@@ -1,7 +1,14 @@
+[中文](README.zh-CN.md)
+
 # dsh-file-watch
 
-A dependency-free plugin that watches a directory and sends exactly one
-notification to a chosen session when a file in it is considered finished.
+A dependency-free plugin that watches one or more directories and sends exactly
+one notification to each directory's target session when a file in it is
+considered finished.
+
+Each entry in `watches` starts its own `fs.watch` and keeps its own
+`(size, mtimeMs)` snapshot and marker state, so targets never interfere with
+one another.
 
 ## What "finished" means
 
@@ -10,6 +17,11 @@ notification to a chosen session when a file in it is considered finished.
   being written to, its timer restarts and nothing is sent.
 - **Explicit marker**: if the last 2 KB of the file contains `<!-- DONE -->`,
   it counts as finished immediately, without waiting for the quiet period.
+
+The stability check is exact: on every filesystem event the plugin records
+`(size, mtimeMs)` and resets a `stableMs` silence timer. When the timer fires
+it stats the file once more and delivers only if **both** values are unchanged.
+If either changed, it restarts the timer — no delivery, no queue.
 
 Each file is delivered at most once for the same content snapshot; repeated
 filesystem events do not produce duplicate notifications.
@@ -29,23 +41,34 @@ profile's patch layer:
 - id: dsh-file-watch
   name: dsh-file-watch
   config:
-    watchDir: '/absolute/path/to/watch-directory'
-    targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+    watches:
+      - dir: '/absolute/path/to/first-outbox'
+        targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+      - dir: '/absolute/path/to/second-outbox'
+        targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
     stableMs: 5000
+    doneMarker: '<!-- DONE -->'
 ```
 
-`watchDir` must be an existing absolute directory. The plugin only reacts to
-filesystem events; it never polls.
+`watches` must contain at least one entry, and every entry needs both `dir`
+and `targetSessionId`. Each `dir` must be an existing absolute directory.
+An entry that is missing either field, or whose directory cannot be read, is
+skipped with a warning naming which entry it was; the remaining watches still
+start. The plugin only reacts to filesystem events; it never polls.
+
+`stableMs` and `doneMarker` are global values shared by all watches. Per-entry
+overrides are not supported.
 
 ## Config
 
 | Field | Meaning |
 |---|---|
-| `watchDir` | Absolute path of the directory to watch. Required. |
-| `targetSessionId` | Id of the session to notify. Required. |
-| `stableMs` | Quiet period in ms. Default `5000`. |
+| `watches` | Non-empty array of watch entries. Required. |
+| `watches[].dir` | Absolute path of the directory to watch. Required. |
+| `watches[].targetSessionId` | Id of the session to notify. Required. |
+| `stableMs` | Silence window in ms, shared by all watches. Default `5000`. |
 | `message` | Optional template; supports `{file}`, `{reason}`, `{size}`, `{mtimeMs}`. |
-| `doneMarker` | Optional immediate marker. Default `<!-- DONE -->`. |
+| `doneMarker` | Immediate-delivery marker, shared by all watches. Default `<!-- DONE -->`. |
 
 ## Test
 
@@ -53,8 +76,8 @@ filesystem events; it never polls.
 node index.test.mjs
 ```
 
-Uses real temporary directories and the real 5-second quiet window; expects
-`6/6 PASS`.
+Uses real temporary directories and the real silence window; expects
+`8/8 PASS`.
 
 ## License
 

@@ -2,13 +2,15 @@
 // 运行：node index.test.mjs
 //
 // 假 ctx 形状按任务给定：{ agents: { get: () => ({ followup: (m) => calls.push(m) }) } }
-// 用真实临时目录 + 真实 fs.watch + 真实 5000ms 默认静默窗口，不用假时钟、不轮询目录。
+// 用真实临时目录 + 真实 fs.watch + 真实静默窗口，不用假时钟、不轮询目录。
 //
 // 判定线：
 //   T1 持续写 3 秒 → 0 次 followup
 //   T2 停止写 5 秒后 → 恰好 1 次；再等 1.2 秒 → calls.length 稳定不重复
 //   T3 尾部含 <!-- DONE --> → 立即（< 500ms，远早于 stableMs）产生 1 次
-// 附加：T4 消息形状符合取证的 UserMessage；T5 get() 返回 undefined 时写「会话未加载」且不抛。
+//   T4 消息形状符合取证的 UserMessage；T5 get() 返回 undefined 时写「会话未加载」且不抛
+//   T7 两个 watch 同时各丢一个文件 → 两个目标各恰好 1 条，不串、不重复
+//   T8 一个 watch 目录不存在 → 另一个 watch 照常工作
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -20,11 +22,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stamp = () => new Date().toISOString().slice(11, 23);
 const out = (msg) => console.log(`[${stamp()}] ${msg}`);
 
-function makeCtx(calls, { get, roots, times } = {}) {
+// byId 可选：按 targetSessionId 把消息分到不同数组，用于验证多目标不串。
+function makeCtx(calls, { get, roots, times, byId } = {}) {
   return {
     agents: {
-      get: get ?? (() => ({
-        followup: (m) => { calls.push(m); if (times) times.push(Date.now()); },
+      get: get ?? ((id) => ({
+        followup: (m) => {
+          (byId ? (byId[id] ?? calls) : calls).push(m);
+          if (times) times.push(Date.now());
+        },
       })),
       roots: roots ?? (() => []),
     },
@@ -52,11 +58,13 @@ function check(label, fn) {
 // ---------------------------------------------------------------- 场景 A：稳定判据
 const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-a-'));
 const callsA = [];
-const disposeA = apply(makeCtx(callsA), { watchDir: dirA, targetSessionId: 'S-A', stableMs });
+const disposeA = apply(makeCtx(callsA), {
+  watches: [{ dir: dirA, targetSessionId: 'S-A' }], stableMs,
+});
 assert.equal(typeof disposeA, 'function', 'apply 应返回 dispose');
 const fileA = path.join(dirA, 'growing.txt');
 
-out(`场景 A 开始：watchDir=${dirA}，stableMs=${stableMs}`);
+out(`场景 A 开始：watches[0].dir=${dirA}，stableMs=${stableMs}`);
 for (let i = 0; i < 15; i++) {
   fs.appendFileSync(fileA, `line ${i}\n`);
   await sleep(200);                       // 持续写 3 秒
@@ -97,7 +105,9 @@ disposeA();
 const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-b-'));
 const callsB = [];
 const timesB = [];
-const disposeB = apply(makeCtx(callsB, { times: timesB }), { watchDir: dirB, targetSessionId: 'S-B', stableMs });
+const disposeB = apply(makeCtx(callsB, { times: timesB }), {
+  watches: [{ dir: dirB, targetSessionId: 'S-B' }], stableMs,
+});
 out(`场景 B 开始：写入含 <!-- DONE --> 的文件`);
 const tDoneWrite = Date.now();
 fs.writeFileSync(path.join(dirB, 'done.txt'), 'hello\n<!-- DONE -->\n');
@@ -116,7 +126,7 @@ const callsC = [];
 warnings.length = 0;
 const disposeC = apply(
   makeCtx(callsC, { get: () => undefined, roots: () => [] }),
-  { watchDir: dirC, targetSessionId: 'NO-SUCH-SESSION', stableMs },
+  { watches: [{ dir: dirC, targetSessionId: 'NO-SUCH-SESSION' }], stableMs },
 );
 fs.writeFileSync(path.join(dirC, 'orphan.txt'), 'x\n<!-- DONE -->\n');
 await sleep(450);
@@ -127,7 +137,77 @@ check('T5 会话未加载：写日志、不抛、不投递', () => {
 });
 disposeC();
 
-for (const d of [dirA, dirB, dirC]) {
+// ------------------------------- 场景 D：两个 watch 同时各丢一个文件（稳定判据路径）
+// 故意不带 DONE，让两个 watch 各自走完整的 (size, mtimeMs) + 静默 timer 判定，
+// 以验证状态不是全局共享的；共用状态会让至少一个目标判不出稳定。
+const dirD1 = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-d1-'));
+const dirD2 = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-d2-'));
+const bucketsD = { 'S-D1': [], 'S-D2': [] };
+const shortStableMs = 500;
+const disposeD = apply(
+  makeCtx([], { byId: bucketsD }),
+  {
+    watches: [
+      { dir: dirD1, targetSessionId: 'S-D1' },
+      { dir: dirD2, targetSessionId: 'S-D2' },
+    ],
+    stableMs: shortStableMs,
+  },
+);
+assert.equal(typeof disposeD, 'function', 'apply 应返回 dispose');
+out(`场景 D 开始：两个 watch 同时各写一个普通文件（stableMs=${shortStableMs}）`);
+fs.writeFileSync(path.join(dirD1, 'only-in-d1.txt'), 'payload for target one\n');
+fs.writeFileSync(path.join(dirD2, 'only-in-d2.txt'), 'payload for target two\n');
+// 等超过两个静默窗口：仍各恰好 1 条，即为「不重复」的证据。
+await sleep(shortStableMs * 2 + 900);
+check('T7 两个 watch 同时各丢一个文件：两个目标各收到恰好 1 条，不串、不重复', () => {
+  const d1 = bucketsD['S-D1'];
+  const d2 = bucketsD['S-D2'];
+  assert.equal(d1.length, 1, `S-D1 期望 1，实际 ${d1.length}`);
+  assert.equal(d2.length, 1, `S-D2 期望 1，实际 ${d2.length}`);
+  const t1 = d1[0].content[0].text;
+  const t2 = d2[0].content[0].text;
+  assert.ok(t1.includes('only-in-d1.txt') && !t1.includes('only-in-d2.txt'), `S-D1 串了：${t1}`);
+  assert.ok(t2.includes('only-in-d2.txt') && !t2.includes('only-in-d1.txt'), `S-D2 串了：${t2}`);
+  assert.notEqual(d1[0].id, d2[0].id, '两条应是独立的消息对象');
+  assert.equal(d1[0].source.kind, 'plugin:dsh-file-watch');
+  assert.equal(d2[0].source.kind, 'plugin:dsh-file-watch');
+  out(`       S-D1 消息：${t1}`);
+  out(`       S-D2 消息：${t2}`);
+});
+disposeD();
+
+// ------------------------------- 场景 E：一条 watch 目录不存在，另一条照常工作
+const dirE = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-e-'));
+const missingDir = path.join(os.tmpdir(), `dfw-missing-${process.pid}-${Date.now()}`);
+assert.equal(fs.existsSync(missingDir), false, '测试前提：该目录必须不存在');
+const bucketsE = { 'S-E-MISSING': [], 'S-E-OK': [] };
+warnings.length = 0;
+const disposeE = apply(
+  makeCtx([], { byId: bucketsE }),
+  {
+    watches: [
+      { dir: missingDir, targetSessionId: 'S-E-MISSING' },
+      { dir: dirE, targetSessionId: 'S-E-OK' },
+    ],
+    stableMs: shortStableMs,
+  },
+);
+assert.equal(typeof disposeE, 'function', 'apply 应返回 dispose（坏条目不能整插件不启动）');
+fs.writeFileSync(path.join(dirE, 'survivor.txt'), 'x\n<!-- DONE -->\n');
+await sleep(600);
+check('T8 一个 watch 目录不存在时，另一个 watch 照常工作', () => {
+  assert.equal(bucketsE['S-E-OK'].length, 1, `正常 watch 期望 1，实际 ${bucketsE['S-E-OK'].length}`);
+  assert.equal(bucketsE['S-E-MISSING'].length, 0, `坏 watch 期望 0，实际 ${bucketsE['S-E-MISSING'].length}`);
+  assert.ok(bucketsE['S-E-OK'][0].content[0].text.includes('survivor.txt'));
+  assert.ok(!warnings.some((w) => w.includes('未启动')), `不应整插件不启动：${JSON.stringify(warnings)}`);
+  assert.ok(warnings.some((w) => w.includes('跳过 watches[0]') && w.includes('dir 不可读')),
+    `未点名跳过坏条目：${JSON.stringify(warnings)}`);
+  out(`       跳过日志：${warnings.find((w) => w.includes('跳过 watches[0]'))}`);
+});
+disposeE();
+
+for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
