@@ -46,55 +46,86 @@
 
 ## 安装
 
-`dsh-handoff-relay` 是一个 DSH profile 的插件 bundle（DSH 是加载 cordis-based
-bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一个本地目录链接进 profile。
+`dsh-handoff-relay` 是一个 DSH profile 的插件 bundle。它没有任何运行时依赖，
+一条命令行就能装完——不需要手动改 profile 的 `package.json`，也不需要手动改 bundle 列表。
 
-1. 把本仓库放到本机某个目录，例如 macOS/Linux 上的 `/srv/dsh-handoff-relay`，
-   或 Windows 上的 `C:/plugins/dsh-handoff-relay`（克隆一份，或把检出目录复制过去）。
-2. 在 profile 目录的 `package.json` 里，添加一个指向该目录的 `file:` 依赖，
-   并把包名注册到 `dsh.profile.bundles`。两个列表里已有的其他条目保持不动，
-   只新增这两处：
+### 从插件市场安装
 
-   ```json
-   {
-     "dependencies": {
-       "dsh-handoff-relay": "file:/srv/dsh-handoff-relay"
-     },
-     "dsh": {
-       "profile": {
-         "bundles": ["dsh-handoff-relay"]
-       }
-     }
-   }
-   ```
+暂时还用不了：本包尚未发布到 npm（`npm view dsh-handoff-relay` 返回 `404`），
+应用内插件市场按包名搜不到它。发布之后，在市场里搜索 `dsh-handoff-relay` 即可安装。
 
-   `file:` 的值必须是指向本包 `package.json` 所在目录的绝对路径。各平台一律用
-   正斜杠：Windows 上写成带盘符的形式，例如 `file:C:/plugins/dsh-handoff-relay`；
-   macOS/Linux 上写成 POSIX 路径，例如 `file:/srv/dsh-handoff-relay`。
-3. 在 profile 目录执行 `pnpm install`（或你所用包管理器的等价安装命令），
-   让本地包链接进该 profile 的 `node_modules`。改动本包源码后需重新执行一次。
-4. 在 profile 的 `cordis.patch.yml` 里加一行 `id` 相同的配置，把配置写在那里。
-   本包自带补丁层（`package.json` 的 `dsh.bundle.patch`）负责插入插件行；
-   profile 的补丁层通过匹配同一个 `id` 覆盖该行的 `config`：
+### 用命令行安装
 
-   ```yaml
-   - id: dsh-handoff-relay
-     name: dsh-handoff-relay
-     config:
-       watches:
-         - dir: '/absolute/path/to/first-outbox'
-           targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-           done: { text: '<!-- DONE -->' }
-         - dir: '/absolute/path/to/second-outbox'
-           targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
-           done: { regex: '^## 章末' }
-         - dir: '/absolute/path/to/third-outbox'
-           targetSessionId: 'session-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz'
-           done: null
-       stableMs: 5000
-   ```
+`dsh plugin` 会把参数转发给 profile 目录里的 `pnpm`，所以必须指明 profile
+（`desktop`、`web` 等，和你启动时用的是同一个）：
 
-5. 重启宿主，让新的 bundle 与配置生效。
+```bash
+# from a local checkout: give the absolute path of the directory that holds package.json
+git clone https://github.com/byfbaish/dsh-handoff-relay.git D:/plugins/dsh-handoff-relay
+dsh plugin --profile desktop add D:/plugins/dsh-handoff-relay
+
+# or straight from GitHub
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
+```
+
+两种写法在 macOS/Linux 与 Windows 上都可用；路径要给绝对路径，因为命令实际在
+profile 目录里执行。
+
+然后设置配置。本包自带补丁层（`package.json` 的 `dsh.bundle.patch`）负责插入插件行；
+profile 的 `cordis.patch.yml` 通过匹配同一个 `id` 覆盖该行的 `config`：
+
+```yaml
+stableMs: 5000
+watches:
+  - dir: 'D:\path\to\inbox'
+    targetSessionId: 'session-xxxx'
+    done: { text: '<!-- DONE -->' }
+```
+
+把上面这段放到该行的 `config:` 键下：
+
+```yaml
+- id: dsh-handoff-relay
+  name: dsh-handoff-relay
+  config:
+    # the block above goes here
+```
+
+重启宿主，让 bundle 与配置生效。`targetSessionId` 必须指向当前存在的会话；
+宿主重启后会话 id 会变化，每次重启后都需要重新接线。
+
+### 更新
+
+重新执行一次安装命令，然后重启宿主：
+
+```bash
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
+```
+
+本地检出的情形：在该检出目录里 `git pull` 后重启；若没生效，再执行一次 `add` 命令。
+要固定版本就带 ref：
+
+```bash
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.0
+```
+
+### 卸载与查看状态
+
+```bash
+dsh plugin --profile desktop remove dsh-handoff-relay
+```
+
+重启宿主，然后删掉 profile 的 `cordis.patch.yml` 里本插件那一行——包不在了，
+这行配置只会被忽略，删掉只是为了文件干净。
+
+查看某个 profile 装了什么、以及合成后的插件树：
+
+```bash
+dsh plugin --profile desktop list --depth 0
+dsh --dump-config --profile desktop
+```
+
+前者列出该 profile 的依赖；后者打印合成后的 profile 树并直接退出，不会启动应用。
 
 ### 配置字段
 

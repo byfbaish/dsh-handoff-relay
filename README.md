@@ -58,61 +58,94 @@ is not loaded, a warning is written and nothing is sent.
 
 ## Install
 
-`dsh-handoff-relay` is a plugin bundle for a DSH profile (the host that loads
-cordis-based bundles). It has no runtime dependencies, so installing it is just
-linking a local directory into a profile.
+`dsh-handoff-relay` is a plugin bundle for a DSH profile. It has no runtime
+dependencies, so it installs with one CLI command — there is no need to hand-edit
+the profile's `package.json` or its bundle list.
 
-1. Put this repository in a local directory, for example
-   `/srv/dsh-handoff-relay` on macOS/Linux or `C:/plugins/dsh-handoff-relay`
-   on Windows (clone it, or copy the checkout there).
-2. In the profile directory, add a `file:` dependency pointing at that
-   directory in `package.json`, and register the package name in
-   `dsh.profile.bundles`. Keep the other entries already present in both
-   lists — only add these two:
+### Install from the marketplace
 
-   ```json
-   {
-     "dependencies": {
-       "dsh-handoff-relay": "file:/srv/dsh-handoff-relay"
-     },
-     "dsh": {
-       "profile": {
-         "bundles": ["dsh-handoff-relay"]
-       }
-     }
-   }
-   ```
+Not available yet: this package is not published to npm (`npm view
+dsh-handoff-relay` answers `404`), so the in-app marketplace cannot find it by
+name. Once it is published, search for `dsh-handoff-relay` in the marketplace
+and install it there.
 
-   The `file:` value must be an absolute path to the directory containing this
-   package's `package.json`. Use forward slashes on every platform: on Windows
-   that means a drive-letter path such as `file:C:/plugins/dsh-handoff-relay`;
-   on macOS/Linux a POSIX path such as `file:/srv/dsh-handoff-relay`.
-3. Run `pnpm install` in the profile directory (or the equivalent install
-   command of your package manager) so the local package is linked into the
-   profile's `node_modules`. Re-run it after changing the package's source.
-4. Add a row with the same `id` to the profile's `cordis.patch.yml` and set the
-   config there. The bundle ships its own patch layer (`dsh.bundle.patch` in
-   `package.json`) that inserts the plugin row; the profile patch layer
-   overrides that row's config by matching its `id`:
+### Install with the CLI
 
-   ```yaml
-   - id: dsh-handoff-relay
-     name: dsh-handoff-relay
-     config:
-       watches:
-         - dir: '/absolute/path/to/first-outbox'
-           targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-           done: { text: '<!-- DONE -->' }
-         - dir: '/absolute/path/to/second-outbox'
-           targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
-           done: { regex: '^## 章末' }
-         - dir: '/absolute/path/to/third-outbox'
-           targetSessionId: 'session-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz'
-           done: null
-       stableMs: 5000
-   ```
+`dsh plugin` forwards its arguments to `pnpm` inside the profile directory, so
+the profile name is required (`desktop`, `web`, … — the same one you boot):
 
-5. Restart the host so the new bundle and its config are loaded.
+```bash
+# from a local checkout: give the absolute path of the directory that holds package.json
+git clone https://github.com/byfbaish/dsh-handoff-relay.git D:/plugins/dsh-handoff-relay
+dsh plugin --profile desktop add D:/plugins/dsh-handoff-relay
+
+# or straight from GitHub
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
+```
+
+Both forms work on macOS/Linux and Windows; keep the path absolute, because the
+command runs inside the profile directory.
+
+Then set the config. The bundle ships its own patch layer (`dsh.bundle.patch` in
+`package.json`) that inserts the plugin row; the profile's `cordis.patch.yml`
+overrides that row's `config` by matching the same `id`:
+
+```yaml
+stableMs: 5000
+watches:
+  - dir: 'D:\path\to\inbox'
+    targetSessionId: 'session-xxxx'
+    done: { text: '<!-- DONE -->' }
+```
+
+Put that block under the row's `config:` key:
+
+```yaml
+- id: dsh-handoff-relay
+  name: dsh-handoff-relay
+  config:
+    # the block above goes here
+```
+
+Restart the host so the bundle and its config are loaded. `targetSessionId` must
+point to a session that currently exists; session ids change when the host
+restarts, so re-wire it after every restart.
+
+### Update
+
+Re-run the install command, then restart the host:
+
+```bash
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
+```
+
+For a local checkout, `git pull` in that checkout and restart; if the change
+does not show up, re-run the `add` command once. Pin a release by appending a
+ref:
+
+```bash
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.0
+```
+
+### Uninstall and check status
+
+```bash
+dsh plugin --profile desktop remove dsh-handoff-relay
+```
+
+Restart the host, then delete the plugin's row from the profile's
+`cordis.patch.yml` — a config row whose package is gone is simply ignored, so
+removing it only keeps the file readable.
+
+Check what a profile has installed, and what the composed plugin tree looks like:
+
+```bash
+dsh plugin --profile desktop list --depth 0
+dsh --dump-config --profile desktop
+```
+
+The first prints the profile's dependencies; the second prints the composed
+profile tree and exits without booting the app.
 
 ### Config fields
 
