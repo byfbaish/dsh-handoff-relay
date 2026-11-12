@@ -41,8 +41,18 @@
 
 ## 通知发给谁
 
-由 `targetSessionId` 指定 id 的那个会话会收到一条用户消息，内容包含文件名和
-触发原因（`stable` 或 `DONE`）。如果该会话尚未加载，则写一条警告日志，不发送任何消息。
+每条 watch 只能指定一个目标：`targetSessionId`（会话 id）或 `targetTitle`
+（会话标题的一部分）。两个都写、或都不写，该条 watch 会被跳过并写一条警告——
+插件不猜哪个优先。
+
+`targetTitle` 按**包含匹配**（区分大小写）：`简报` 也会命中 `周简报`。它**每次
+投递前都重新解析、不缓存**。命中 0 条或多条都不投递，只写一条警告，写明是哪条
+watch、找的是什么标题、命中几条（有歧义时列出候选）。**不做 `cwd` 兜底**——插件
+不会去猜「最近活跃的那个会话」。
+
+通知是一条用户消息，默认文本形如
+`文件 <绝对路径> 已就绪（触发=stable|DONE），请继续。`，收件方可以按该路径直接读文件。
+如果目标会话尚未加载，则写一条警告日志，不发送任何消息。
 
 ## 安装
 
@@ -51,8 +61,12 @@
 
 ### 从插件市场安装
 
-暂时还用不了：本包尚未发布到 npm（`npm view dsh-handoff-relay` 返回 `404`），
-应用内插件市场按包名搜不到它。发布之后，在市场里搜索 `dsh-handoff-relay` 即可安装。
+`dsh-handoff-relay` 已发布到 npm（当前版本 `0.3.2`），应用内插件市场按包名就能
+搜到它：在市场里搜索 `dsh-handoff-relay` 即可安装。命令行也可以直接用包名装：
+
+```bash
+dsh plugin --profile desktop add dsh-handoff-relay
+```
 
 ### 用命令行安装
 
@@ -91,8 +105,9 @@ watches:
     # the block above goes here
 ```
 
-重启宿主，让 bundle 与配置生效。`targetSessionId` 必须指向当前存在的会话；
-宿主重启后会话 id 会变化，每次重启后都需要重新接线。
+重启宿主，让 bundle 与配置生效。每条 watch 的目标必须指向当前存在的会话：
+用 `targetSessionId` 时，宿主重启后会话 id 会变化，每次重启后都需要重新接线；
+改用 `targetTitle` 就没有这个问题——标题跨重启不变。
 
 ### 更新
 
@@ -106,7 +121,7 @@ dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
 要固定版本就带 ref：
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.2
 ```
 
 ### 卸载与查看状态
@@ -129,10 +144,16 @@ dsh --dump-config --profile desktop
 
 ### 配置字段
 
-- `watches` —— 监控项数组，长度至少 1；每一项都必须同时给出 `dir` 与
-  `targetSessionId`。每个 `dir` 必须是已存在的绝对路径目录。缺少任一字段、
-  或目录不可读的那一条会被跳过，并在日志里写明跳过了哪一项；其余监控项照常启动。
-  插件只响应文件系统事件，从不轮询。
+- `watches` —— 监控项数组，长度至少 1；每一项都必须给出 `dir`，并在
+  `targetSessionId` 与 `targetTitle` 中**恰好选一个**。每个 `dir` 必须是已存在的
+  绝对路径目录。缺 `dir`、两个目标字段都写或都不写、或目录不可读的那一条会被跳过，
+  并在日志里写明跳过了哪一项；其余监控项照常启动。插件只响应文件系统事件，从不轮询。
+- `watches[].targetSessionId` —— 接收通知的会话 id。与 `targetTitle` **二选一**；
+  id 在宿主重启后会变化，所以每次重启后都要重新接线。
+- `watches[].targetTitle` —— 目标会话标题的一部分，按**包含匹配**（区分大小写，
+  `简报` 会命中 `周简报`）。与 `targetSessionId` **二选一**：都写或都不写，该条
+  watch 会被跳过并告警。每次投递前都重新解析；命中 0 条或多条都不投递、只告警；
+  不做 `cwd` 兜底。
 - `stableMs` —— 静默窗口，单位毫秒，所有监控项共用（默认 `5000`）。文件的
   `(size, mtimeMs)` 持续这么久不变即判定为已完成。不支持为单项单独覆盖。
 - `watches[].done` —— 每条 watch 的完成规则，四种状态：
@@ -144,11 +165,12 @@ dsh --dump-config --profile desktop
 
   `done` 是唯一的完成规则设置。
 
-加载期会校验每条 watch 的 `targetSessionId`：能解析出会话标题就正常启动；解析不到
-则写一条带该 watch `dir` 的警告，该 watch 仍然启动，其余 watch 照常工作。
+加载期会校验每条 watch 的目标（id 或标题）现在能否解析到：能解析就正常启动；
+解析不到则写一条带该 watch `dir` 与目标的警告，该 watch 仍然启动，其余 watch 照常
+工作。解析结果不缓存——每次投递前都重新解析。
 
-**`targetSessionId` 必须指向当前存在的会话；宿主重启后会话 id 会变化，
-每次重启后都需要重新接线。**
+**`targetSessionId` 必须指向当前存在的会话；宿主重启后会话 id 会变化，每次重启后
+都需要重新接线。用 `targetTitle` 的 watch 不需要重新接线。**
 
 ## 配置
 
@@ -156,9 +178,10 @@ dsh --dump-config --profile desktop
 |---|---|
 | `watches` | 监控项数组，长度至少 1。必填。 |
 | `watches[].dir` | 要监控的目录，绝对路径。必填。 |
-| `watches[].targetSessionId` | 接收通知的会话 id。必填。 |
+| `watches[].targetSessionId` | 接收通知的会话 id。与 `targetTitle` 二选一，必选其一。 |
+| `watches[].targetTitle` | 目标会话标题的一部分（包含匹配，区分大小写）；每次投递前重新解析；命中 0 条或多条都不投递。与 `targetSessionId` 二选一，必选其一。 |
 | `stableMs` | 静默窗口，单位毫秒，所有监控项共用。默认 `5000`。 |
-| `message` | 可选消息模板；支持 `{file}`、`{reason}`、`{size}`、`{mtimeMs}`。 |
+| `message` | 可选消息模板；支持 `{path}`（被投递文件的绝对路径）、`{file}`（文件名）、`{reason}`、`{size}`、`{mtimeMs}`。 |
 | `watches[].done` | 每条 watch 的完成规则：省略=默认文本，`{ text }`、`{ regex }` 或 `null`（关闭）。 |
 
 ## 测试

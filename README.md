@@ -52,9 +52,21 @@ filesystem events do not produce duplicate notifications.
 
 ## Who gets notified
 
-The session whose id is given by `targetSessionId` receives one user message
-containing the file name and the reason (`stable` or `DONE`). If that session
-is not loaded, a warning is written and nothing is sent.
+Each watch names exactly one target: `targetSessionId` (the session id) or
+`targetTitle` (part of the session title). Writing both, or neither, skips that
+watch with a warning — the plugin does not guess which one wins.
+
+`targetTitle` matches by substring, case-sensitively: `简报` also matches
+`周简报`. It is resolved again before every delivery and never cached. If it
+matches no session, or more than one, nothing is sent: a warning naming the
+watch, the wanted title, and the number of matches (with candidates when it is
+ambiguous) is logged. There is no `cwd` fallback — the plugin never guesses a
+"most recently active" session.
+
+The notification is one user message. Its default text is
+`文件 <absolute path> 已就绪（触发=stable|DONE），请继续。`, so the receiver can
+open the file straight from that path. If the target session is not loaded, a
+warning is written and nothing is sent.
 
 ## Install
 
@@ -64,10 +76,13 @@ the profile's `package.json` or its bundle list.
 
 ### Install from the marketplace
 
-Not available yet: this package is not published to npm (`npm view
-dsh-handoff-relay` answers `404`), so the in-app marketplace cannot find it by
-name. Once it is published, search for `dsh-handoff-relay` in the marketplace
-and install it there.
+`dsh-handoff-relay` is published to npm (current release `0.3.2`), so the in-app
+marketplace finds it by name: search for `dsh-handoff-relay` and install it
+there. From the command line, the same package name works directly:
+
+```bash
+dsh plugin --profile desktop add dsh-handoff-relay
+```
 
 ### Install with the CLI
 
@@ -107,9 +122,10 @@ Put that block under the row's `config:` key:
     # the block above goes here
 ```
 
-Restart the host so the bundle and its config are loaded. `targetSessionId` must
-point to a session that currently exists; session ids change when the host
-restarts, so re-wire it after every restart.
+Restart the host so the bundle and its config are loaded. A watch's target must
+resolve to a session that currently exists: with `targetSessionId` this means
+re-wiring it after every restart, because session ids change when the host
+restarts. `targetTitle` avoids that — its title survives restarts.
 
 ### Update
 
@@ -124,7 +140,7 @@ does not show up, re-run the `add` command once. Pin a release by appending a
 ref:
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.2
 ```
 
 ### Uninstall and check status
@@ -149,11 +165,20 @@ profile tree and exits without booting the app.
 
 ### Config fields
 
-- `watches` — a non-empty array of watch entries; each entry needs `dir` and
-  `targetSessionId`. Each `dir` must be an existing absolute directory. An
-  entry missing either field, or whose directory cannot be read, is skipped
-  with a warning naming the entry; the remaining watches still start. The
-  plugin only reacts to filesystem events; it never polls.
+- `watches` — a non-empty array of watch entries; each entry needs `dir` plus
+  exactly one of `targetSessionId` and `targetTitle`. Each `dir` must be an
+  existing absolute directory. An entry missing `dir` or giving both target
+  fields (or neither), or whose directory cannot be read, is skipped with a
+  warning naming the entry; the remaining watches still start. The plugin only
+  reacts to filesystem events; it never polls.
+- `watches[].targetSessionId` — id of the session to notify. Mutually exclusive
+  with `targetTitle`; ids change when the host restarts, so it has to be
+  re-wired after every restart.
+- `watches[].targetTitle` — part of the target session's title, matched by
+  substring (case-sensitive; `简报` hits `周简报`). Mutually exclusive with
+  `targetSessionId`: writing both or neither skips that watch with a warning.
+  Resolved afresh before each delivery; zero matches or more than one match
+  means nothing is delivered, only a warning. There is no `cwd` fallback.
 - `stableMs` — silence window in milliseconds, shared by all watches (default
   `5000`). A file counts as finished once `(size, mtimeMs)` has been unchanged
   for this long. Per-entry overrides are not supported.
@@ -167,14 +192,14 @@ profile tree and exits without booting the app.
 
   `done` is the only completion setting.
 
-At load time each watch's `targetSessionId` is validated: if a session title can
-be resolved, the watch starts normally; otherwise a warning naming that watch's
-`dir` is logged and the watch still starts, so the remaining watches keep
-working.
+At load time each watch's target (id or title) is checked: if it resolves right
+now, the watch starts normally; otherwise a warning naming that watch's `dir`
+and target is logged and the watch still starts, so the remaining watches keep
+working. Nothing is cached — every delivery resolves the target again.
 
 **`targetSessionId` must point to a session that currently exists. Session ids
 change when the host restarts, so re-wire `targetSessionId` after every
-restart.**
+restart; a `targetTitle` watch needs no re-wiring.**
 
 ## Config
 
@@ -182,9 +207,10 @@ restart.**
 |---|---|
 | `watches` | Non-empty array of watch entries. Required. |
 | `watches[].dir` | Absolute path of the directory to watch. Required. |
-| `watches[].targetSessionId` | Id of the session to notify. Required. |
+| `watches[].targetSessionId` | Id of the session to notify. Exactly one of this and `targetTitle` is required. |
+| `watches[].targetTitle` | Substring of the target session's title (case-sensitive); resolved before every delivery; zero or multiple matches mean no delivery. Exactly one of this and `targetSessionId` is required. |
 | `stableMs` | Silence window in ms, shared by all watches. Default `5000`. |
-| `message` | Optional template; supports `{file}`, `{reason}`, `{size}`, `{mtimeMs}`. |
+| `message` | Optional template; supports `{path}` (absolute path of the delivered file), `{file}` (file name), `{reason}`, `{size}`, `{mtimeMs}`. |
 | `watches[].done` | Per-watch completion rule: omitted = default text, `{ text }`, `{ regex }`, or `null` (off). |
 
 ## Test
