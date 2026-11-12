@@ -39,7 +39,8 @@ cordis-based bundles). It has no runtime dependencies, so installing it is just
 linking a local directory into a profile.
 
 1. Put this repository in a local directory, for example
-   `/srv/dsh-file-watch` (clone it, or copy the checkout there).
+   `/srv/dsh-file-watch` on macOS/Linux or `C:/plugins/dsh-file-watch`
+   on Windows (clone it, or copy the checkout there).
 2. In the profile directory, add a `file:` dependency pointing at that
    directory in `package.json`, and register the package name in
    `dsh.profile.bundles`. Keep the other entries already present in both
@@ -48,7 +49,7 @@ linking a local directory into a profile.
    ```json
    {
      "dependencies": {
-       "dsh-file-watch": "file:/absolute/path/to/dsh-file-watch"
+       "dsh-file-watch": "file:/srv/dsh-file-watch"
      },
      "dsh": {
        "profile": {
@@ -59,7 +60,9 @@ linking a local directory into a profile.
    ```
 
    The `file:` value must be an absolute path to the directory containing this
-   package's `package.json`.
+   package's `package.json`. Use forward slashes on every platform: on Windows
+   that means a drive-letter path such as `file:C:/plugins/dsh-file-watch`;
+   on macOS/Linux a POSIX path such as `file:/srv/dsh-file-watch`.
 3. Run `pnpm install` in the profile directory (or the equivalent install
    command of your package manager) so the local package is linked into the
    profile's `node_modules`. Re-run it after changing the package's source.

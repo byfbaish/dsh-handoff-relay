@@ -31,8 +31,8 @@
 `dsh-file-watch` 是一个 DSH profile 的插件 bundle（DSH 是加载 cordis-based
 bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一个本地目录链接进 profile。
 
-1. 把本仓库放到本机某个目录，例如 `/srv/dsh-file-watch`（克隆一份，或把
-   检出目录复制过去）。
+1. 把本仓库放到本机某个目录，例如 macOS/Linux 上的 `/srv/dsh-file-watch`，
+   或 Windows 上的 `C:/plugins/dsh-file-watch`（克隆一份，或把检出目录复制过去）。
 2. 在 profile 目录的 `package.json` 里，添加一个指向该目录的 `file:` 依赖，
    并把包名注册到 `dsh.profile.bundles`。两个列表里已有的其他条目保持不动，
    只新增这两处：
@@ -40,7 +40,7 @@ bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一�
    ```json
    {
      "dependencies": {
-       "dsh-file-watch": "file:/absolute/path/to/dsh-file-watch"
+       "dsh-file-watch": "file:/srv/dsh-file-watch"
      },
      "dsh": {
        "profile": {
@@ -50,7 +50,9 @@ bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一�
    }
    ```
 
-   `file:` 的值必须是指向本包 `package.json` 所在目录的绝对路径。
+   `file:` 的值必须是指向本包 `package.json` 所在目录的绝对路径。各平台一律用
+   正斜杠：Windows 上写成带盘符的形式，例如 `file:C:/plugins/dsh-file-watch`；
+   macOS/Linux 上写成 POSIX 路径，例如 `file:/srv/dsh-file-watch`。
 3. 在 profile 目录执行 `pnpm install`（或你所用包管理器的等价安装命令），
    让本地包链接进该 profile 的 `node_modules`。改动本包源码后需重新执行一次。
 4. 在 profile 的 `cordis.patch.yml` 里加一行 `id` 相同的配置，把配置写在那里。
