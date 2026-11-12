@@ -18,6 +18,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { apply } from './index.js';
 
+// 落盘去重表默认写到 profile 根；测试统一改到临时目录，避免污染本机 profile。
+const suiteStateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-state-'));
+process.env.DSH_RELAY_STATE_FILE = path.join(suiteStateRoot, 'state.json');
+const readState = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+const restoreStateEnv = (prev) => {
+  if (prev === undefined) delete process.env.DSH_RELAY_STATE_FILE;
+  else process.env.DSH_RELAY_STATE_FILE = prev;
+};
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const stamp = () => new Date().toISOString().slice(11, 23);
 const out = (msg) => console.log(`[${stamp()}] ${msg}`);
@@ -220,10 +229,11 @@ function withFs(patch, fn) {
   }
 }
 function capturingWatch() {
-  const box = { cb: null, handlers: {} };
+  const box = { cb: null, cbs: [], handlers: {} };
   box.patch = {
     watch: (_dir, _opts, cb) => {
       box.cb = cb;
+      box.cbs.push(cb);
       return {
         on(ev, fn) { box.handlers[ev] = fn; return this; },
         close() {},
@@ -1085,6 +1095,294 @@ function makeTitleCtx(calls, entries, opts = {}) {
       `缺 watches[1] 解析不到日志：${JSON.stringify(infos)}`);
   });
   disp();
+}
+
+// =============================== P7 落盘去重表（指纹 → 已投目标） ===============================
+// 1) 同指纹同目标：首次落盘，第二次加载（模拟热重载）跳过
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  const calls = [];
+  const box1 = capturingWatch();
+  const disp1 = withFs(box1.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S-REL' }], stableMs: 120,
+  }));
+  fs.writeFileSync(path.join(d, 'reload.txt'), 'x\n<!-- DONE -->\n');
+  box1.cb('change', 'reload.txt');
+  check('P7 首次投递成功并落盘（version=1，指纹含该文件）', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    const data = readState(stateFile);
+    assert.equal(data.version, 1);
+    assert.ok(Object.keys(data.entries).some((k) => k.includes('reload.txt')), JSON.stringify(data));
+  });
+  disp1();
+  const box2 = capturingWatch();
+  const disp2 = withFs(box2.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S-REL' }], stableMs: 120,
+  }));
+  box2.cb('change', 'reload.txt');
+  check('P7 重载后同一文件同一目标不再投递（同指纹同目标跳过）', () => {
+    assert.equal(calls.length, 1, `期望仍 1，实际 ${calls.length}`);
+  });
+  disp2();
+  restoreStateEnv(prev);
+}
+
+// 2) 指纹随 mtime/size 变化而不同
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  const calls = [];
+  const box = capturingWatch();
+  const probe = path.join(d, 'fingerprint.txt');
+  const disp = withFs(box.patch, () => {
+    const p = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S-FP' }], stableMs: 120 });
+    fs.writeFileSync(probe, 'v1\n<!-- DONE -->\n');
+    box.cb('change', 'fingerprint.txt');
+    fs.appendFileSync(probe, 'v2-more-bytes\n<!-- DONE -->\n');
+    box.cb('change', 'fingerprint.txt');
+    return p;
+  });
+  check('P7 指纹随 mtime/size 变化而不同：同文件改写后再投一次', () => {
+    assert.equal(calls.length, 2, `期望 2，实际 ${calls.length}`);
+    const keys = Object.keys(readState(stateFile).entries).filter((k) => k.includes('fingerprint.txt'));
+    assert.ok(keys.length >= 2, `应有至少两个指纹，实际 ${JSON.stringify(keys)}`);
+  });
+  disp();
+  restoreStateEnv(prev);
+}
+
+// 3) 同指纹 + 新目标：照投并追加
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  const buckets = { 'S-T1': [], 'S-T2': [] };
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => {
+    const p = apply(makeCtx([], { byId: buckets }), {
+      watches: [{ dir: d, targetSessionId: 'S-T1' }, { dir: d, targetSessionId: 'S-T2' }],
+      stableMs: 120,
+    });
+    fs.writeFileSync(path.join(d, 'shared.txt'), 'x\n<!-- DONE -->\n');
+    for (const cb of box.cbs) cb('change', 'shared.txt');
+    return p;
+  });
+  check('P7 同指纹新目标可投：同目录两条 watch 各投一次，表内追加两个目标', () => {
+    assert.equal(buckets['S-T1'].length, 1, `S-T1 期望 1，实际 ${buckets['S-T1'].length}`);
+    assert.equal(buckets['S-T2'].length, 1, `S-T2 期望 1，实际 ${buckets['S-T2'].length}`);
+    const found = Object.entries(readState(stateFile).entries).filter(([k]) => k.includes('shared.txt'));
+    assert.equal(found.length, 1, '同一快照应只有一个指纹');
+    assert.ok(found[0][1].targets.includes('S-T1') && found[0][1].targets.includes('S-T2'), JSON.stringify(found[0][1]));
+  });
+  disp();
+  restoreStateEnv(prev);
+}
+
+// 4) 上限裁剪：淘汰最旧，连带其 targets
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  const seed = { version: 1, entries: {} };
+  for (let i = 0; i < 500; i++) {
+    seed.entries[`${d}|seed-${i}.txt|${1000 + i}|1`] = {
+      deliveredAt: new Date(Date.UTC(2020, 0, 1, 0, 0, 0, i)).toISOString(),
+      targets: ['S-SEED'],
+    };
+  }
+  fs.writeFileSync(stateFile, JSON.stringify(seed));
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => {
+    const p = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S-TRIM' }], stableMs: 120 });
+    fs.writeFileSync(path.join(d, 'newest.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'newest.txt');
+    return p;
+  });
+  check('P7 裁剪：超过 500 个指纹淘汰最旧（连带 targets），最近一条保留', () => {
+    assert.equal(calls.length, 1);
+    const data = readState(stateFile);
+    const keys = Object.keys(data.entries);
+    assert.equal(keys.length, 500, `应裁到 500，实际 ${keys.length}`);
+    assert.ok(!keys.includes(`${d}|seed-0.txt|1000|1`), '最旧指纹应被淘汰');
+    assert.ok(keys.includes(`${d}|seed-499.txt|1499|1`), '次新指纹应保留');
+    assert.ok(keys.some((k) => k.includes('newest.txt')), '本次投递的指纹应保留');
+  });
+  disp();
+  restoreStateEnv(prev);
+}
+
+// 5) 损坏容错：JSON 坏 → warn + 整表丢弃 + 从空表重建，投递照常
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  fs.writeFileSync(stateFile, '{ broken json');
+  warnings.length = 0;
+  const calls = [];
+  const box = capturingWatch();
+  const ctx = infoCtx(calls);
+  const disp = withFs(box.patch, () => {
+    const p = apply(ctx, { watches: [{ dir: d, targetSessionId: 'S-BAD' }], stableMs: 120 });
+    fs.writeFileSync(path.join(d, 'after-corrupt.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'after-corrupt.txt');
+    return p;
+  });
+  check('P7 损坏容错：warn「整表丢弃」、功能不关闭、文件被重建', () => {
+    assert.equal(calls.length, 1, `投递应照常，实际 ${calls.length}`);
+    assert.ok(warnings.some((m) => m.includes('整表丢弃')), JSON.stringify(warnings));
+    assert.ok(ctx.infos.some((m) => m.includes('损坏已重建')), JSON.stringify(ctx.infos));
+    const data = readState(stateFile);
+    assert.equal(data.version, 1);
+    assert.ok(Object.keys(data.entries).some((k) => k.includes('after-corrupt.txt')));
+  });
+  disp();
+  restoreStateEnv(prev);
+}
+
+// 6) 写失败降级：mock fs 抛错 → 只 warn，本次投递照常
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  warnings.length = 0;
+  const calls = [];
+  const box = capturingWatch();
+  const probe = path.join(d, 'write-fail.txt');
+  fs.writeFileSync(probe, 'x\n<!-- DONE -->\n');
+  const disp = withFs({ ...box.patch, writeFileSync: () => { throw new Error('EACCES: readonly'); } }, () => {
+    const p = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S-WF' }], stableMs: 120 });
+    box.cb('change', 'write-fail.txt');
+    return p;
+  });
+  check('P7 写失败降级：写状态抛错只 warn，本次投递照常且不抛', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(warnings.some((m) => m.includes('状态文件写入失败')), JSON.stringify(warnings));
+  });
+  disp();
+  restoreStateEnv(prev);
+}
+
+// 7) 未投不记：解析不到目标 → 不投也不写表
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  warnings.length = 0;
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => {
+    const p = apply(makeCtx(calls, { get: () => undefined, roots: () => [] }), {
+      watches: [{ dir: d, targetSessionId: 'S-NONE' }], stableMs: 120,
+    });
+    fs.writeFileSync(path.join(d, 'no-target.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'no-target.txt');
+    return p;
+  });
+  check('P7 未投不记：解析不到目标时状态文件不存在（不记指纹）', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+    assert.equal(fs.existsSync(stateFile), false, '未投递不应创建状态文件');
+  });
+  disp();
+  restoreStateEnv(prev);
+}
+
+// 8) 原子写：临时文件 + rename，不留 .tmp
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  const nativeRename = fs.renameSync;
+  const seen = [];
+  const calls = [];
+  const box = capturingWatch();
+  const probe = path.join(d, 'atomic.txt');
+  fs.writeFileSync(probe, 'x\n<!-- DONE -->\n');
+  const disp = withFs({ ...box.patch, renameSync: (from, to) => { seen.push([from, to]); return nativeRename(from, to); } }, () => {
+    const p = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S-ATOM' }], stableMs: 120 });
+    box.cb('change', 'atomic.txt');
+    return p;
+  });
+  check('P7 原子写：先写同目录 .tmp 再 rename，且无残留', () => {
+    assert.equal(calls.length, 1);
+    assert.equal(seen.length, 1, `应恰好一次 rename，实际 ${seen.length}`);
+    const [from, to] = seen[0] ?? [];
+    assert.ok(String(from).endsWith('.tmp'), `临时文件应以 .tmp 结尾：${from}`);
+    assert.equal(to, stateFile, `rename 目标应是状态文件：${to}`);
+    assert.ok(!fs.existsSync(from), '临时文件应已消失');
+  });
+  disp();
+  restoreStateEnv(prev);
+}
+
+// 9) 状态文件落在 watch 目录内 → 改到 profile 根并告警
+{
+  const d = tmp();
+  const home = tmp();
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  const nativeHomedir = os.homedir;
+  process.env.DSH_RELAY_STATE_FILE = path.join(d, 'state.json');
+  os.homedir = () => home;
+  warnings.length = 0;
+  const calls = [];
+  const ctx = infoCtx(calls);
+  const box = capturingWatch();
+  const expected = path.join(home, '.dsh', 'dsh-handoff-relay-state.json');
+  let disp;
+  try {
+    disp = withFs(box.patch, () => {
+      const p = apply(ctx, { watches: [{ dir: d, targetSessionId: 'S-OUT' }], stableMs: 120 });
+      fs.writeFileSync(path.join(d, 'outside.txt'), 'x\n<!-- DONE -->\n');
+      box.cb('change', 'outside.txt');
+      return p;
+    });
+    check('P7 状态文件不在任何 watch 目录内：改到 profile 根，加载日志打出最终路径', () => {
+      assert.equal(calls.length, 1);
+      assert.ok(ctx.infos.some((m) => m.includes('状态文件：') && m.includes(expected)), JSON.stringify(ctx.infos));
+      assert.ok(warnings.some((m) => m.includes('状态文件路径落在 watch 目录内')), JSON.stringify(warnings));
+      assert.equal(fs.existsSync(path.join(d, 'state.json')), false, '不应写进 watch 目录');
+      assert.ok(fs.existsSync(expected), '应写到 profile 根');
+    });
+  } finally {
+    os.homedir = nativeHomedir;
+    restoreStateEnv(prev);
+    if (disp) disp();
+  }
+}
+
+// 10) 加载日志带已载入条目数
+{
+  const d = tmp();
+  const stateFile = path.join(tmp(), 'state.json');
+  const prev = process.env.DSH_RELAY_STATE_FILE;
+  process.env.DSH_RELAY_STATE_FILE = stateFile;
+  fs.writeFileSync(stateFile, JSON.stringify({
+    version: 1,
+    entries: {
+      [`${d}|a.txt|1|1`]: { deliveredAt: '2026-01-01T00:00:00.000Z', targets: ['S'] },
+      [`${d}|b.txt|2|2`]: { deliveredAt: '2026-01-02T00:00:00.000Z', targets: ['S'] },
+    },
+  }));
+  const ctx = infoCtx([]);
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(ctx, { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 }));
+  check('P7 加载日志：状态文件路径 + 已载入条目数', () => {
+    assert.ok(ctx.infos.some((m) => m.includes('状态文件：') && m.includes('已载入 2 个指纹')),
+      `缺加载日志：${JSON.stringify(ctx.infos)}`);
+  });
+  disp();
+  restoreStateEnv(prev);
 }
 
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {

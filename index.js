@@ -3,6 +3,7 @@
 // DONE 命中立即投递；source 用 Session Format v4 的生产者自有 kind。
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 export const name = 'dsh-handoff-relay';
@@ -13,6 +14,9 @@ const TAIL_BYTES = 4096;
 const MAX_REGEX_LENGTH = 200;
 const DEFAULT_STABLE_MS = 5000;
 const DEFAULT_MESSAGE = '文件 {path} 已就绪（触发={reason}），请继续。';
+const STATE_FILENAME = 'dsh-handoff-relay-state.json';
+const STATE_VERSION = 1;
+const MAX_FINGERPRINTS = 500;
 
 function log(ctx, level, msg) {
   const logger = ctx && ctx.logger;
@@ -21,6 +25,118 @@ function log(ctx, level, msg) {
   }
   (level === 'warn' ? console.warn : console.info)(msg);
 }
+// ---------------------------------------------------------------- 落盘去重表
+// 指纹 = dir|relName|mtimeMs|size（不含目标）；同一指纹下记已投达的目标集合，
+// 因此同目录两条 watch 各投各的、互不吞；热重载 / 重启只跳过「同快照 + 同目标」。
+
+function profileRootDir() {
+  const envDir = process.env.DSH_PROFILE_DIR;
+  if (typeof envDir === 'string' && envDir.trim() && path.isAbsolute(envDir.trim())) return envDir.trim();
+  const profile = String(process.env.DSH_PROFILE || '').trim() || 'desktop';
+  return path.join(os.homedir(), '.dsh', 'profiles', profile);
+}
+
+function isInsideDir(dir, target) {
+  const rel = path.relative(dir, target);
+  return rel === '' || (!path.isAbsolute(rel) && rel.split(path.sep)[0] !== '..');
+}
+
+/** 状态文件必须落在任何 watch 目录之外，否则自身写入会触发事件、形成自激。 */
+function resolveStateFile(watchDirs) {
+  const override = process.env.DSH_RELAY_STATE_FILE;
+  const wanted = typeof override === 'string' && override.trim() && path.isAbsolute(override.trim())
+    ? override.trim()
+    : path.join(profileRootDir(), STATE_FILENAME);
+  if (!watchDirs.some((d) => isInsideDir(d, wanted))) return { file: wanted, moved: false, wanted };
+  const fallback = path.join(os.homedir(), '.dsh', STATE_FILENAME);
+  if (!watchDirs.some((d) => isInsideDir(d, fallback))) return { file: fallback, moved: true, wanted };
+  return { file: path.join(os.tmpdir(), STATE_FILENAME), moved: true, wanted };
+}
+
+/** 严格校验整表；任何一处不符都抛错（调用方整表丢弃并从空表重建）。 */
+function parseState(raw) {
+  let data;
+  try { data = JSON.parse(raw); }
+  catch { throw new Error('JSON 不可解析'); }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('顶层不是对象');
+  if (data.version !== STATE_VERSION) throw new Error(`version 不认识（${String(data.version)}）`);
+  const src = data.entries;
+  if (!src || typeof src !== 'object' || Array.isArray(src)) throw new Error('entries 不是对象');
+  const out = {};
+  for (const [key, value] of Object.entries(src)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`条目 ${key} 结构不符`);
+    if (typeof value.deliveredAt !== 'string' || !value.deliveredAt) throw new Error(`条目 ${key} 缺 deliveredAt`);
+    if (!Array.isArray(value.targets) || value.targets.some((t) => typeof t !== 'string')) {
+      throw new Error(`条目 ${key} 的 targets 不是字符串数组`);
+    }
+    out[key] = { deliveredAt: value.deliveredAt, targets: value.targets.slice() };
+  }
+  return out;
+}
+
+/** 单文件单表、所有 watch 共用；读失败按规格降级，写失败只 warn。 */
+function createStateStore(ctx, file) {
+  let entries = {};
+  let rebuilt = false;
+  try {
+    entries = parseState(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      // 文件不存在：视为空表，正常启动。
+    } else {
+      rebuilt = true;
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 状态文件不可用，整表丢弃并从空表重建（功能不关闭）：${String(err && err.message ? err.message : err)}（file=${file}）`);
+    }
+  }
+  function trim() {
+    const keys = Object.keys(entries);
+    if (keys.length <= MAX_FINGERPRINTS) return;
+    const oldest = keys.sort((a, b) => String(entries[a].deliveredAt).localeCompare(String(entries[b].deliveredAt)));
+    for (const key of oldest.slice(0, keys.length - MAX_FINGERPRINTS)) delete entries[key];
+  }
+  /** 原子写：同目录临时文件 + rename；失败只 warn，不重试、不阻塞投递。 */
+  function write() {
+    const payload = { version: STATE_VERSION, entries };
+    const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+      fs.renameSync(tmp, file);
+      return true;
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 状态文件写入失败（本次投递照常，内存表继续用）：${String(err)}（file=${file}）`);
+      return false;
+    }
+  }
+  return {
+    file,
+    rebuilt,
+    count: () => Object.keys(entries).length,
+    isDelivered: (fp, targetId) => Boolean(entries[fp] && entries[fp].targets.includes(targetId)),
+    record(fp, targetId) {
+      const now = new Date().toISOString();
+      const current = entries[fp];
+      if (current) {
+        if (!current.targets.includes(targetId)) current.targets.push(targetId);
+        current.deliveredAt = now;
+      } else {
+        entries[fp] = { deliveredAt: now, targets: [targetId] };
+      }
+      trim();
+      write();
+    },
+  };
+}
+
+function fingerprint(dir, relName, state) {
+  return `${dir}|${relName}|${state.mtimeMs}|${state.size}`;
+}
+
+function targetIdOf(target) {
+  return target.kind === 'title' ? `title:${target.value}` : target.value;
+}
+
 /** 拒绝嵌套量词（(a+)+、(x*)* 之类），防灾难性回溯卡死事件循环。 */
 function hasNestedQuantifier(src) {
   const stack = [];
@@ -199,7 +315,7 @@ function buildMessage(relName, fullPath, state, reason, template) {
   });
 }
 
-function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad) {
+function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, store) {
   const pending = new Map();   // relName → { size, mtimeMs, sig, timer }；不轮询
   const delivered = new Set(); // 已投递快照，防止同一 (文件,size,mtimeMs) 重复 followup
   let closed = false;
@@ -256,10 +372,18 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话 ${resolved.id} 投递时已不可用；文件 ${full} 未投递`);
       return;
     }
+    // 落盘去重：仅拦截「同一快照 + 同一目标」；同快照换目标照投并追加。
+    const targetId = targetIdOf(target);
+    const fp = fingerprint(watchDir, relName, state);
+    if (store && store.isDelivered(fp, targetId)) {
+      log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 跳过重复投递：${relName}（目标 ${targetId} 已收到过同一快照，指纹=${fp}）`);
+      return;
+    }
     const message = buildMessage(relName, full, state, reason, cfg.message);
     try {
       agent.followup(message);
       log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${resolved.id}（${label}，文件=${full}，触发=${reason}）`);
+      if (store) store.record(fp, targetId);
     } catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] followup 抛错：${String(err)}`); }
   }
 
@@ -337,6 +461,20 @@ export function apply(ctx, config = {}) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] 未启动：watches 必须是长度 ≥1 的数组`);
     return dispose;
   }
+  // 状态文件必须落在所有 watch 目录之外：先把可读的目录收齐，再定最终路径。
+  const watchDirs = [];
+  for (const w of watches) {
+    const dir = w && w.dir;
+    if (typeof dir === 'string' && path.isAbsolute(dir)) {
+      try { if (fs.statSync(dir).isDirectory()) watchDirs.push(dir); } catch { /* 不可读的 dir 不参与路径判定 */ }
+    }
+  }
+  const statePath = resolveStateFile(watchDirs);
+  if (statePath.moved) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] 状态文件路径落在 watch 目录内，已改到 ${statePath.file}（原=${statePath.wanted}）`);
+  }
+  const store = createStateStore(ctx, statePath.file);
+  log(ctx, 'info', `[${PLUGIN_NAME}] 状态文件：${statePath.file}（已载入 ${store.count()} 个指纹${store.rebuilt ? '，损坏已重建' : ''}）`);
   watches.forEach((w, i) => {
     const label = `watches[${i}]`;
     const dir = w && w.dir;
@@ -377,7 +515,7 @@ export function apply(ctx, config = {}) {
         : `targetSessionId=${target.value}`;
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
-    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad);
+    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, store);
     if (d) { disposers.push(d); startedModes.push(done.mode); }
   });
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
