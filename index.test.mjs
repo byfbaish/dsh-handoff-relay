@@ -79,8 +79,10 @@ check('T4 UserMessage 形状（id/role/content/source）', () => {
   assert.ok(Array.isArray(m.content));
   assert.equal(m.content[0].type, 'text');
   assert.equal(typeof m.content[0].text, 'string');
-  assert.equal(m.source.kind, 'plugin');
-  assert.equal(m.source.plugin, 'dsh-file-watch');
+  // Session Format v4：source.kind 必须是生产者自有标识，不能是通用 'plugin'。
+  assert.notEqual(m.source.kind, 'plugin', 'v4 不接受通用 plugin kind');
+  assert.equal(m.source.kind, 'plugin:dsh-file-watch');
+  assert.ok(typeof m.source.kind === 'string' && m.source.kind.length > 0);
   out(`       消息原文：${m.content[0].text}`);
   out(`       消息 JSON：${JSON.stringify(m)}`);
 });

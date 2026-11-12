@@ -8,7 +8,10 @@
 //       ~/.dsh/profiles/node_modules/@deepseek-ai/dsh-llm/lib/types/message.d.ts
 //         :120-133  Message   { id, role, content: ContentBlock[], source }
 //         :131-133  UserMessage extends Message { role: 'user' }
-//         :98-101   plugin source { kind: 'plugin', plugin: string } & ContextFormed
+//         :98-101   Session Format v4 要求 source.kind 为「生产者自有」标识：
+//                   非空字符串且不等于 'plugin'（如 'plugin:dsh-file-watch'）。
+//                   旧版 v3 写法 { kind: 'plugin', plugin: string } 在 v4 下抛 SessionFormatError，
+//                   会让接收方整个 turn 失败——不只是这条消息被拒。
 //                   （ContextFormed 的 `{ form?: never }` 分支允许不写 form）
 //       ~/.dsh/profiles/node_modules/@deepseek-ai/dsh-llm/lib/types/types.d.ts
 //         :39-42    TextBlock { type: 'text', text: string }
@@ -80,7 +83,9 @@ function buildMessage(relName, state, reason, template) {
     id: randomUUID(),                       // MessageId = 品牌字符串，运行期即 randomUUID()
     role: 'user',
     content: Object.freeze([Object.freeze({ type: 'text', text })]),
-    source: Object.freeze({ kind: 'plugin', plugin: PLUGIN_NAME }),
+    // Session Format v4：source.kind 必须是「生产者自有」标识，非空且不等于 'plugin'。
+    // 旧写法 { kind: 'plugin', plugin: 'x' } 在 v4 下会抛 SessionFormatError，令整个 turn 失败。
+    source: Object.freeze({ kind: `plugin:${PLUGIN_NAME}` }),
   });
 }
 
