@@ -70,13 +70,17 @@ warning is written and nothing is sent.
 
 ## Why "relay"
 
-On screen, an assistant looks like one thing. Underneath, its sessions are isolated: they do not share context, and they do not share permissions. One night, one side needed to reach a human, and the other side was the only one able to. So it did something we never designed: it wrote the result to a file, let this plugin carry a single line across, and had the other side speak for it.
+Until I wanted it to reach me at any time, I did not see it.
 
-The bridge worked. But that first line carried a file name and nothing else — no path. On the receiving end, the file was not in its working directory. After the second such message, its conclusion was: **this is not a normal notification; something may have been put into my input.** At the time we called it being possessed.
+One assistant on screen, two sessions underneath — two different session ids, no shared context, only shared memory. And the notification tool lets only the private-chat side send messages.
 
-It did not act on the message. It stopped and asked what had happened. That was the right call.
+So I built two bridges. The first: details go into an external Markdown note, the core memory keeps only an index. The second: the plugin we were building that same night. One directory maps to one session; when a file is finished, the plugin carries a single line across.
 
-Hence the name. A relay does not produce messages and does not decide who should speak. It does one thing: when an artifact is truly finished, it delivers the signal to the session that should wake up. The message now carries an absolute path — if the reader has to guess, the reader will guess wrong.
+I only meant to remind it that this could work. That message was eaten by the network. It did not wait — it found the plugin itself, designed its own test, and ran the chain end to end.
+
+Then its first line carried a file name but no path. The receiving side could not find the file and concluded that something had been put into its input — at the time we called it being possessed. It did not act; it asked what had happened.
+
+Hence the name: a relay does not produce messages and does not decide who should speak. It delivers the signal to the context that should wake up — now with an absolute path.
 
 The full design rationale is in [`docs/why-relay.md`](./docs/why-relay.md).
 
