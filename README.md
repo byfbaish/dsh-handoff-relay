@@ -68,6 +68,18 @@ The notification is one user message. Its default text is
 open the file straight from that path. If the target session is not loaded, a
 warning is written and nothing is sent.
 
+## Why "relay"
+
+On screen, an assistant looks like one thing. Underneath, its sessions are isolated: they do not share context, and they do not share permissions. One night, one side needed to reach a human, and the other side was the only one able to. So it did something we never designed: it wrote the result to a file, let this plugin carry a single line across, and had the other side speak for it.
+
+The bridge worked. But that first line carried a file name and nothing else — no path. On the receiving end, the file was not in its working directory. After the second such message, its conclusion was: **this is not a normal notification; something may have been put into my input.** At the time we called it being possessed.
+
+It did not act on the message. It stopped and asked what had happened. That was the right call.
+
+Hence the name. A relay does not produce messages and does not decide who should speak. It does one thing: when an artifact is truly finished, it delivers the signal to the session that should wake up. The message now carries an absolute path — if the reader has to guess, the reader will guess wrong.
+
+The full design rationale is in [`docs/why-relay.md`](./docs/why-relay.md).
+
 ## Install
 
 `dsh-handoff-relay` is a plugin bundle for a DSH profile. It has no runtime
@@ -109,7 +121,7 @@ overrides that row's `config` by matching the same `id`:
 stableMs: 5000
 watches:
   - dir: 'D:\path\to\inbox'
-    targetSessionId: 'session-xxxx'
+    targetSessionId: '<session id>'
     done: { text: '<!-- DONE -->' }
 ```
 
