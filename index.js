@@ -12,7 +12,7 @@ const DEFAULT_DONE_TEXT = '<!-- DONE -->';
 const TAIL_BYTES = 4096;
 const MAX_REGEX_LENGTH = 200;
 const DEFAULT_STABLE_MS = 5000;
-const DEFAULT_MESSAGE = '文件 {file} 已就绪（触发={reason}），请继续。';
+const DEFAULT_MESSAGE = '文件 {path} 已就绪（触发={reason}），请继续。';
 
 function log(ctx, level, msg) {
   const logger = ctx && ctx.logger;
@@ -103,44 +103,92 @@ function tailHasDone(full, size, judge) {
 }
 
 /**
- * 加载期解析 targetSessionId 对应的会话，区分「会话是否存在」与「有没有标题」两态。
- * 解析顺序固定为 agents.get(id) → roots() 兜底（不改动既有顺序）。
- * found=false 表示 agent 确实解析不到（真失效）；found=true 表示会话存在，title 可能为空。
+ * 取 agent 的会话标题；没有标题返回 ''。
  * 标题权威来源是 `sessionTitle` 服务（折叠会话日志，含启动前写入的标题）；
  * agent 上的 title/name/label 等字段作为兜底。标题解析异常只当作「无标题」，不回退成失效。
  */
-function resolveSession(ctx, targetSessionId) {
-  const agents = ctx && ctx.agents;
-  let agent;
-  try { agent = agents && typeof agents.get === 'function' ? agents.get(targetSessionId) : undefined; }
-  catch { /* ignore */ }
-  if (!agent && agents && typeof agents.roots === 'function') {
-    try { agent = (agents.roots() || []).find((a) => a && a.id === targetSessionId); }
-    catch { /* ignore */ }
-  }
-  if (!agent) return { found: false, title: '' };
+function sessionTitleOf(ctx, agent) {
   try {
-    const session = agent.session;
+    const session = agent && agent.session;
     const svc = ctx && typeof ctx.get === 'function' ? ctx.get('sessionTitle') : null;
     if (svc && typeof svc.get === 'function' && session != null) {
       const snap = svc.get(session);
       const ti = typeof snap === 'string' ? snap : (snap && (snap.title || snap.text));
       const s = String(ti == null ? '' : ti).trim();
-      if (s) return { found: true, title: s };
+      if (s) return s;
     }
-    const cands = [agent.title, agent.name, agent.label,
-      agent.session && agent.session.title, agent.session && agent.session.name,
-      agent.meta && agent.meta.title, agent.meta && agent.meta.name];
+    const cands = [agent && agent.title, agent && agent.name, agent && agent.label,
+      session && session.title, session && session.name,
+      agent && agent.meta && agent.meta.title, agent && agent.meta && agent.meta.name];
     for (const c of cands) {
       const s = String(c == null ? '' : c).trim();
-      if (s) return { found: true, title: s };
+      if (s) return s;
     }
   } catch { /* ignore */ }
-  return { found: true, title: '' };
+  return '';
 }
 
-function buildMessage(relName, state, reason, template) {
-  const text = template.replaceAll('{file}', relName).replaceAll('{reason}', reason)
+/** 按 id 找 agent：agents.get(id) → roots() 兜底（顺序不变）；找不到返回 undefined。 */
+function findAgentById(ctx, id, onError) {
+  const agents = ctx && ctx.agents;
+  let agent;
+  try { agent = agents && typeof agents.get === 'function' ? agents.get(id) : undefined; }
+  catch (err) { if (onError) onError('agents.get 抛错', err); }
+  if (!agent && agents && typeof agents.roots === 'function') {
+    try { agent = (agents.roots() || []).find((a) => a && a.id === id); }
+    catch (err) { if (onError) onError('agents.roots 抛错', err); }
+  }
+  return agent;
+}
+
+/**
+ * 解析 targetSessionId 对应的会话，区分「会话是否存在」与「有没有标题」两态。
+ * found=false 表示 agent 确实解析不到（真失效）；found=true 表示会话存在，title 可能为空。
+ */
+function resolveSession(ctx, targetSessionId, onError) {
+  const agent = findAgentById(ctx, targetSessionId, onError);
+  if (!agent) return { found: false, title: '', agent: undefined };
+  return { found: true, title: sessionTitleOf(ctx, agent), agent };
+}
+
+/** 标题包含匹配（区分大小写，不做严格相等）；返回 [{ id, title, agent }]，顺序同 roots()。 */
+function matchSessionsByTitle(ctx, targetTitle, onError) {
+  const agents = ctx && ctx.agents;
+  let list;
+  try { list = agents && typeof agents.roots === 'function' ? (agents.roots() || []) : []; }
+  catch (err) { if (onError) onError('agents.roots 抛错', err); list = []; }
+  const hits = [];
+  for (const a of list) {
+    if (!a || !a.id) continue;
+    const title = sessionTitleOf(ctx, a);
+    if (title && title.includes(targetTitle)) hits.push({ id: a.id, title, agent: a });
+  }
+  return hits;
+}
+
+/** 候选清单文案：<id>（<标题>） 用「、」串联。 */
+function hitsText(hits) {
+  return (hits || []).map((h) => `${h.id}（${h.title}）`).join('、');
+}
+
+/**
+ * 加载期的「现在能否解析到」快照：只用于打日志与 warn，不缓存给投递用。
+ * 返回 { ok, id, title, count, hits }；id 型解析不到时 count=0。
+ */
+function describeTargetNow(ctx, target) {
+  if (target.kind === 'id') {
+    const s = resolveSession(ctx, target.value);
+    if (!s.found) return { ok: false, id: '', title: '', count: 0, hits: [] };
+    return { ok: true, id: target.value, title: s.title || '(无标题)', count: 1, hits: [] };
+  }
+  const hits = matchSessionsByTitle(ctx, target.value);
+  if (hits.length === 1) return { ok: true, id: hits[0].id, title: hits[0].title, count: 1, hits };
+  return { ok: false, id: '', title: '', count: hits.length, hits };
+}
+
+function buildMessage(relName, fullPath, state, reason, template) {
+  const text = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
+    .replaceAll('{reason}', reason)
     .replaceAll('{size}', String(state.size)).replaceAll('{mtimeMs}', String(state.mtimeMs));
   return Object.freeze({
     id: randomUUID(),
@@ -151,7 +199,7 @@ function buildMessage(relName, state, reason, template) {
   });
 }
 
-function startWatch(ctx, cfg, watchDir, targetSessionId, label, judge, mode, sessionTitle) {
+function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad) {
   const pending = new Map();   // relName → { size, mtimeMs, sig, timer }；不轮询
   const delivered = new Set(); // 已投递快照，防止同一 (文件,size,mtimeMs) 重复 followup
   let closed = false;
@@ -163,35 +211,55 @@ function startWatch(ctx, cfg, watchDir, targetSessionId, label, judge, mode, ses
     for (const state of pending.values()) clearTimeout(state.timer);
     pending.clear();
   }
-  function resolveAgent() {
-    const agents = ctx && ctx.agents;
-    let agent;
-    try { agent = agents && typeof agents.get === 'function' ? agents.get(targetSessionId) : undefined; }
-    catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] agents.get 抛错：${String(err)}`); }
-    if (!agent && agents && typeof agents.roots === 'function') {
-      try { agent = (agents.roots() || []).find((a) => a && a.id === targetSessionId); }
-      catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] agents.roots 抛错：${String(err)}`); }
+  const targetText = target.kind === 'title' ? `targetTitle="${target.value}"` : `targetSessionId=${target.value}`;
+  const warnErr = (kind, err) => log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} ${kind}：${String(err)}`);
+
+  /**
+   * 每次投递前现解析目标（不缓存、不按 cwd 猜）：
+   * id 型沿用 get(id) → roots() 兜底；title 型走包含匹配，命中必须恰好 1 个。
+   * 解析不到 / 有歧义一律返回 null 并告警，不投递。
+   */
+  function resolveNow(relName) {
+    if (target.kind === 'id') {
+      const agent = findAgentById(ctx, target.value, warnErr);
+      if (!agent) {
+        let ids = '[]';
+        try {
+          if (ctx.agents && typeof ctx.agents.roots === 'function') ids = JSON.stringify((ctx.agents.roots() || []).map((a) => a && a.id).filter(Boolean));
+        } catch { /* ignore */ }
+        log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话未加载：get(${target.value}) 返回 undefined，roots() 中亦无匹配；文件 ${relName} 未投递。当前可用 roots id: ${ids}`);
+        return null;
+      }
+      return { id: target.value, title: sessionTitleOf(ctx, agent) || '(无标题)', agent };
     }
-    return { agent, agents };
+    const hits = matchSessionsByTitle(ctx, target.value, warnErr);
+    if (hits.length === 1) return hits[0];
+    if (hits.length === 0) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题解析不到：${targetText} 命中 0 条（dir=${watchDir}）；文件 ${relName} 未投递（不按 cwd 兜底）`);
+      return null;
+    }
+    log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题有歧义：${targetText} 命中 ${hits.length} 条，候选：${hitsText(hits)}（dir=${watchDir}）；文件 ${relName} 未投递（歧义不猜）`);
+    return null;
   }
+
   function deliver(relName, state, reason) {
     const key = `${relName}|${state.sig}`;
     if (delivered.has(key)) return;
     delivered.add(key);
     clearTimeout(state.timer);
     pending.delete(relName);
-    const { agent, agents } = resolveAgent();
+    const full = path.join(watchDir, relName);
+    const resolved = resolveNow(relName);
+    if (!resolved) return;
+    const agent = resolved.agent || findAgentById(ctx, resolved.id, warnErr);
     if (!agent) {
-      let ids = '[]';
-      try { if (agents && typeof agents.roots === 'function') ids = JSON.stringify((agents.roots() || []).map((a) => a && a.id).filter(Boolean)); }
-      catch { /* ignore */ }
-      log(ctx, 'warn', `[${PLUGIN_NAME}] 会话未加载：get(${targetSessionId}) 返回 undefined，roots() 中亦无匹配；文件 ${relName} 未投递。当前可用 roots id: ${ids}`);
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话 ${resolved.id} 投递时已不可用；文件 ${full} 未投递`);
       return;
     }
-    const message = buildMessage(relName, state, reason, cfg.message);
+    const message = buildMessage(relName, full, state, reason, cfg.message);
     try {
       agent.followup(message);
-      log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${targetSessionId}（${label}，文件=${relName}，触发=${reason}）`);
+      log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${resolved.id}（${label}，文件=${full}，触发=${reason}）`);
     } catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] followup 抛错：${String(err)}`); }
   }
 
@@ -249,7 +317,10 @@ function startWatch(ctx, cfg, watchDir, targetSessionId, label, judge, mode, ses
     dispose();
     return null;
   }
-  log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已加载：dir=${watchDir}，targetSessionId=${targetSessionId}，会话标题=${sessionTitle}，stableMs=${cfg.stableMs}，done=${mode}`);
+  const resolvedText = atLoad.ok
+    ? `解析到 ${atLoad.id}（${atLoad.title}）`
+    : '解析不到，投递时会跳过';
+  log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已加载：dir=${watchDir}，目标=${targetText} → ${resolvedText}，stableMs=${cfg.stableMs}，done=${mode}`);
   return dispose;
 }
 
@@ -269,13 +340,20 @@ export function apply(ctx, config = {}) {
   watches.forEach((w, i) => {
     const label = `watches[${i}]`;
     const dir = w && w.dir;
-    const target = w && w.targetSessionId;
+    const rawId = w && w.targetSessionId;
+    const rawTitle = w && w.targetTitle;
     if (!dir || typeof dir !== 'string' || !path.isAbsolute(dir)) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：dir 必须是绝对路径（当前=${String(dir)}）`);
       return;
     }
-    if (!target || typeof target !== 'string') {
-      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetSessionId 必须是非空字符串`);
+    const hasId = typeof rawId === 'string' && rawId.trim() !== '';
+    const hasTitle = typeof rawTitle === 'string' && rawTitle.trim() !== '';
+    if (hasId && hasTitle) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetSessionId 与 targetTitle 只能二选一（两个都写了，不猜哪个优先）`);
+      return;
+    }
+    if (!hasId && !hasTitle) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetSessionId 必须是非空字符串（或改用 targetTitle，二者二选一；当前 targetSessionId=${String(rawId)}，targetTitle=${String(rawTitle)}）`);
       return;
     }
     try {
@@ -288,12 +366,18 @@ export function apply(ctx, config = {}) {
     if (done.error) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 done 规则未启用，退回只按 stableMs 投递：${done.error}（dir=${dir}）`);
     }
-    const session = resolveSession(ctx, target);
-    if (!session.found) {
-      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：targetSessionId=${target}（dir=${dir}），该 watch 仍启动，请确认会话存在`);
+    const target = hasTitle
+      ? { kind: 'title', value: rawTitle.trim() }
+      : { kind: 'id', value: rawId };
+    // 启动期校验＝「现在能否解析到」：解析不到只 warn，不阻断加载，也不影响其他 watch。
+    const atLoad = describeTargetNow(ctx, target);
+    if (!atLoad.ok) {
+      const which = target.kind === 'title'
+        ? `targetTitle="${target.value}" 命中 ${atLoad.count} 条${atLoad.count ? `，候选：${hitsText(atLoad.hits)}` : ''}`
+        : `targetSessionId=${target.value}`;
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
-    const titleLabel = session.title || '(无标题)';
-    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, titleLabel);
+    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad);
     if (d) { disposers.push(d); startedModes.push(done.mode); }
   });
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);

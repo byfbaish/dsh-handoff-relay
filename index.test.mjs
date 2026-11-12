@@ -908,6 +908,185 @@ const infoCtx = (calls, opts) => {
   disp();
 }
 
+// ====================== P6 会话寻址（title 包含匹配 / 启动解析日志 / 通知带路径） ======================
+/**
+ * 标题型 ctx：agents.roots() 返回带 id/session 的 agent，ctx.get('sessionTitle') 提供标题。
+ * entries: [{ id, title }]；byId 用于按目标 id 分桶，验证不串。
+ */
+function makeTitleCtx(calls, entries, opts = {}) {
+  const titles = new Map(entries.map((e) => [e.id, e.title]));
+  const agents = entries.map((e) => ({
+    id: e.id,
+    session: { id: e.id },
+    followup: (m) => {
+      if (opts.byId) (opts.byId[e.id] ?? calls).push(m);
+      else calls.push(m);
+    },
+  }));
+  return {
+    agents: { get: (id) => agents.find((a) => a.id === id), roots: () => agents },
+    get: (name) => (name === 'sessionTitle'
+      ? { get: (session) => (session ? (titles.get(session.id) || '') : '') }
+      : undefined),
+    logger: { info: () => {}, warn: (m) => warnings.push(m) },
+  };
+}
+
+// targetSessionId / targetTitle 二选一：双写、双空都只跳过该条
+{
+  const dDup = tmp();
+  const dNone = tmp();
+  const dOk = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P6-OK', title: '周简报' }]);
+  const disp = apply(ctx, {
+    watches: [
+      { dir: dDup, targetSessionId: 'P6-OK', targetTitle: '周简报' },
+      { dir: dNone },
+      { dir: dOk, targetTitle: '简报' },
+    ],
+    stableMs: 120,
+  });
+  fs.writeFileSync(path.join(dOk, 'ok.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P6 双写 / 双空 → 只跳过该条并点名 warn，其他 watch 照常投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('ok.txt'), calls[0].content[0].text);
+    assert.ok(warnings.some((m) => m.includes('跳过 watches[0]') && m.includes('只能二选一')),
+      `缺双写 warn：${JSON.stringify(warnings)}`);
+    assert.ok(warnings.some((m) => m.includes('跳过 watches[1]') && m.includes('targetSessionId 必须是非空字符串')),
+      `缺双空 warn：${JSON.stringify(warnings)}`);
+  });
+  disp();
+}
+
+// title 命中 0 条 → 不投递且 warn（带 watch 名、目标标题、命中条数、dir）
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P6-A', title: '周简报' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '月报' }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'zero.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P6 title 命中 0 条 → 不投递，warn 含 watch 名 / 目标标题 / 命中 0 条 / dir', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+    assert.ok(warnings.some((m) => m.includes('watches[0]') && m.includes('月报') && m.includes('命中 0 条') && m.includes(d)),
+      `缺 0 命中 warn：${JSON.stringify(warnings)}`);
+  });
+  disp();
+}
+
+// title 命中 2 条 → 不投递且 warn（候选 id + 标题都要出现）
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P6-B1', title: '周简报' }, { id: 'P6-B2', title: '周简报（二）' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报' }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'two.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P6 title 命中 2 条 → 不投递，warn 列出候选 id 与标题', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+    const hits = warnings.filter((m) => m.includes('命中 2 条'));
+    assert.ok(hits.length >= 1, `缺 2 命中 warn：${JSON.stringify(warnings)}`);
+    assert.ok(hits.some((m) => m.includes('P6-B1') && m.includes('P6-B2') && m.includes('周简报')),
+      `候选未列全：${JSON.stringify(hits)}`);
+  });
+  disp();
+}
+
+// 包含匹配（不是严格相等）唯一命中 → 正常投递
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P6-C', title: '周简报' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报' }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'contains.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P6 包含匹配（简报 命中 周简报）→ 投递正确且 source.kind 不变', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.equal(calls[0].source.kind, 'plugin:dsh-handoff-relay');
+    assert.ok(calls[0].content[0].text.includes('contains.txt'), calls[0].content[0].text);
+  });
+  disp();
+}
+
+// title 型与 id 型混用 → 各自投各自目标，不串
+{
+  const dId = tmp();
+  const dTitle = tmp();
+  const buckets = { 'P6-D-ID': [], 'P6-D-TITLE': [] };
+  warnings.length = 0;
+  const ctx = makeTitleCtx([], [{ id: 'P6-D-ID', title: '日报' }, { id: 'P6-D-TITLE', title: '周报' }], { byId: buckets });
+  const disp = apply(ctx, {
+    watches: [
+      { dir: dId, targetSessionId: 'P6-D-ID' },
+      { dir: dTitle, targetTitle: '周报' },
+    ],
+    stableMs: 120,
+  });
+  fs.writeFileSync(path.join(dId, 'by-id.txt'), 'x\n<!-- DONE -->\n');
+  fs.writeFileSync(path.join(dTitle, 'by-title.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P6 title 与 id 混用 → 各自投各自目标，不串', () => {
+    assert.equal(buckets['P6-D-ID'].length, 1, `id 型期望 1，实际 ${buckets['P6-D-ID'].length}`);
+    assert.equal(buckets['P6-D-TITLE'].length, 1, `title 型期望 1，实际 ${buckets['P6-D-TITLE'].length}`);
+    const t1 = buckets['P6-D-ID'][0].content[0].text;
+    const t2 = buckets['P6-D-TITLE'][0].content[0].text;
+    assert.ok(t1.includes('by-id.txt') && !t1.includes('by-title.txt'), `id 型串了：${t1}`);
+    assert.ok(t2.includes('by-title.txt') && !t2.includes('by-id.txt'), `title 型串了：${t2}`);
+  });
+  disp();
+}
+
+// 投递文案带绝对路径（默认模板 {path}），{file} 仍填文件名
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P6-E', title: '收件箱' }]);
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetTitle: '收件箱' }], stableMs: 120,
+  }));
+  const f = path.join(d, 'abs.txt');
+  fs.writeFileSync(f, 'x\n<!-- DONE -->\n');
+  box.cb('change', 'abs.txt');
+  check('P6 投递文案含文件绝对路径（默认模板 {path}）', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.equal(calls[0].content[0].text, `文件 ${f} 已就绪（触发=DONE），请继续。`);
+    assert.ok(path.isAbsolute(f));
+  });
+  disp();
+}
+
+// 加载期每条 watch 一行解析日志（解析到 / 解析不到）
+{
+  const dOk = tmp();
+  const dMiss = tmp();
+  const infos = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx([], [{ id: 'P6-F', title: '周简报' }]);
+  ctx.logger = { info: (m) => infos.push(m), warn: (m) => warnings.push(m) };
+  const disp = apply(ctx, {
+    watches: [
+      { dir: dOk, targetTitle: '简报' },
+      { dir: dMiss, targetTitle: '不存在' },
+    ],
+    stableMs: 5000,
+  });
+  check('P6 加载期每条 watch 一行解析日志：目标=… → 解析到 <id>（<标题>）/ 解析不到，投递时会跳过', () => {
+    assert.ok(infos.some((m) => m.includes('watches[0]') && m.includes('目标=targetTitle="简报"') && m.includes('解析到 P6-F（周简报）')),
+      `缺 watches[0] 解析日志：${JSON.stringify(infos)}`);
+    assert.ok(infos.some((m) => m.includes('watches[1]') && m.includes('解析不到，投递时会跳过')),
+      `缺 watches[1] 解析不到日志：${JSON.stringify(infos)}`);
+  });
+  disp();
+}
+
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }
