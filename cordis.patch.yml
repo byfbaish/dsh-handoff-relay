@@ -1,0 +1,11 @@
+# Bundle patch layer for a cordis-based plugin bundle.
+# A bundle can ship its own patch file through the `dsh.bundle.patch` field in
+# package.json. Loader layers are applied in order: each bundle's `insert`
+# entries add plugin rows to the tree, then the profile patch layer can
+# override a row's config by matching its id.
+# This layer only inserts the row; config values are set in the profile patch
+# and matched by the same id.
+- insert:
+    - id: dsh-file-watch
+      name: dsh-file-watch
+      config: {}
