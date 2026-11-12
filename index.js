@@ -1,6 +1,6 @@
 // dsh-file-watch · 每个 watch 独立 fs.watch，各自持 (size, mtimeMs) 与 marker 状态。
 // 判定：事件记快照 → 重置静默 timer → 到期再 stat，两值没变才投递；变了重新计时、不投递、不排队。
-// DONE 命中立即投递；source 依 Session Format v4（生产者自有 kind），取证见 reports/p2-multi-watch.md。
+// DONE 命中立即投递；source 用 Session Format v4 的生产者自有 kind。
 
 import fs from 'node:fs';
 import path from 'node:path';

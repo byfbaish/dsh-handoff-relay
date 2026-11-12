@@ -34,30 +34,72 @@ is not loaded, a warning is written and nothing is sent.
 
 ## Install
 
-Register the package as a bundle in a profile, then set its config in that
-profile's patch layer:
+`dsh-file-watch` is a plugin bundle for a DSH profile (the host that loads
+cordis-based bundles). It has no runtime dependencies, so installing it is just
+linking a local directory into a profile.
 
-```yaml
-- id: dsh-file-watch
-  name: dsh-file-watch
-  config:
-    watches:
-      - dir: '/absolute/path/to/first-outbox'
-        targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-      - dir: '/absolute/path/to/second-outbox'
-        targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
-    stableMs: 5000
-    doneMarker: '<!-- DONE -->'
-```
+1. Put this repository in a local directory, for example
+   `/srv/dsh-file-watch` (clone it, or copy the checkout there).
+2. In the profile directory, add a `file:` dependency pointing at that
+   directory in `package.json`, and register the package name in
+   `dsh.profile.bundles`. Keep the other entries already present in both
+   lists — only add these two:
 
-`watches` must contain at least one entry, and every entry needs both `dir`
-and `targetSessionId`. Each `dir` must be an existing absolute directory.
-An entry that is missing either field, or whose directory cannot be read, is
-skipped with a warning naming which entry it was; the remaining watches still
-start. The plugin only reacts to filesystem events; it never polls.
+   ```json
+   {
+     "dependencies": {
+       "dsh-file-watch": "file:/absolute/path/to/dsh-file-watch"
+     },
+     "dsh": {
+       "profile": {
+         "bundles": ["dsh-file-watch"]
+       }
+     }
+   }
+   ```
 
-`stableMs` and `doneMarker` are global values shared by all watches. Per-entry
-overrides are not supported.
+   The `file:` value must be an absolute path to the directory containing this
+   package's `package.json`.
+3. Run `pnpm install` in the profile directory (or the equivalent install
+   command of your package manager) so the local package is linked into the
+   profile's `node_modules`. Re-run it after changing the package's source.
+4. Add a row with the same `id` to the profile's `cordis.patch.yml` and set the
+   config there. The bundle ships its own patch layer (`dsh.bundle.patch` in
+   `package.json`) that inserts the plugin row; the profile patch layer
+   overrides that row's config by matching its `id`:
+
+   ```yaml
+   - id: dsh-file-watch
+     name: dsh-file-watch
+     config:
+       watches:
+         - dir: '/absolute/path/to/first-outbox'
+           targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+         - dir: '/absolute/path/to/second-outbox'
+           targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
+       stableMs: 5000
+       doneMarker: '<!-- DONE -->'
+   ```
+
+5. Restart the host so the new bundle and its config are loaded.
+
+### Config fields
+
+- `watches` — a non-empty array of watch entries; each entry needs `dir` and
+  `targetSessionId`. Each `dir` must be an existing absolute directory. An
+  entry missing either field, or whose directory cannot be read, is skipped
+  with a warning naming the entry; the remaining watches still start. The
+  plugin only reacts to filesystem events; it never polls.
+- `stableMs` — silence window in milliseconds, shared by all watches (default
+  `5000`). A file counts as finished once `(size, mtimeMs)` has been unchanged
+  for this long. Per-entry overrides are not supported.
+- `doneMarker` — immediate-delivery marker, shared by all watches (default
+  `<!-- DONE -->`). When it appears in the last 2 KB of a file, that file is
+  delivered immediately without waiting for `stableMs`.
+
+**`targetSessionId` must point to a session that currently exists. Session ids
+change when the host restarts, so re-wire `targetSessionId` after every
+restart.**
 
 ## Config
 
@@ -76,9 +118,9 @@ overrides are not supported.
 node index.test.mjs
 ```
 
-Uses real temporary directories and the real silence window; expects
-`8/8 PASS`.
+Uses real temporary directories and the real silence window; expects every
+case to report `PASS` and the summary to end with `RESULT: PASS`.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

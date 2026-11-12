@@ -1,7 +1,7 @@
 // dsh-file-watch · 代码级自测（不依赖 DSH 重启、不 import 任何 DSH 包）
 // 运行：node index.test.mjs
 //
-// 假 ctx 形状按任务给定：{ agents: { get: () => ({ followup: (m) => calls.push(m) }) } }
+// 最小假 ctx 形状：{ agents: { get: () => ({ followup: (m) => calls.push(m) }) } }
 // 用真实临时目录 + 真实 fs.watch + 真实静默窗口，不用假时钟、不轮询目录。
 //
 // 判定线：
@@ -207,7 +207,429 @@ check('T8 一个 watch 目录不存在时，另一个 watch 照常工作', () =>
 });
 disposeE();
 
-for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE]) {
+// ------------------------------------------------- 边界与容错分支的覆盖
+// 这里只增加断言；为精确触发边界，部分场景临时替换 node:fs 的方法，用完立即还原。
+function withFs(patch, fn) {
+  const saved = {};
+  for (const k of Object.keys(patch)) saved[k] = fs[k];
+  try {
+    for (const k of Object.keys(patch)) fs[k] = patch[k];
+    return fn();
+  } finally {
+    for (const k of Object.keys(saved)) fs[k] = saved[k];
+  }
+}
+function capturingWatch() {
+  const box = { cb: null, handlers: {} };
+  box.patch = {
+    watch: (_dir, _opts, cb) => {
+      box.cb = cb;
+      return {
+        on(ev, fn) { box.handlers[ev] = fn; return this; },
+        close() {},
+      };
+    },
+  };
+  return box;
+}
+const extraDirs = [];
+const tmp = () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-x-'));
+  extraDirs.push(d);
+  return d;
+};
+const infoCtx = (calls) => {
+  const ctx = makeCtx(calls);
+  const infos = [];
+  ctx.logger.info = (m) => infos.push(m);
+  ctx.infos = infos;
+  return ctx;
+};
+
+// stableMs 非法值回退
+{
+  const d1 = tmp();
+  const d2 = tmp();
+  const x1 = infoCtx([]);
+  const x2 = infoCtx([]);
+  const p1 = apply(x1, { watches: [{ dir: d1, targetSessionId: 'S' }], stableMs: 0 });
+  const p2 = apply(x2, { watches: [{ dir: d2, targetSessionId: 'S' }], stableMs: NaN });
+  check('stableMs 非正数 / 非有限值回退到默认 5000', () => {
+    assert.ok(x1.infos.some((m) => m.includes('stableMs=5000')), `未回退：${JSON.stringify(x1.infos)}`);
+    assert.ok(x2.infos.some((m) => m.includes('stableMs=5000')), `未回退：${JSON.stringify(x2.infos)}`);
+  });
+  p1(); p2();
+}
+
+// message 模板替换四个占位符
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120,
+    message: 'F={file}|R={reason}|S={size}|M={mtimeMs}',
+  }));
+  const f = path.join(d, 'tpl.txt');
+  fs.writeFileSync(f, 'x\n<!-- DONE -->\n');
+  box.cb('change', 'tpl.txt');
+  const st = fs.statSync(f);
+  check('自定义 message 模板替换 {file}/{reason}/{size}/{mtimeMs}', () => {
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].content[0].text, `F=tpl.txt|R=DONE|S=${st.size}|M=${st.mtimeMs}`);
+  });
+  disp();
+}
+
+// doneMarker 自定义值
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 300, doneMarker: '<!-- FIN -->',
+  }));
+  fs.writeFileSync(path.join(d, 'a.txt'), 'x\n<!-- FIN -->\n');
+  box.cb('change', 'a.txt');
+  fs.writeFileSync(path.join(d, 'b.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'b.txt');
+  check('自定义 doneMarker 命中即投递，默认标记不再立即投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('a.txt'));
+  });
+  await sleep(450);
+  check('未命中自定义标记的文件在静默窗口到期后按 stable 投递', () => {
+    assert.equal(calls.length, 2, `期望 2，实际 ${calls.length}`);
+    assert.ok(calls[1].content[0].text.includes('b.txt'));
+  });
+  disp();
+}
+
+// watches 非数组 / 空数组
+{
+  warnings.length = 0;
+  const p1 = apply(makeCtx([]), {});
+  const p2 = apply(makeCtx([]), { watches: [] });
+  const p3 = apply(makeCtx([]), { watches: 'not-an-array' });
+  check('watches 缺失 / 空 / 非数组 → 写「未启动」warn 且不抛', () => {
+    assert.equal(typeof p1, 'function');
+    assert.equal(typeof p2, 'function');
+    assert.equal(typeof p3, 'function');
+    assert.equal(warnings.filter((m) => m.includes('未启动')).length, 3,
+      `应有 3 条未启动日志：${JSON.stringify(warnings)}`);
+  });
+  p1(); p2(); p3();
+}
+
+// dir / targetSessionId 逐条字段校验
+{
+  const d = tmp();
+  warnings.length = 0;
+  const p1 = apply(makeCtx([]), { watches: [{ dir: 'relative/path', targetSessionId: 'S' }] });
+  const p2 = apply(makeCtx([]), { watches: [{ dir: d, targetSessionId: '' }] });
+  const p3 = apply(makeCtx([]), { watches: [{ dir: d, targetSessionId: 123 }] });
+  check('dir 非绝对路径、targetSessionId 空或非字符串 → 逐条跳过并点名', () => {
+    assert.ok(warnings.some((m) => m.includes('dir 必须是绝对路径')), `缺 dir 校验日志：${JSON.stringify(warnings)}`);
+    assert.equal(warnings.filter((m) => m.includes('targetSessionId 必须是非空字符串')).length, 2,
+      `应有 2 条 target 校验日志：${JSON.stringify(warnings)}`);
+  });
+  p1(); p2(); p3();
+}
+
+// agents.get 抛错 → warn 且继续
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  warnings.length = 0;
+  const disp = withFs(box.patch, () => apply(makeCtx(calls, {
+    get: () => { throw new Error('get boom'); },
+    roots: () => [{ id: 'S', followup: (m) => calls.push(m) }],
+  }), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 }));
+  fs.writeFileSync(path.join(d, 'g.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'g.txt');
+  check('agents.get 抛错 → 写 warn，并经 roots 兜底继续投递', () => {
+    assert.ok(warnings.some((m) => m.includes('agents.get 抛错')), `未找到日志：${JSON.stringify(warnings)}`);
+    assert.equal(calls.length, 1);
+  });
+  disp();
+}
+
+// agents.roots 抛错 → warn 且继续
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  warnings.length = 0;
+  const disp = withFs(box.patch, () => apply(makeCtx(calls, {
+    get: () => undefined,
+    roots: () => { throw new Error('roots boom'); },
+  }), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 }));
+  fs.writeFileSync(path.join(d, 'r.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'r.txt');
+  check('agents.roots 抛错 → 写 warn、不抛、不投递', () => {
+    assert.ok(warnings.some((m) => m.includes('agents.roots 抛错')), `未找到日志：${JSON.stringify(warnings)}`);
+    assert.equal(calls.length, 0);
+  });
+  disp();
+}
+
+// get 返回 undefined 但 roots 里有该 id
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls, {
+    get: () => undefined,
+    roots: () => [{ id: 'S', followup: (m) => calls.push(m) }],
+  }), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 }));
+  fs.writeFileSync(path.join(d, 'fb.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'fb.txt');
+  check('get 返回 undefined 但 roots 中有该 id → 兜底命中并投递', () => {
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].source.kind, 'plugin:dsh-file-watch');
+  });
+  disp();
+}
+
+// followup 抛错 → warn
+{
+  const d = tmp();
+  const box = capturingWatch();
+  warnings.length = 0;
+  const disp = withFs(box.patch, () => apply(makeCtx([], {
+    get: () => ({ followup: () => { throw new Error('followup boom'); } }),
+  }), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 }));
+  fs.writeFileSync(path.join(d, 'fo.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'fo.txt');
+  check('followup 抛错 → 写 warn 且不向调用方抛', () => {
+    assert.ok(warnings.some((m) => m.includes('followup 抛错')), `未找到日志：${JSON.stringify(warnings)}`);
+  });
+  disp();
+}
+
+// fs.watch 启动失败 / watcher error 事件
+{
+  const d = tmp();
+  warnings.length = 0;
+  const disp = withFs({ watch: () => { throw new Error('EACCES'); } },
+    () => apply(makeCtx([]), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 }));
+  check('fs.watch 启动失败 → 写 warn、自行 dispose、不抛', () => {
+    assert.ok(warnings.some((m) => m.includes('fs.watch 启动失败')), `未找到日志：${JSON.stringify(warnings)}`);
+    assert.equal(typeof disp, 'function');
+  });
+  disp();
+}
+{
+  const d = tmp();
+  const box = capturingWatch();
+  warnings.length = 0;
+  const disp = withFs(box.patch, () => apply(makeCtx([]), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 }));
+  box.handlers.error(new Error('watcher boom'));
+  check('watcher error 事件 → 写 warn 且不抛', () => {
+    assert.ok(warnings.some((m) => m.includes('fs.watch 出错')), `未找到日志：${JSON.stringify(warnings)}`);
+  });
+  disp();
+}
+
+// filename 为 null → listFiles 全扫
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120,
+  }));
+  fs.writeFileSync(path.join(d, 'scan.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', null);
+  check('filename 为 null → listFiles 全扫并投递目录内文件', () => {
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].content[0].text.includes('scan.txt'));
+  });
+  disp();
+}
+
+// 空文件 / 尾部读失败
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120,
+  }));
+  fs.writeFileSync(path.join(d, 'empty.txt'), '');
+  box.cb('change', 'empty.txt');
+  await sleep(280);
+  check('空文件（尾部长度 ≤ 0）不误判 DONE，静默到期后按 stable 投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=stable'));
+  });
+  disp();
+}
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  fs.writeFileSync(path.join(d, 'badfd.txt'), 'x\n<!-- DONE -->\n');
+  withFs({ ...box.patch, openSync: () => { throw new Error('EBADF'); } }, () => {
+    const disp = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 });
+    box.cb('change', 'badfd.txt');
+    check('尾部读失败（openSync 抛错）→ 不误判 DONE、不立即投递', () => {
+      assert.equal(calls.length, 0);
+    });
+    disp();
+  });
+}
+
+// 目录里的子目录被跳过
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120,
+  }));
+  fs.mkdirSync(path.join(d, 'subdir'));
+  box.cb('change', 'subdir');
+  check('目录里的子目录被跳过（!isFile），不投递', () => {
+    assert.equal(calls.length, 0);
+  });
+  disp();
+}
+
+// 事件后 / 到期时 stat 失败
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => {
+    const p = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 });
+    box.cb('change', 'gone.txt');
+    return p;
+  });
+  check('事件后 stat 失败（文件不存在）→ 不投递、不残留 timer', () => {
+    assert.equal(calls.length, 0);
+  });
+  disp();
+}
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => {
+    const p = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120 });
+    fs.writeFileSync(path.join(d, 'vanish.txt'), 'payload');
+    box.cb('change', 'vanish.txt');
+    fs.rmSync(path.join(d, 'vanish.txt'));
+    return p;
+  });
+  await sleep(280);
+  check('到期时 stat 失败（文件被删除）→ 不投递、清除 pending', () => {
+    assert.equal(calls.length, 0);
+  });
+  disp();
+}
+
+// 同一文件第二快照再投递一次
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120,
+  }));
+  const f = path.join(d, 'again.txt');
+  fs.writeFileSync(f, 'v1\n<!-- DONE -->\n');
+  box.cb('change', 'again.txt');
+  fs.appendFileSync(f, 'v2-more-bytes\n<!-- DONE -->\n');
+  box.cb('change', 'again.txt');
+  check('同一文件第二快照（size 变化）再投递一次', () => {
+    assert.equal(calls.length, 2, `期望 2，实际 ${calls.length}`);
+    assert.notEqual(calls[0].id, calls[1].id, '两条应是独立的消息对象');
+  });
+  disp();
+}
+
+// checkStable 收到过期 state 早退
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const nativeST = globalThis.setTimeout;
+  const nativeCT = globalThis.clearTimeout;
+  const held = [];
+  let disp;
+  globalThis.setTimeout = (fn, ms, ...rest) => {
+    if (ms === 137) { held.push(fn); return { __held: true }; }
+    return nativeST(fn, ms, ...rest);
+  };
+  globalThis.clearTimeout = (h) => (h && h.__held ? undefined : nativeCT(h));
+  try {
+    withFs(box.patch, () => {
+      disp = apply(makeCtx(calls), { watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 137 });
+    });
+    const f = path.join(d, 'race.txt');
+    fs.writeFileSync(f, 'v1');
+    box.cb('change', 'race.txt');
+    fs.appendFileSync(f, '-longer-v2');
+    box.cb('change', 'race.txt');
+    held[0]();
+    check('checkStable 收到过期 state → 早退、不投递', () => {
+      assert.equal(held.length, 2, `应捕获两个不同 state 的 timer，实际 ${held.length}`);
+      assert.equal(calls.length, 0);
+    });
+  } finally {
+    globalThis.setTimeout = nativeST;
+    globalThis.clearTimeout = nativeCT;
+    if (disp) disp();
+  }
+}
+
+// dispose 幂等 / ctx.effect 注册
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  let effectFn = null;
+  const ctx = makeCtx(calls);
+  ctx.effect = (fn) => { effectFn = fn; return () => {}; };
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120,
+  }));
+  disp();
+  disp();
+  fs.writeFileSync(path.join(d, 'after.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'after.txt');
+  check('ctx.effect 注册、dispose 幂等、卸载后不再投递', () => {
+    assert.equal(typeof effectFn, 'function');
+    assert.equal(typeof effectFn(), 'function');
+    assert.equal(calls.length, 0);
+  });
+}
+
+// 标记落在尾部 2048 字节之外 → 不立即投递
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 220,
+  }));
+  fs.writeFileSync(path.join(d, 'far.txt'), '<!-- DONE -->\n' + 'x'.repeat(4096));
+  box.cb('change', 'far.txt');
+  await sleep(120);
+  check('标记落在尾部 2048 字节之外 → 不立即投递', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+  });
+  await sleep(240);
+  check('静默窗口到期后按 stable 投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=stable'));
+  });
+  disp();
+}
+
+for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 

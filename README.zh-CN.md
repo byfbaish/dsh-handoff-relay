@@ -28,28 +28,63 @@
 
 ## 安装
 
-把本包作为 bundle 注册到某个 profile，然后在该 profile 的补丁层（patch layer）
-里设置配置：
+`dsh-file-watch` 是一个 DSH profile 的插件 bundle（DSH 是加载 cordis-based
+bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一个本地目录链接进 profile。
 
-```yaml
-- id: dsh-file-watch
-  name: dsh-file-watch
-  config:
-    watches:
-      - dir: '/absolute/path/to/first-outbox'
-        targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-      - dir: '/absolute/path/to/second-outbox'
-        targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
-    stableMs: 5000
-    doneMarker: '<!-- DONE -->'
-```
+1. 把本仓库放到本机某个目录，例如 `/srv/dsh-file-watch`（克隆一份，或把
+   检出目录复制过去）。
+2. 在 profile 目录的 `package.json` 里，添加一个指向该目录的 `file:` 依赖，
+   并把包名注册到 `dsh.profile.bundles`。两个列表里已有的其他条目保持不动，
+   只新增这两处：
 
-`watches` 至少要有一项，每一项都必须同时具备 `dir` 与 `targetSessionId`。
-每个 `dir` 必须是已存在的绝对路径目录。缺少任一字段、或目录不可读的那一条
-会被跳过，并在日志里写明跳过了哪一项；其余监控项照常启动。插件只响应
-文件系统事件，从不轮询。
+   ```json
+   {
+     "dependencies": {
+       "dsh-file-watch": "file:/absolute/path/to/dsh-file-watch"
+     },
+     "dsh": {
+       "profile": {
+         "bundles": ["dsh-file-watch"]
+       }
+     }
+   }
+   ```
 
-`stableMs` 与 `doneMarker` 是全局值，由所有监控项共用，不支持为单项单独覆盖。
+   `file:` 的值必须是指向本包 `package.json` 所在目录的绝对路径。
+3. 在 profile 目录执行 `pnpm install`（或你所用包管理器的等价安装命令），
+   让本地包链接进该 profile 的 `node_modules`。改动本包源码后需重新执行一次。
+4. 在 profile 的 `cordis.patch.yml` 里加一行 `id` 相同的配置，把配置写在那里。
+   本包自带补丁层（`package.json` 的 `dsh.bundle.patch`）负责插入插件行；
+   profile 的补丁层通过匹配同一个 `id` 覆盖该行的 `config`：
+
+   ```yaml
+   - id: dsh-file-watch
+     name: dsh-file-watch
+     config:
+       watches:
+         - dir: '/absolute/path/to/first-outbox'
+           targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+         - dir: '/absolute/path/to/second-outbox'
+           targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
+       stableMs: 5000
+       doneMarker: '<!-- DONE -->'
+   ```
+
+5. 重启宿主，让新的 bundle 与配置生效。
+
+### 配置字段
+
+- `watches` —— 监控项数组，长度至少 1；每一项都必须同时给出 `dir` 与
+  `targetSessionId`。每个 `dir` 必须是已存在的绝对路径目录。缺少任一字段、
+  或目录不可读的那一条会被跳过，并在日志里写明跳过了哪一项；其余监控项照常启动。
+  插件只响应文件系统事件，从不轮询。
+- `stableMs` —— 静默窗口，单位毫秒，所有监控项共用（默认 `5000`）。文件的
+  `(size, mtimeMs)` 持续这么久不变即判定为已完成。不支持为单项单独覆盖。
+- `doneMarker` —— 立即投递用的完成标记，所有监控项共用（默认 `<!-- DONE -->`）。
+  当它出现在文件末尾 2 KB 内时，该文件立即投递，无需等待 `stableMs`。
+
+**`targetSessionId` 必须指向当前存在的会话；宿主重启后会话 id 会变化，
+每次重启后都需要重新接线。**
 
 ## 配置
 
@@ -68,8 +103,9 @@
 node index.test.mjs
 ```
 
-使用真实临时目录与真实静默窗口；预期 `8/8 PASS`。
+使用真实临时目录与真实静默窗口；预期每一条都报 `PASS`，汇总以
+`RESULT: PASS` 结尾。
 
 ## 许可证
 
-MIT
+MIT —— 见 [LICENSE](LICENSE)。
