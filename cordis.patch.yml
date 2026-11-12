@@ -6,6 +6,6 @@
 # This layer only inserts the row; config values are set in the profile patch
 # and matched by the same id.
 - insert:
-    - id: dsh-file-watch
-      name: dsh-file-watch
+    - id: dsh-handoff-relay
+      name: dsh-handoff-relay
       config: {}

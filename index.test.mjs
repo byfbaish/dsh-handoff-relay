@@ -1,4 +1,4 @@
-// dsh-file-watch · 代码级自测（不依赖 DSH 重启、不 import 任何 DSH 包）
+// dsh-handoff-relay · 代码级自测（不依赖 DSH 重启、不 import 任何 DSH 包）
 // 运行：node index.test.mjs
 //
 // 最小假 ctx 形状：{ agents: { get: () => ({ followup: (m) => calls.push(m) }) } }
@@ -89,7 +89,7 @@ check('T4 UserMessage 形状（id/role/content/source）', () => {
   assert.equal(typeof m.content[0].text, 'string');
   // Session Format v4：source.kind 必须是生产者自有标识，不能是通用 'plugin'。
   assert.notEqual(m.source.kind, 'plugin', 'v4 不接受通用 plugin kind');
-  assert.equal(m.source.kind, 'plugin:dsh-file-watch');
+  assert.equal(m.source.kind, 'plugin:dsh-handoff-relay');
   assert.ok(typeof m.source.kind === 'string' && m.source.kind.length > 0);
   out(`       消息原文：${m.content[0].text}`);
   out(`       消息 JSON：${JSON.stringify(m)}`);
@@ -170,8 +170,8 @@ check('T7 两个 watch 同时各丢一个文件：两个目标各收到恰好 1 
   assert.ok(t1.includes('only-in-d1.txt') && !t1.includes('only-in-d2.txt'), `S-D1 串了：${t1}`);
   assert.ok(t2.includes('only-in-d2.txt') && !t2.includes('only-in-d1.txt'), `S-D2 串了：${t2}`);
   assert.notEqual(d1[0].id, d2[0].id, '两条应是独立的消息对象');
-  assert.equal(d1[0].source.kind, 'plugin:dsh-file-watch');
-  assert.equal(d2[0].source.kind, 'plugin:dsh-file-watch');
+  assert.equal(d1[0].source.kind, 'plugin:dsh-handoff-relay');
+  assert.equal(d2[0].source.kind, 'plugin:dsh-handoff-relay');
   out(`       S-D1 消息：${t1}`);
   out(`       S-D2 消息：${t2}`);
 });
@@ -238,8 +238,8 @@ const tmp = () => {
   extraDirs.push(d);
   return d;
 };
-const infoCtx = (calls) => {
-  const ctx = makeCtx(calls);
+const infoCtx = (calls, opts) => {
+  const ctx = makeCtx(calls, opts);
   const infos = [];
   ctx.logger.info = (m) => infos.push(m);
   ctx.infos = infos;
@@ -387,7 +387,7 @@ const infoCtx = (calls) => {
   box.cb('change', 'fb.txt');
   check('get 返回 undefined 但 roots 中有该 id → 兜底命中并投递', () => {
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].source.kind, 'plugin:dsh-file-watch');
+    assert.equal(calls[0].source.kind, 'plugin:dsh-handoff-relay');
   });
   disp();
 }
@@ -817,6 +817,49 @@ const infoCtx = (calls) => {
     assert.equal(buckets.GOOD.length, 1, `正常 watch 期望 1，实际 ${buckets.GOOD.length}`);
     assert.ok(warnings.some((m) => m.includes('无法解析会话标题') && m.includes(dBadSession)),
       `未找到带 dir 的会话标题 warn：${JSON.stringify(warnings)}`);
+  });
+  disp();
+}
+
+// =============================== 会话两态：存在但无标题 vs 完全解析不到（P5） ===============================
+// 会话存在（agent 可解析）但没有任何标题字段 → 不产生「无法解析会话标题」误报，watch 正常启动
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  warnings.length = 0;
+  // makeCtx 默认 agent 只有 followup，无 title/name/label/session 标题/meta 标题
+  const ctx = infoCtx(calls);
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetSessionId: 'S-NO-TITLE' }], stableMs: 120,
+  }));
+  fs.writeFileSync(path.join(d, 'no-title.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'no-title.txt');
+  check('会话存在但无任何标题字段 → 不产生「无法解析会话标题」warn，watch 正常启动', () => {
+    assert.ok(!warnings.some((m) => m.includes('无法解析会话标题')),
+      `不应误报：${JSON.stringify(warnings)}`);
+    assert.equal(calls.length, 1, `watch 应正常启动并投递，实际 ${calls.length}`);
+    assert.ok(ctx.infos.some((m) => m.includes('已加载') && m.includes('(无标题)')),
+      `已加载日志应显示 (无标题)：${JSON.stringify(ctx.infos)}`);
+  });
+  disp();
+}
+
+// 会话完全解析不到（agents.get 与 roots() 都无该 id）→ 产生 warn（带 dir 与 id），watch 仍启动、不抛
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  warnings.length = 0;
+  const ctx = infoCtx(calls, { get: () => undefined, roots: () => [] });
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetSessionId: 'GONE-SESSION' }], stableMs: 120,
+  }));
+  check('会话完全解析不到 → 产生「无法解析会话标题」warn（带 dir），watch 仍启动、不抛', () => {
+    assert.equal(typeof disp, 'function', '解析不到会话不应让 apply 抛错');
+    assert.ok(warnings.some((m) => m.includes('无法解析会话标题') && m.includes(d) && m.includes('GONE-SESSION')),
+      `未找到带 dir 与 targetSessionId 的 warn：${JSON.stringify(warnings)}`);
+    assert.ok(ctx.infos.some((m) => m.includes('已加载')), `watch 仍应启动：${JSON.stringify(ctx.infos)}`);
   });
   disp();
 }

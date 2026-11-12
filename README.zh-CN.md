@@ -1,12 +1,15 @@
 [English](README.md)
 
-# dsh-file-watch
+# dsh-handoff-relay
 
 一个零依赖插件：监控一个或多个目录，当目录里的文件被判定为「已完成」时，
 向该目录对应的目标会话发送恰好一条通知。
 
 `watches` 里的每一项各自启动一个 `fs.watch`，并各自保存自己的
 `(size, mtimeMs)` 快照与标记状态，因此各个目标之间互不干扰。
+
+取名 **relay** 是因为它做的正是「把一条已就绪的信号点到点转达到某个会话」；
+刻意避开会让人以为能起构建 / 跑命令的字眼——`trigger` 会被误读成能触发动作。
 
 ## 「已完成」如何判定
 
@@ -43,11 +46,11 @@
 
 ## 安装
 
-`dsh-file-watch` 是一个 DSH profile 的插件 bundle（DSH 是加载 cordis-based
+`dsh-handoff-relay` 是一个 DSH profile 的插件 bundle（DSH 是加载 cordis-based
 bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一个本地目录链接进 profile。
 
-1. 把本仓库放到本机某个目录，例如 macOS/Linux 上的 `/srv/dsh-file-watch`，
-   或 Windows 上的 `C:/plugins/dsh-file-watch`（克隆一份，或把检出目录复制过去）。
+1. 把本仓库放到本机某个目录，例如 macOS/Linux 上的 `/srv/dsh-handoff-relay`，
+   或 Windows 上的 `C:/plugins/dsh-handoff-relay`（克隆一份，或把检出目录复制过去）。
 2. 在 profile 目录的 `package.json` 里，添加一个指向该目录的 `file:` 依赖，
    并把包名注册到 `dsh.profile.bundles`。两个列表里已有的其他条目保持不动，
    只新增这两处：
@@ -55,19 +58,19 @@ bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一�
    ```json
    {
      "dependencies": {
-       "dsh-file-watch": "file:/srv/dsh-file-watch"
+       "dsh-handoff-relay": "file:/srv/dsh-handoff-relay"
      },
      "dsh": {
        "profile": {
-         "bundles": ["dsh-file-watch"]
+         "bundles": ["dsh-handoff-relay"]
        }
      }
    }
    ```
 
    `file:` 的值必须是指向本包 `package.json` 所在目录的绝对路径。各平台一律用
-   正斜杠：Windows 上写成带盘符的形式，例如 `file:C:/plugins/dsh-file-watch`；
-   macOS/Linux 上写成 POSIX 路径，例如 `file:/srv/dsh-file-watch`。
+   正斜杠：Windows 上写成带盘符的形式，例如 `file:C:/plugins/dsh-handoff-relay`；
+   macOS/Linux 上写成 POSIX 路径，例如 `file:/srv/dsh-handoff-relay`。
 3. 在 profile 目录执行 `pnpm install`（或你所用包管理器的等价安装命令），
    让本地包链接进该 profile 的 `node_modules`。改动本包源码后需重新执行一次。
 4. 在 profile 的 `cordis.patch.yml` 里加一行 `id` 相同的配置，把配置写在那里。
@@ -75,8 +78,8 @@ bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一�
    profile 的补丁层通过匹配同一个 `id` 覆盖该行的 `config`：
 
    ```yaml
-   - id: dsh-file-watch
-     name: dsh-file-watch
+   - id: dsh-handoff-relay
+     name: dsh-handoff-relay
      config:
        watches:
          - dir: '/absolute/path/to/first-outbox'
