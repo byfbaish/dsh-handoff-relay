@@ -281,24 +281,24 @@ const infoCtx = (calls) => {
   disp();
 }
 
-// doneMarker 自定义值
+// done: { text } 自定义完成文本
 {
   const d = tmp();
   const calls = [];
   const box = capturingWatch();
   const disp = withFs(box.patch, () => apply(makeCtx(calls), {
-    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 300, doneMarker: '<!-- FIN -->',
+    watches: [{ dir: d, targetSessionId: 'S', done: { text: '<!-- FIN -->' } }], stableMs: 300,
   }));
   fs.writeFileSync(path.join(d, 'a.txt'), 'x\n<!-- FIN -->\n');
   box.cb('change', 'a.txt');
   fs.writeFileSync(path.join(d, 'b.txt'), 'x\n<!-- DONE -->\n');
   box.cb('change', 'b.txt');
-  check('自定义 doneMarker 命中即投递，默认标记不再立即投递', () => {
+  check('done: { text } 命中即投递，默认标记不再立即投递', () => {
     assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
     assert.ok(calls[0].content[0].text.includes('a.txt'));
   });
   await sleep(450);
-  check('未命中自定义标记的文件在静默窗口到期后按 stable 投递', () => {
+  check('done: { text } 未命中时在静默窗口到期后按 stable 投递', () => {
     assert.equal(calls.length, 2, `期望 2，实际 ${calls.length}`);
     assert.ok(calls[1].content[0].text.includes('b.txt'));
   });
@@ -607,7 +607,7 @@ const infoCtx = (calls) => {
   });
 }
 
-// 标记落在尾部 2048 字节之外 → 不立即投递
+// 标记落在尾部 4096 字节之外 → 不立即投递
 {
   const d = tmp();
   const calls = [];
@@ -618,13 +618,249 @@ const infoCtx = (calls) => {
   fs.writeFileSync(path.join(d, 'far.txt'), '<!-- DONE -->\n' + 'x'.repeat(4096));
   box.cb('change', 'far.txt');
   await sleep(120);
-  check('标记落在尾部 2048 字节之外 → 不立即投递', () => {
+  check('命中串落在尾部 4096 字节之外（头部）→ 不立即投递', () => {
     assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
   });
   await sleep(240);
   check('静默窗口到期后按 stable 投递', () => {
     assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
     assert.ok(calls[0].content[0].text.includes('触发=stable'));
+  });
+  disp();
+}
+
+// =============================== done 四态与启动校验（P4） ===============================
+// 省略 done → 默认文本判据
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 5000,
+  }));
+  fs.writeFileSync(path.join(d, 'default-hit.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'default-hit.txt');
+  check('省略 done → 默认 { text: "<!-- DONE -->" } 命中即提前投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=DONE'), calls[0].content[0].text);
+  });
+  disp();
+}
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 120,
+  }));
+  fs.writeFileSync(path.join(d, 'no-marker.txt'), 'plain content without marker\n');
+  box.cb('change', 'no-marker.txt');
+  check('省略 done 但无标记 → 不立即投递', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+  });
+  await sleep(280);
+  check('省略 done 但无标记 → 静默窗口到期后按 stable 投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=stable'), calls[0].content[0].text);
+  });
+  disp();
+}
+
+// { regex } 命中 / 不命中 / m 标志
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S', done: { regex: '章末' } }], stableMs: 5000,
+  }));
+  fs.writeFileSync(path.join(d, 'regex-hit.txt'), '第一行\n本章章末在此\n');
+  box.cb('change', 'regex-hit.txt');
+  check('done: { regex } 命中即提前投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=DONE'), calls[0].content[0].text);
+  });
+  disp();
+}
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S', done: { regex: '^## 章末' } }], stableMs: 5000,
+  }));
+  fs.writeFileSync(path.join(d, 'mflag.txt'), '第一行\n## 章末\n');
+  box.cb('change', 'mflag.txt');
+  check('done: { regex } 带 m 标志：第二行 ^ 命中', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=DONE'), calls[0].content[0].text);
+  });
+  disp();
+}
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S', done: { regex: '^## 章末' } }], stableMs: 150,
+  }));
+  fs.writeFileSync(path.join(d, 'regex-miss.txt'), '没有标记\n只有普通正文\n');
+  box.cb('change', 'regex-miss.txt');
+  check('done: { regex } 不命中 → 不立即投递', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+  });
+  await sleep(320);
+  check('done: { regex } 不命中 → 静默窗口到期后按 stable 投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=stable'), calls[0].content[0].text);
+  });
+  disp();
+}
+
+// done: null → 关闭完成规则
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S', done: null }], stableMs: 150,
+  }));
+  fs.writeFileSync(path.join(d, 'null-done.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'null-done.txt');
+  check('done: null → 忽略完成标记，不立即投递', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+  });
+  await sleep(320);
+  check('done: null → 静默窗口到期后按 stable 投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=stable'), calls[0].content[0].text);
+  });
+  disp();
+}
+
+// 尾部截断：命中串在尾部 4096 字节内 → 命中
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S' }], stableMs: 5000,
+  }));
+  fs.writeFileSync(path.join(d, 'tail-hit.txt'), 'a'.repeat(9000) + '\n<!-- DONE -->\n');
+  box.cb('change', 'tail-hit.txt');
+  check('命中串落在尾部 4096 字节内 → 命中', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=DONE'), calls[0].content[0].text);
+  });
+  disp();
+}
+
+// 正则超长 / 编译失败 → 该 watch 退回只按 stableMs，其他 watch 照常
+{
+  const dLong = tmp();
+  const dBad = tmp();
+  const dOk = tmp();
+  const buckets = { LONG: [], BAD: [], OK: [] };
+  warnings.length = 0;
+  const longSrc = 'a'.repeat(201);
+  const disp = apply(makeCtx([], { byId: buckets }), {
+    watches: [
+      { dir: dLong, targetSessionId: 'LONG', done: { regex: longSrc } },
+      { dir: dBad, targetSessionId: 'BAD', done: { regex: '(' } },
+      { dir: dOk, targetSessionId: 'OK' },
+    ],
+    stableMs: 600,
+  });
+  fs.writeFileSync(path.join(dLong, 'l.txt'), '<!-- DONE -->\n');
+  fs.writeFileSync(path.join(dBad, 'b.txt'), '<!-- DONE -->\n');
+  fs.writeFileSync(path.join(dOk, 'o.txt'), '<!-- DONE -->\n');
+  await sleep(160);
+  check('正则超长 / 编译失败 → 该 watch 跳过完成规则（有 warn），其他 watch 照常立即投递', () => {
+    assert.equal(buckets.OK.length, 1, `正常 watch 期望 1，实际 ${buckets.OK.length}`);
+    assert.ok(buckets.OK[0].content[0].text.includes('触发=DONE'), buckets.OK[0].content[0].text);
+    assert.equal(buckets.LONG.length, 0, `超长 regex watch 不应立即投递，实际 ${buckets.LONG.length}`);
+    assert.equal(buckets.BAD.length, 0, `编译失败 watch 不应立即投递，实际 ${buckets.BAD.length}`);
+    assert.ok(warnings.some((m) => m.includes('regex 长度')), `缺超长 warn：${JSON.stringify(warnings)}`);
+    assert.ok(warnings.some((m) => m.includes('regex 编译失败')), `缺编译失败 warn：${JSON.stringify(warnings)}`);
+  });
+  await sleep(900);
+  check('被拒正则的 watch 在静默窗口到期后仍按 stable 投递', () => {
+    assert.equal(buckets.LONG.length, 1, `期望 1，实际 ${buckets.LONG.length}`);
+    assert.equal(buckets.BAD.length, 1, `期望 1，实际 ${buckets.BAD.length}`);
+    assert.ok(buckets.LONG[0].content[0].text.includes('触发=stable'), buckets.LONG[0].content[0].text);
+    assert.ok(buckets.BAD[0].content[0].text.includes('触发=stable'), buckets.BAD[0].content[0].text);
+  });
+  disp();
+}
+
+// 失效 targetSessionId → warn（带 dir）且不抛，其他 watch 照常
+{
+  const dBadSession = tmp();
+  const dGood = tmp();
+  const buckets = { BAD_SESSION: [], GOOD: [] };
+  warnings.length = 0;
+  const disp = apply(makeCtx([], {
+    get: (id) => (id === 'GOOD' ? { followup: (m) => buckets.GOOD.push(m) } : undefined),
+    roots: () => [],
+    byId: buckets,
+  }), {
+    watches: [
+      { dir: dBadSession, targetSessionId: 'BAD_SESSION' },
+      { dir: dGood, targetSessionId: 'GOOD' },
+    ],
+    stableMs: 600,
+  });
+  assert.equal(typeof disp, 'function', '失效会话不应让 apply 抛错');
+  fs.writeFileSync(path.join(dGood, 'g.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(160);
+  check('失效 targetSessionId → warn 带 dir 且不抛，其他 watch 照常投递', () => {
+    assert.equal(buckets.GOOD.length, 1, `正常 watch 期望 1，实际 ${buckets.GOOD.length}`);
+    assert.ok(warnings.some((m) => m.includes('无法解析会话标题') && m.includes(dBadSession)),
+      `未找到带 dir 的会话标题 warn：${JSON.stringify(warnings)}`);
+  });
+  disp();
+}
+
+// 加载期为每条 watch 记一行 done 模式日志
+{
+  const dirs = [tmp(), tmp(), tmp(), tmp()];
+  const ctx = infoCtx([]);
+  const disp = apply(ctx, {
+    watches: [
+      { dir: dirs[0], targetSessionId: 'S' },
+      { dir: dirs[1], targetSessionId: 'S', done: { text: 'X' } },
+      { dir: dirs[2], targetSessionId: 'S', done: { regex: '^Y' } },
+      { dir: dirs[3], targetSessionId: 'S', done: null },
+    ],
+    stableMs: 5000,
+  });
+  check('加载期为每条 watch 记一行 done 模式日志（default/text/regex/off）', () => {
+    for (const mode of ['done=default', 'done=text', 'done=regex', 'done=off']) {
+      assert.ok(ctx.infos.some((m) => m.includes(mode)), `缺 ${mode} 日志：${JSON.stringify(ctx.infos)}`);
+    }
+  });
+  disp();
+}
+
+// 嵌套量词 → 拒绝该 watch 的完成规则，退回 stableMs
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  warnings.length = 0;
+  const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+    watches: [{ dir: d, targetSessionId: 'S', done: { regex: '(a+)+' } }], stableMs: 150,
+  }));
+  fs.writeFileSync(path.join(d, 'nested.txt'), 'x\n<!-- DONE -->\n');
+  box.cb('change', 'nested.txt');
+  check('嵌套量词 regex → 拒绝并 warn，不立即投递', () => {
+    assert.equal(calls.length, 0, `期望 0，实际 ${calls.length}`);
+    assert.ok(warnings.some((m) => m.includes('嵌套量词')), `缺嵌套量词 warn：${JSON.stringify(warnings)}`);
+  });
+  await sleep(320);
+  check('嵌套量词 regex 被拒后 → 静默窗口到期按 stable 投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('触发=stable'), calls[0].content[0].text);
   });
   disp();
 }

@@ -12,8 +12,23 @@
 
 - **静默期**：文件在 `stableMs` 毫秒内（默认 `5000`）不再变化，即判定为已完成。
   文件仍在被写入时，计时器会不断重置，期间不发送任何通知。
-- **显式完成标记**：如果文件末尾 2 KB 内含 `<!-- DONE -->`，则立即判定为已完成，
-  无需等待静默期。
+- **完成规则（每条 watch 独立）**：每条 watch 可配置一个 `done` 规则；命中文件尾部
+  4 KB 时立即投递，无需等待静默期。**未命中也不影响投递**——静默期到期后照常按
+  `stableMs` 投递，`done` 只是加速，不是投递的前提。
+
+`done` 有四种状态，只靠「键在不在 / 值是什么键」区分：
+
+| `done` 取值 | 行为 |
+|---|---|
+| 省略 | 默认文本规则 `{ text: '<!-- DONE -->' }` |
+| `{ text: '...' }` | 尾部 4 KB 内出现该文本即提前投递 |
+| `{ regex: '...' }` | 尾部 4 KB 内匹配该正则即提前投递 |
+| `null` | 关闭完成规则，只按 `stableMs` 投递 |
+
+正则固定以 `m` 标志编译，且只扫文件尾部 4 KB；模式串长度上限 200 字符，含嵌套量词
+（如 `(a+)+`）的模式会被拒绝。超长、含嵌套量词或编译失败时，**只关闭这一条 watch 的
+完成规则**（写一条带该 watch `dir` 的警告），该 watch 退回只按 `stableMs` 投递，
+其余 watch 不受影响。
 
 稳定判定是精确的：每次文件系统事件都会记录 `(size, mtimeMs)` 并重置一个
 时长为 `stableMs` 的静默计时器；计时器到期后会再读一次文件状态，只有当
@@ -66,10 +81,14 @@ bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一�
        watches:
          - dir: '/absolute/path/to/first-outbox'
            targetSessionId: 'session-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+           done: { text: '<!-- DONE -->' }
          - dir: '/absolute/path/to/second-outbox'
            targetSessionId: 'session-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy'
+           done: { regex: '^## 章末' }
+         - dir: '/absolute/path/to/third-outbox'
+           targetSessionId: 'session-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz'
+           done: null
        stableMs: 5000
-       doneMarker: '<!-- DONE -->'
    ```
 
 5. 重启宿主，让新的 bundle 与配置生效。
@@ -82,8 +101,17 @@ bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一�
   插件只响应文件系统事件，从不轮询。
 - `stableMs` —— 静默窗口，单位毫秒，所有监控项共用（默认 `5000`）。文件的
   `(size, mtimeMs)` 持续这么久不变即判定为已完成。不支持为单项单独覆盖。
-- `doneMarker` —— 立即投递用的完成标记，所有监控项共用（默认 `<!-- DONE -->`）。
-  当它出现在文件末尾 2 KB 内时，该文件立即投递，无需等待 `stableMs`。
+- `watches[].done` —— 每条 watch 的完成规则，四种状态：
+  - 省略 → 默认文本规则 `{ text: '<!-- DONE -->' }`；
+  - `{ text: '...' }` → 尾部 4 KB 内文本命中；
+  - `{ regex: '...' }` → 尾部 4 KB 内正则命中（`m` 标志，≤ 200 字符，拒绝嵌套量词；
+    模式无效时只关闭这一条 watch 的完成规则并写警告）；
+  - `null` → 关闭完成规则，只按 `stableMs` 投递。
+
+  `done` 是唯一的完成规则设置。
+
+加载期会校验每条 watch 的 `targetSessionId`：能解析出会话标题就正常启动；解析不到
+则写一条带该 watch `dir` 的警告，该 watch 仍然启动，其余 watch 照常工作。
 
 **`targetSessionId` 必须指向当前存在的会话；宿主重启后会话 id 会变化，
 每次重启后都需要重新接线。**
@@ -97,7 +125,7 @@ bundle 的宿主）。它没有任何运行时依赖，因此安装就是把一�
 | `watches[].targetSessionId` | 接收通知的会话 id。必填。 |
 | `stableMs` | 静默窗口，单位毫秒，所有监控项共用。默认 `5000`。 |
 | `message` | 可选消息模板；支持 `{file}`、`{reason}`、`{size}`、`{mtimeMs}`。 |
-| `doneMarker` | 立即投递用的完成标记，所有监控项共用。默认 `<!-- DONE -->`。 |
+| `watches[].done` | 每条 watch 的完成规则：省略=默认文本，`{ text }`、`{ regex }` 或 `null`（关闭）。 |
 
 ## 测试
 
