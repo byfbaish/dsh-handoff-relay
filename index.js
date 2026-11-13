@@ -33,6 +33,45 @@ const MAX_SCAN_ATTEMPTS = 3;
 const MAX_SCAN_WINDOW_MS = 21000;
 export const SETTINGS_NS = 'dsh-handoff-relay';
 
+// P22b：宿主只为带 .volatile() 的 Config 字段出设置表单，也只接受这些路径写回。
+// 解析基线仍是 profile 根；解析不到时导出 undefined，交给宿主按无表单处理，不阻塞 watch。
+function buildConfigSchema() {
+  try {
+    const { z } = loadSchemastery();
+    return z.object({
+      watches: z.array(z.object({
+        dir: z.string().default(''),
+        targetTitle: z.string().default(''),
+        targetSessionId: z.string().default(''),
+        exact: z.boolean().default(true),
+        done: z.any(),
+      })).volatile().default([]),
+      stableMs: z.number().default(DEFAULT_STABLE_MS).volatile(),
+      message: z.string().default(DEFAULT_MESSAGE),
+    });
+  } catch {
+    return undefined;
+  }
+}
+export const Config = buildConfigSchema();
+
+/** 逐层拆 volatile box：宿主运行时字段可能是函数或 { get }，读配置前必须先落到普通值。 */
+function unwrapConfigValue(value, depth = 0) {
+  if (depth > 32) return value;
+  let current = value;
+  if (typeof current === 'function') return unwrapConfigValue(current(), depth + 1);
+  if (current && typeof current === 'object' && !Array.isArray(current) && typeof current.get === 'function') {
+    return unwrapConfigValue(current.get(), depth + 1);
+  }
+  if (Array.isArray(current)) return current.map((item) => unwrapConfigValue(item, depth + 1));
+  if (current && typeof current === 'object') {
+    const out = {};
+    for (const [key, child] of Object.entries(current)) out[key] = unwrapConfigValue(child, depth + 1);
+    return out;
+  }
+  return current;
+}
+
 function log(ctx, level, msg) {
   const logger = ctx && ctx.logger;
   if (logger && typeof logger[level] === 'function') {
@@ -940,6 +979,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
 }
 
 export function apply(ctx, config = {}) {
+  config = unwrapConfigValue(config) || {};
   const cfg = {
     stableMs: Number.isFinite(config && config.stableMs) && config.stableMs > 0 ? config.stableMs : DEFAULT_STABLE_MS,
     message: config && typeof config.message === 'string' && config.message ? config.message : DEFAULT_MESSAGE,

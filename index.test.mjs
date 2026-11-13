@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml } from './index.js';
+import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config } from './index.js';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
@@ -2548,6 +2548,172 @@ async function p14WaitFor(cond, label, ms = 3000) {
     assert.equal(fs.existsSync(path.join(d, 'none.txt')), true, '文件应留在原地');
   });
   disp();
+}
+
+// ---------------------------------------------------------------- P22b：Config / 三列卡片 / 保存部分成功
+{
+  const checkAsync = async (label, fn) => {
+    try {
+      await fn();
+      results.push(`PASS  ${label}`);
+      out(`PASS  ${label}`);
+    } catch (err) {
+      failed += 1;
+      results.push(`FAIL  ${label} :: ${err.message}`);
+      out(`FAIL  ${label} :: ${err.message}`);
+    }
+  };
+  check('P22b Config：watches 与 stableMs 都是 volatile，解析后是 box 且可取回原值', () => {
+    assert.ok(Config && typeof Config.toJSON === 'function', 'Config 应导出 schemastery schema');
+    const resolved = Config({ watches: [{ dir: 'C:/x', targetTitle: '会话 A', exact: true, done: { text: '<!-- DONE -->' } }], stableMs: 1234 });
+    assert.equal(typeof resolved.watches.get, 'function', 'watches 应是 volatile box');
+    assert.equal(typeof resolved.stableMs.get, 'function', 'stableMs 应是 volatile box');
+    assert.equal(resolved.stableMs.get(), 1234);
+    const rows = resolved.watches.get();
+    assert.equal(Array.isArray(rows), true);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].targetTitle, '会话 A');
+    assert.equal(rows[0].exact, true);
+  });
+
+  const clientCode = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'client.js'), 'utf8');
+  const p22bRender = (watches) => {
+    let factory;
+    const sandbox = { window: { __ModuleLoader__: { load: (def) => { factory = def.factory; } } }, console };
+    vm.runInNewContext(clientCode, sandbox, { filename: 'client.js' });
+    if (!factory) throw new Error('未捕获 client factory');
+    const messages = [];
+    const React = {
+      useState: (init) => {
+        let value = typeof init === 'function' ? init() : init;
+        return [value, (next) => { if (typeof next === 'string') messages.push(next); value = next; }];
+      },
+      useEffect: () => {},
+      createElement: (type, props, ...children) => ({
+        type,
+        props: props || {},
+        children: children.map((c) => (typeof c === 'function' ? c() : c)),
+      }),
+    };
+    const mod = factory((name) => {
+      if (name === 'react') return React;
+      throw new Error(`未知 require：${name}`);
+    });
+    const controller = {
+      getSnapshot: () => ({ status: 'ready', value: { watches, stableMs: 5000 }, writable: true, revision: 3 }),
+      subscribe: () => () => {},
+      mutate: async (ops) => { controller.ops = ops; return true; },
+      ops: null,
+    };
+    let slot = null;
+    let component = null;
+    mod.apply({
+      get: (name) => (name === 'configForms' ? { get: () => controller } : undefined),
+      slots: {
+        inject: (key, fn) => { assert.equal(key, 'plugins.row.config'); fn(); },
+        register: (def, comp) => { slot = def; component = comp; return comp; },
+      },
+    });
+    assert.equal(slot && slot.name, 'plugins.row.config');
+    assert.equal(slot.key, 'dsh-handoff-relay#dsh-handoff-relay');
+    const tree = component({ ctx: { get: () => undefined }, controller });
+    return { tree, messages, controller };
+  };
+  const walk = (node, out = []) => {
+    if (Array.isArray(node)) { for (const c of node) walk(c, out); return out; }
+    if (!node || typeof node !== 'object') { if (typeof node === 'string') out.push(node); return out; }
+    out.push(node);
+    for (const c of node.children || []) walk(c, out);
+    return out;
+  };
+  const textOf = (nodes) => nodes.filter((n) => typeof n === 'string').join(' | ');
+  const findByText = (nodes, text) => nodes.find((n) => n && typeof n === 'object' && (n.children || []).some((c) => c === text));
+
+  const baseRows = [
+    { dir: 'C:\\watch\\a', targetTitle: '会话 A', exact: true, done: { text: '<!-- DONE -->' } },
+    { dir: 'C:\\watch\\b', targetTitle: '会话 B', exact: true, done: { regex: '^done$' } },
+    { dir: 'C:\\watch\\c', targetTitle: '会话 C', exact: true, done: null },
+  ];
+
+  check('P22b 渲染：三列表头、3 个行节点、3 个「选择会话」按钮，且没有 Session ID 输入', () => {
+    const { tree } = p22bRender(baseRows);
+    const nodes = walk(tree);
+    const allText = textOf(nodes);
+    assert.ok(allText.includes('目录'), '缺「目录」表头');
+    assert.ok(allText.includes('目标会话'), '缺「目标会话」表头');
+    assert.ok(allText.includes('完成规则'), '缺「完成规则」表头');
+    const rowNodes = nodes.filter((n) => n && n.type === 'div' && n.props && n.props.key !== undefined);
+    assert.equal(rowNodes.length, 3, `应有 3 个行节点，实际 ${rowNodes.length}`);
+    const pickButtons = nodes.filter((n) => n && n.type === 'button' && (n.children || []).includes('选择会话'));
+    assert.equal(pickButtons.length, 3, `应有 3 个「选择会话」，实际 ${pickButtons.length}`);
+    assert.equal(/Session ID/i.test(allText), false, `渲染输出不应出现 Session ID：${allText}`);
+    const placeholders = nodes.filter((n) => n && n.props && typeof n.props.placeholder === 'string').map((n) => n.props.placeholder);
+    assert.equal(placeholders.some((p) => /session/i.test(p)), false, `不应有会话 id 输入框：${placeholders.join(' | ')}`);
+  });
+
+  check('P22b 三态切换：文本 / 正则 / 不使用 三个选项与三个当前值都在', () => {
+    const { tree } = p22bRender(baseRows);
+    const nodes = walk(tree);
+    const selects = nodes.filter((n) => n && n.type === 'select');
+    assert.equal(selects.length, 3);
+    assert.deepEqual(selects.map((n) => n.props.value), ['text', 'regex', 'off']);
+    const optionText = selects.flatMap((n) => (n.children || []).flatMap((c) => (c && c.children) || [])).join(' | ');
+    assert.ok(optionText.includes('文本') && optionText.includes('正则') && optionText.includes('不使用'), optionText);
+  });
+
+  check('P22b 正则约束常驻，编译失败只标红该行', () => {
+    const { tree } = p22bRender([
+      { dir: 'C:\\watch\\a', targetTitle: '会话 A', exact: true, done: { text: '<!-- DONE -->' } },
+      { dir: 'C:\\watch\\b', targetTitle: '会话 B', exact: true, done: { regex: '(a+)+' } },
+    ]);
+    const nodes = walk(tree);
+    const allText = textOf(nodes);
+    assert.ok(allText.includes('只扫文件尾部约 4KB'), '缺 4KB 约束');
+    assert.ok(allText.includes('固定 m 标志，长度 ≤200 字符'), '缺 m / 200 约束');
+    assert.ok(allText.includes('禁止嵌套量词（如 (a+)+）'), '缺嵌套量词约束');
+    const errors = nodes.filter((n) => n && n.props && n.props.style && n.props.style.color === '#d33');
+    assert.equal(errors.length, 1, `只有坏正则那一行标红，实际 ${errors.length}`);
+    const redText = textOf(errors.flatMap((n) => walk(n, [])));
+    assert.ok(redText.includes('禁止嵌套量词'), redText);
+  });
+
+  await checkAsync('P22b 保存部分成功：坏行保留旧值、好行写入、列出未通过行号与原因', async () => {
+    const { tree, messages, controller } = p22bRender([
+      { dir: 'C:\\watch\\a', targetTitle: '会话 A', exact: true, done: { text: '<!-- DONE -->' } },
+      { dir: 'C:\\watch\\b', targetTitle: '会话 B', exact: true, done: { regex: '(a+)+' } },
+      { dir: 'C:\\watch\\c', targetTitle: '会话 C', exact: true, done: null },
+    ]);
+    const nodes = walk(tree);
+    const save = findByText(nodes, '保存');
+    assert.ok(save, '缺「保存」按钮');
+    await save.props.onClick();
+    assert.equal(Array.isArray(controller.ops), true, '保存应调用 mutate');
+    const watchesOp = controller.ops.find((op) => op.op === 'set' && op.path[0] === 'watches');
+    assert.equal(watchesOp.value.length, 3, '坏行应回填旧值，三行都保留');
+    assert.deepEqual(watchesOp.value[1].done, { regex: '(a+)+' }, '坏行必须保留旧值');
+    const status = messages.join(' | ');
+    assert.ok(status.includes('已保存，重启宿主后生效'), status);
+    assert.ok(status.includes('第 2 行'), status);
+    assert.ok(status.includes('禁止嵌套量词'), status);
+  });
+}
+
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P22-BOX', title: 'boxed-title' }]);
+  const boxed = Config({ watches: [{ dir: d, targetTitle: 'boxed-title' }], stableMs: 120 });
+  assert.equal(typeof boxed.watches.get, 'function');
+  const disp = apply(ctx, boxed);
+  fs.writeFileSync(path.join(d, 'boxed.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P22b 读时 unwrap：Config 解析出的 box 直接交给 apply，watch 照常投递', () => {
+    assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('boxed.txt'), calls[0].content[0].text);
+  });
+  disp();
+  fs.rmSync(d, { recursive: true, force: true });
 }
 
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
