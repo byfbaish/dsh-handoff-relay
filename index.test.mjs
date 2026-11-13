@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { apply } from './index.js';
+import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml } from './index.js';
 
 // delivered 落点默认在 profile 根；测试统一改到临时目录，避免污染本机 profile。
 const suiteProfileRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-profile-'));
@@ -1732,6 +1732,206 @@ const p9WithProfile = (root) => {
       assert.ok(lines.some((l) => l.includes('title-multiple:2') && l.includes('targetTitle="周简报"') && l.includes(dirs[3])), JSON.stringify(lines));
       // 成功投递不写 relay.log：加载行里只有「加载解析」与启动行，不含「已投递」
       assert.equal(text.includes('已投递'), false, `relay.log 不应记录每次成功投递：${text}`);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// ---------------------------------------------------------------- P11：exact / 启动期重扫 / 设置卡回写
+// 1) exact 三态：缺省=包含匹配、true=完全相等、非布尔=报错并跳过整条 watch
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p11-a-'));
+  const restoreProfile = p9WithProfile(root);
+  const dirs = [tmp(), tmp(), tmp()];
+  const agents = [
+    { id: 'S-EXACT', title: '周简报' },
+    { id: 'S-LONG', title: '周简报 A' },
+  ];
+  const calls = [];
+  const ctx = {
+    agents: {
+      get: (id) => agents.find((a) => a.id === id),
+      roots: () => agents.map((a) => ({ ...a, followup: (m) => calls.push({ id: a.id, m }) })),
+    },
+    logger: { info: () => {}, warn: (m) => warnings.push(m) },
+  };
+  const box = capturingWatch();
+  let disp = null;
+  warnings.length = 0;
+  try {
+    disp = withFs(box.patch, () => apply(ctx, {
+      watches: [
+        { dir: dirs[0], targetTitle: '周简报' },                    // 缺省：包含 → 命中 2 条，不投
+        { dir: dirs[1], targetTitle: '周简报', exact: true },        // 完全相等 → 命中 1 条
+        { dir: dirs[2], targetTitle: '周简报', exact: 'true' },      // 非布尔 → 整条跳过
+      ],
+      stableMs: 120,
+    }));
+    fs.writeFileSync(path.join(dirs[0], 'a.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'a.txt');
+    fs.writeFileSync(path.join(dirs[1], 'b.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'b.txt');
+    fs.writeFileSync(path.join(dirs[2], 'c.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'c.txt');
+    await sleep(200);
+    check('P11 exact 缺省=包含匹配：标题命中多条时按原语义跳过（不投递）', () => {
+      assert.equal(fs.existsSync(path.join(dirs[0], 'a.txt')), true, '缺省包含匹配命中 2 条应不投递，文件应留在原地');
+      assert.ok(warnings.some((m) => m.includes('无法解析会话标题') && m.includes('命中 2 条') && m.includes(dirs[0])),
+        `应写明命中多条并点名该 watch：${JSON.stringify(warnings.slice(-4))}`);
+    });
+    check('P11 exact=true 完全相等：只命中同名会话并正常投递移走', () => {
+      const hit = calls.filter((c) => c.id === 'S-EXACT');
+      assert.equal(hit.length, 1, `期望投给 S-EXACT 1 次，实际 ${calls.map((c) => c.id)}`);
+      assert.equal(fs.existsSync(path.join(dirs[1], 'b.txt')), false, '投递后应移走');
+    });
+    check('P11 exact 非布尔：报错并跳过整条 watch（连加载解析行都没有）', () => {
+      assert.equal(calls.filter((c) => c.id === 'S-EXACT' || c.id === 'S-LONG').length, 1,
+        `非布尔 watch 不应投递，实际 ${JSON.stringify(calls.map((c) => c.id))}`);
+      assert.equal(fs.existsSync(path.join(dirs[2], 'c.txt')), true, '被跳过的 watch 文件应留在原地');
+      const line = warnings.find((m) => m.includes('exact') && m.includes(dirs[2])) || '';
+      assert.ok(line.includes('必须是布尔'), `错误应点名 exact 字段：${line}`);
+      assert.ok(line.includes('dir=') && line.includes(dirs[2]), `错误应点名 watch 与 dir：${line}`);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// 2) 启动期有限重扫：1 次成功 / 2 次成功 / 3 次全败（日志行数与顺序）
+{
+  const runPlan = (resolvedAt) => {
+    const timers = [];
+    const lines = [];
+    let scans = 0;
+    const handle = scheduleStartupRescans({
+      dir: 'D:\\demo',
+      delays: [1, 2, 3],
+      describeOnce: () => { scans += 1; return scans >= resolvedAt; },
+      logOnce: (n, result) => lines.push(`rescan#${n} result=${result}`),
+      rescanOnce: () => lines.push('rescan-once'),
+      setTimer: (fn) => { timers.push(fn); return fn; },
+      clearTimer: () => {},
+      now: () => 0,
+    });
+    for (const fn of timers) fn();      // done 置位后的回调直接返回，等价于 cancel
+    return { lines, handle };
+  };
+  check('P11 重扫第 1 次即 resolved：只写 1 行 rescan#1、只投一次', () => {
+    const c = runPlan(1);
+    assert.deepEqual(c.lines, ['rescan#1 result=resolved', 'rescan-once']);
+  });
+  check('P11 重扫第 2 次 resolved：rescan#1 not-found 在前、rescan#2 resolved 在后', () => {
+    const c = runPlan(2);
+    assert.deepEqual(c.lines, ['rescan#1 result=not-found', 'rescan#2 result=resolved', 'rescan-once']);
+  });
+  check('P11 重扫 3 次全败：恰好 3 行 rescan#、顺序 1→2→3 且均为 not-found', () => {
+    const c = runPlan(99);
+    assert.deepEqual(c.lines, [
+      'rescan#1 result=not-found',
+      'rescan#2 result=not-found',
+      'rescan#3 result=not-found',
+    ]);
+  });
+}
+
+// 3) 设置卡回写：只替换 relay 条目的 watches 块，其余逐字保留；解析回来深比较相等
+{
+  const sample = [
+    '# 注释保留',
+    '- id: other',
+    '  name: other',
+    '  config:',
+    '    enabled: true',
+    '- id: dsh-handoff-relay',
+    '  name: dsh-handoff-relay',
+    '  config:',
+    '    watches:',
+    "      - dir: 'C:\\a'",
+    "        targetSessionId: 'S-1'",
+    '    stableMs: 5000',
+    '- id: bot',
+    '  name: bot',
+    '  config:',
+    '    x: 1',
+    '- id: dsh-handoff-relay',
+    '  name: dsh-handoff-relay',
+    '  config:',
+    '    watches:',
+    "      - dir: 'C:\\b'",
+    "        targetSessionId: 'S-2'",
+    '',
+  ].join('\n');
+  const nextWatches = [
+    { dir: 'C:\\a', targetSessionId: 'S-1', targetTitle: '甲', exact: true },
+    { dir: 'C:\\c', targetTitle: '乙', done: { text: '<!-- DONE -->' } },
+    { dir: 'C:\\d', targetSessionId: 'S-3', done: null },
+    { dir: 'C:\\e', targetSessionId: 'S-4', done: { regex: '^done$' } },
+  ];
+  check('P11 保存回写：只改 relay 条目 watches，stableMs/注释/重复条目/后续条目逐字保留', () => {
+    const next = replaceWatchesInYml(sample, nextWatches);
+    assert.ok(next.includes('# 注释保留'), '注释应保留');
+    assert.ok(next.includes('    stableMs: 5000'), '同条目其它 config 键应保留');
+    assert.ok(next.includes('- id: bot'), '后续条目应保留');
+    assert.ok(next.includes("        targetSessionId: 'S-2'"), '重复 relay 条目应原样保留（只改第一条）');
+    assert.equal((next.match(/watches:/g) || []).length, 2, '两条 relay 条目应各有一个 watches 块');
+  });
+  check('P11 保存回写：解析回来与写入值深比较相等（含 exact / done 四态）', () => {
+    const next = replaceWatchesInYml(sample, nextWatches);
+    assert.deepEqual(parseWatchesFromYml(next), nextWatches);
+  });
+  check('P11 保存不改值：写回再解析与原解析结果深比较相等', () => {
+    const parsed = parseWatchesFromYml(sample);
+    const next = replaceWatchesInYml(sample, parsed);
+    assert.deepEqual(parseWatchesFromYml(next), parsed);
+  });
+  check('P11 保存失败不写坏 yml：文件结构不匹配时返回 ok:false 且原文件逐字不变', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p11-yml-'));
+    const file = path.join(dir, 'cordis.patch.yml');
+    const bad = '# 没有 relay 条目\n- id: other\n  name: other\n';
+    fs.writeFileSync(file, bad);
+    const before = fs.readFileSync(file, 'utf8');
+    const r = writeWatchesToYml(file, nextWatches);
+    assert.equal(r.ok, false, '找不到 relay 条目应失败');
+    assert.equal(fs.readFileSync(file, 'utf8'), before, '失败时原文件必须逐字不变');
+    assert.equal(fs.readdirSync(dir).filter((n) => n.includes('.tmp')).length, 0, '不应留下临时文件');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+// 4) 真实链路：加载时解析不到 → relay.log 出现 rescan#1（最多 3 条/次加载、成功投递不写流水账）
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p11-r-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const live = {};
+  const ctx = {
+    agents: { get: (id) => live[id], roots: () => Object.entries(live).map(([id, a]) => ({ id, ...a })) },
+    logger: { info: () => {}, warn: () => {} },
+  };
+  const box = capturingWatch();
+  let disp = null;
+  try {
+    // 文件在加载时就已存在，此时目标解析不到 ⇒ 进入有限重扫路径。
+    fs.writeFileSync(path.join(d, 'late-p11.txt'), 'x\n<!-- DONE -->\n');
+    disp = withFs(box.patch, () => apply(ctx, {
+      watches: [{ dir: d, targetSessionId: 'P11-LATE' }], stableMs: 120,
+    }));
+    await sleep(1300);       // 越过 rescan#1（1000ms）
+    live['P11-LATE'] = { title: '迟到', followup: (m) => calls.push(m) };
+    await sleep(4300);       // 越过 rescan#2（5000ms）
+    const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+    const rescanLines = log.split('\n').filter((l) => l.includes('rescan#'));
+    check('P11 真实链路：rescan# 行带 dir 与 result，最多 3 条/次加载', () => {
+      assert.ok(rescanLines.length >= 1 && rescanLines.length <= 3, `实际 ${rescanLines.length} 条：${rescanLines.join(' | ')}`);
+      assert.ok(rescanLines[0].includes(`dir=${d}`), `应带 dir：${rescanLines[0]}`);
+      assert.ok(/rescan#1 dir=.* result=(resolved|not-found)/.test(rescanLines[0]), `格式不符：${rescanLines[0]}`);
+      assert.ok(rescanLines.some((l) => l.includes('result=resolved')), `第 2 次重扫应成功：${rescanLines.join(' | ')}`);
+      assert.equal(calls.length, 1, `只应投一条，实际 ${calls.length}`);
+      assert.equal(fs.existsSync(path.join(d, 'late-p11.txt')), false, '重扫成功后应投递并移走');
     });
   } finally {
     if (disp) disp();

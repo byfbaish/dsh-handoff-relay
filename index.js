@@ -26,6 +26,11 @@ const MAX_FAILED_ENTRIES = 200;
 const MAX_LOG_BYTES = 256 * 1024;
 const RENAME_RETRIES = 3;
 const RENAME_RETRY_DELAY_MS = 100;
+// P11：启动期有限重扫 + 设置卡 namespace
+const RETRY_DELAYS_MS = [1000, 5000, 15000];
+const MAX_SCAN_ATTEMPTS = 3;
+const MAX_SCAN_WINDOW_MS = 21000;
+export const SETTINGS_NS = 'dsh-handoff-relay';
 
 function log(ctx, level, msg) {
   const logger = ctx && ctx.logger;
@@ -380,8 +385,11 @@ function resolveSession(ctx, targetSessionId, onError) {
   return { found: true, title: sessionTitleOf(ctx, agent), agent };
 }
 
-/** 标题包含匹配（区分大小写，不做严格相等）；返回 [{ id, title, agent }]，顺序同 roots()。 */
-function matchSessionsByTitle(ctx, targetTitle, onError) {
+/**
+ * 标题匹配：默认包含（P6 语义逐条不变）；exact=true 时完全相等。
+ * 返回 [{ id, title, agent }]，顺序同 roots()。
+ */
+function matchSessionsByTitle(ctx, targetTitle, onError, exact = false) {
   const agents = ctx && ctx.agents;
   let list;
   try { list = agents && typeof agents.roots === 'function' ? (agents.roots() || []) : []; }
@@ -390,7 +398,9 @@ function matchSessionsByTitle(ctx, targetTitle, onError) {
   for (const a of list) {
     if (!a || !a.id) continue;
     const title = sessionTitleOf(ctx, a);
-    if (title && title.includes(targetTitle)) hits.push({ id: a.id, title, agent: a });
+    if (!title) continue;
+    const hit = exact ? title === targetTitle : title.includes(targetTitle);
+    if (hit) hits.push({ id: a.id, title, agent: a });
   }
   return hits;
 }
@@ -411,7 +421,7 @@ function describeTargetNow(ctx, target) {
     if (!s.found) return { ok: false, id: '', title: '', count: 0, hits: [], status: 'agent-not-found' };
     return { ok: true, id: target.value, title: s.title || '(无标题)', count: 1, hits: [], status: `resolved=${target.value}` };
   }
-  const hits = matchSessionsByTitle(ctx, target.value);
+  const hits = matchSessionsByTitle(ctx, target.value, undefined, target.exact === true);
   if (hits.length === 1) {
     return { ok: true, id: hits[0].id, title: hits[0].title, count: 1, hits, status: `resolved=${hits[0].id}` };
   }
@@ -432,19 +442,287 @@ function buildMessage(relName, fullPath, state, reason, template) {
   });
 }
 
+/**
+ * P11 启动期有限重扫：按 RETRY_DELAYS_MS 各重扫一次（最多 MAX_SCAN_ATTEMPTS 次，总窗口 21s）。
+ * 成功即停止后续尝试；每次尝试写一行 `rescan#<N> dir=<dir> result=resolved|not-found`。
+ * 依赖注入 describeOnce / rescanOnce / logOnce，便于单元测试用毫秒级延迟复现 1/2/3 次路径。
+ * @returns {{ cancel: () => void }}
+ */
+export function scheduleStartupRescans(options) {
+  const {
+    dir, describeOnce, rescanOnce, logOnce,
+    delays = RETRY_DELAYS_MS, windowMs = MAX_SCAN_WINDOW_MS,
+    now = () => Date.now(),
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (t) => clearTimeout(t),
+  } = options || {};
+  const timers = [];
+  let done = false;
+  const startedAt = now();
+  const attempts = Math.min(delays.length, MAX_SCAN_ATTEMPTS);
+  for (let i = 0; i < attempts; i += 1) {
+    const n = i + 1;
+    timers.push(setTimer(() => {
+      if (done) return;
+      if (now() - startedAt > windowMs) return;
+      const ok = describeOnce();
+      const result = ok ? 'resolved' : 'not-found';
+      if (ok) done = true;
+      logOnce(n, result);
+      if (ok) rescanOnce();
+      if (ok) for (const t of timers) clearTimer(t);
+    }, delays[i]));
+  }
+  return { cancel: () => { done = true; for (const t of timers) clearTimer(t); } };
+}
+
+/**
+ * P11 A：设置卡的 Host 侧胶水。
+ * 卡片只作编辑通道；cordis.patch.yml 的 config.watches 仍是唯一运行时真相。
+ * 这里只提供：yml 块解析/写回（纯函数，便于单测）+ 注册与 observe 的挂载。
+ */
+
+/** YAML 单引号标量：内部的 ' 写成 ''。 */
+function yamlQuote(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+/** 把 done 规则写成 YAML 行（缩进 8/10 空格）；undefined=省略（默认规则），null=关闭。 */
+function serializeDoneLines(done, out) {
+  if (done === undefined) return;
+  if (done === null) { out.push('        done: null'); return; }
+  if (done && typeof done.text === 'string') {
+    out.push('        done:');
+    out.push(`          text: ${yamlQuote(done.text)}`);
+    return;
+  }
+  if (done && typeof done.regex === 'string') {
+    out.push('        done:');
+    out.push(`          regex: ${yamlQuote(done.regex)}`);
+  }
+}
+
+/** 把一条 watch 序列化成 yml 片段（与现有文件同样的缩进与引号风格）。 */
+export function serializeWatchesBlock(watches, indent = '    ') {
+  const out = [`${indent}watches:`];
+  for (const w of watches || []) {
+    out.push(`${indent}  - dir: ${yamlQuote(w && w.dir)}`);
+    if (w && typeof w.targetSessionId === 'string' && w.targetSessionId) {
+      out.push(`${indent}    targetSessionId: ${yamlQuote(w.targetSessionId)}`);
+    }
+    if (w && typeof w.targetTitle === 'string' && w.targetTitle) {
+      out.push(`${indent}    targetTitle: ${yamlQuote(w.targetTitle)}`);
+    }
+    if (w && w.exact === true) out.push(`${indent}    exact: true`);
+    serializeDoneLines(w && w.done, out);
+  }
+  return out.join('\n');
+}
+
+/**
+ * 从 cordis.patch.yml 源码里解析第一条 dsh-handoff-relay 条目的 config.watches。
+ * 只支持本插件自己写出的子集（dir/targetSessionId/targetTitle/exact/done.text/done.regex）。
+ * @returns {Array<object>|null} 找不到条目或 watches 时返回 null。
+ */
+export function parseWatchesFromYml(source) {
+  const lines = String(source).split(/\r?\n/);
+  let entryLine = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (/^- id:\s*dsh-handoff-relay\s*$/.test(lines[i])) { entryLine = i; break; }
+  }
+  if (entryLine < 0) return null;
+  let configLine = -1;
+  for (let i = entryLine + 1; i < lines.length; i += 1) {
+    if (/^- /.test(lines[i])) break;               // 下一条目
+    if (/^  config:\s*$/.test(lines[i])) { configLine = i; break; }
+  }
+  if (configLine < 0) return null;
+  let watchesLine = -1;
+  for (let i = configLine + 1; i < lines.length; i += 1) {
+    if (/^\s*- /.test(lines[i])) break;
+    if (/^    watches:\s*$/.test(lines[i])) { watchesLine = i; break; }
+  }
+  if (watchesLine < 0) return null;
+  const watches = [];
+  let item = null;
+  let doneOwner = null;
+  for (let i = watchesLine + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    if (/^ {0,4}\S/.test(line)) break;             // 回到 config 同级
+    const itemStart = /^ {6}- dir:\s*(.*)$/.exec(line);
+    if (itemStart) {
+      item = { dir: unquote(itemStart[1]) };
+      watches.push(item);
+      doneOwner = null;
+      continue;
+    }
+    if (!item) continue;
+    const doneField = /^ {10}(text|regex):\s*(.*)$/.exec(line);
+    if (doneField && doneOwner === item) {
+      item.done = { [doneField[1]]: unquote(doneField[2]) };
+      continue;
+    }
+    const doneLine = /^ {8}done:\s*(.*)$/.exec(line);
+    if (doneLine) {
+      const raw = doneLine[1].trim();
+      if (raw === 'null' || raw === '') {
+        if (raw === 'null') item.done = null;
+        doneOwner = item;                          // 空值：后续 text/regex 子行
+      } else {
+        item.done = null;
+        doneOwner = null;
+      }
+      continue;
+    }
+    const field = /^ {8}([A-Za-z]+):\s*(.*)$/.exec(line);
+    if (field) {
+      const name = field[1];
+      const raw = field[2].trim();
+      if (name === 'targetSessionId') item.targetSessionId = unquote(raw);
+      else if (name === 'targetTitle') item.targetTitle = unquote(raw);
+      else if (name === 'exact') item.exact = raw === 'true';
+      doneOwner = null;
+    }
+  }
+  return watches;
+}
+
+function unquote(raw) {
+  const text = String(raw || '').trim();
+  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) {
+    return text.slice(1, -1).replaceAll("''", "'");
+  }
+  return text;
+}
+
+/**
+ * 把 watches 写回 yml 源码：只替换第一条 dsh-handoff-relay 条目下的 watches 块，
+ * 其余内容（含重复条目、注释、别的 config 键）逐字保留。
+ * @throws 当文件里找不到 relay 条目 / config / watches 时抛错（调用方负责不落盘）。
+ */
+export function replaceWatchesInYml(source, watches) {
+  const lines = String(source).split('\n');
+  let entryLine = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (/^- id:\s*dsh-handoff-relay\s*$/.test(lines[i].replace(/\r$/, ''))) { entryLine = i; break; }
+  }
+  if (entryLine < 0) throw new Error('未找到 - id: dsh-handoff-relay 条目');
+  let configLine = -1;
+  for (let i = entryLine + 1; i < lines.length; i += 1) {
+    if (/^- /.test(lines[i])) break;
+    if (/^  config:\s*\r?$/.test(lines[i])) { configLine = i; break; }
+  }
+  if (configLine < 0) throw new Error('relay 条目下未找到 config:');
+  let watchesLine = -1;
+  for (let i = configLine + 1; i < lines.length; i += 1) {
+    if (/^- /.test(lines[i])) break;
+    if (/^    watches:/.test(lines[i])) { watchesLine = i; break; }
+  }
+  if (watchesLine < 0) throw new Error('relay config 下未找到 watches:');
+  let endLine = lines.length;
+  for (let i = watchesLine + 1; i < lines.length; i += 1) {
+    const stripped = lines[i].replace(/\r$/, '');
+    if (!stripped.trim()) continue;
+    if (/^ {0,4}\S/.test(stripped)) { endLine = i; break; }
+  }
+  // 保留 watches 块末尾的空行归属（块内空行已在 endLine 扫描里跳过）
+  const before = lines.slice(0, watchesLine);
+  const after = lines.slice(endLine);
+  const block = serializeWatchesBlock(watches).split('\n');
+  return [...before, ...block, ...after].join('\n');
+}
+
+/**
+ * 写回 yml：先算新文本，再写临时文件 + rename；任何一步失败都返回 { ok:false }，
+ * 原文件保持逐字不变（不写坏 yml）。
+ */
+export function writeWatchesToYml(filePath, watches) {
+  let source;
+  try { source = fs.readFileSync(filePath, 'utf8'); }
+  catch (err) { return { ok: false, error: `读取失败：${String(err)}` }; }
+  let next;
+  try { next = replaceWatchesInYml(source, watches); }
+  catch (err) { return { ok: false, error: `结构不匹配，未写入：${String(err)}` }; }
+  if (next === source) return { ok: true, changed: false };
+  const tmp = `${filePath}.p11-${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, next, 'utf8');
+    fs.renameSync(tmp, filePath);
+    return { ok: true, changed: true };
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    return { ok: false, error: `写入失败：${String(err)}` };
+  }
+}
+
+function sameJson(a, b) {
+  try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
+}
+
+/**
+ * 注册 settings namespace 并把卡片写入的 watches 回写 yml。
+ * 失败只 warn，不影响 relay 主链路（运行期仍只读 config.watches）。
+ */
+async function mountSettingsCard(ctx, configWatches, stateDir) {
+  const settings = ctx && ctx.settings;
+  if (!settings || typeof settings.register !== 'function') return;
+  let z;
+  try {
+    const mod = await import('@deepseek-ai/schemastery');
+    z = mod && (mod.default || mod);
+  } catch (err) {
+    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：无法解析 @deepseek-ai/schemastery（${String(err)}）`);
+    return;
+  }
+  let scope;
+  try {
+    const Schema = z.object({ watches: z.array(z.any()).default([]) });
+    scope = settings.register(SETTINGS_NS, Schema, { base: { watches: configWatches }, applies: 'live' });
+  } catch (err) {
+    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：settings.register 失败（${String(err)}）`);
+    return;
+  }
+  // 播种：yml 为准（用户文档与 yml 冲突时以 yml 覆盖）。
+  try {
+    const current = scope && typeof scope.get === 'function' ? scope.get() : undefined;
+    const value = current && Array.isArray(current.watches) ? current.watches : [];
+    if (!sameJson(value, configWatches)) await scope.update({ watches: configWatches });
+  } catch (err) {
+    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡播种失败（${String(err)}）`);
+  }
+  const ymlPath = path.join(profileRootDir(), 'cordis.patch.yml');
+  try {
+    scope.watch(async (next) => {
+      const watches = next && Array.isArray(next.watches) ? next.watches : [];
+      let onDisk = null;
+      try { onDisk = parseWatchesFromYml(fs.readFileSync(ymlPath, 'utf8')); }
+      catch { onDisk = null; }
+      if (sameJson(onDisk, watches)) return;       // 值没变：不碰 yml
+      const r = writeWatchesToYml(ymlPath, watches);
+      if (!r.ok) relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡保存失败，yml 未改：${r.error}`);
+      else relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 设置卡保存已写回 cordis.patch.yml（${watches.length} 条 watch），重启后生效`);
+    });
+  } catch (err) {
+    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡 observe 失败（${String(err)}）`);
+  }
+}
+
 function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deliveredRoot, stateDir) {
   const pending = new Map();   // relName → { size, mtimeMs, sig, timer }；不轮询
   const delivered = new Set(); // 已投递快照，防止同一 (文件,size,mtimeMs) 重复 followup
   let closed = false;
   let watcher;
+  let rescans = null;
   function dispose() {
     if (closed) return;
     closed = true;
+    if (rescans) rescans.cancel();
     if (watcher) { try { watcher.close(); } catch { /* ignore */ } }
     for (const state of pending.values()) clearTimeout(state.timer);
     pending.clear();
   }
-  const targetText = target.kind === 'title' ? `targetTitle="${target.value}"` : `targetSessionId=${target.value}`;
+  const targetText = target.kind === 'title' ? `targetTitle="${target.value}"${target.exact === true ? ' exact=true' : ''}` : `targetSessionId=${target.value}`;
   const warnErr = (kind, err) => log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} ${kind}：${String(err)}`);
 
   /**
@@ -466,10 +744,10 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
       }
       return { ok: true, id: target.value, title: sessionTitleOf(ctx, agent) || '(无标题)', agent };
     }
-    const hits = matchSessionsByTitle(ctx, target.value, warnErr);
+    const hits = matchSessionsByTitle(ctx, target.value, warnErr, target.exact === true);
     if (hits.length === 1) return { ok: true, id: hits[0].id, title: hits[0].title, agent: hits[0].agent };
     if (hits.length === 0) {
-      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题解析不到：${targetText} 命中 0 条（dir=${watchDir}）；文件 ${relName} 未投递（不按 cwd 兜底）`);
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题解析不到：${targetText} 命中 0 条（dir=${watchDir}${target.exact === true ? '，exact=true' : ''}）；文件 ${relName} 未投递（不按 cwd 兜底）`);
       return { ok: false, reason: 'title-no-match' };
     }
     log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题有歧义：${targetText} 命中 ${hits.length} 条，候选：${hitsText(hits)}（dir=${watchDir}）；文件 ${relName} 未投递（歧义不猜）`);
@@ -585,6 +863,15 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   }
   // 停机期间留下的文件：启动后扫一遍，保证补发一次；已投过的文件已被移走，不会重放。
   for (const rel of listFiles()) consider(rel);
+  // P11：加载时解析不到 ⇒ 按 RETRY_DELAYS_MS 有限重扫（最多 3 次、21s 窗口内），成功即投。
+  if (!atLoad.ok) {
+    rescans = scheduleStartupRescans({
+      dir: watchDir,
+      describeOnce: () => describeTargetNow(ctx, target).ok,
+      rescanOnce: () => { for (const rel of listFiles()) consider(rel); },
+      logOnce: (n, result) => relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] rescan#${n} dir=${watchDir} result=${result}`),
+    });
+  }
   const resolvedText = atLoad.ok
     ? `解析到 ${atLoad.id}（${atLoad.title}）`
     : '解析不到，投递时会跳过';
@@ -641,6 +928,14 @@ export function apply(ctx, config = {}) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetSessionId 必须是非空字符串（或改用 targetTitle，二者二选一；当前 targetSessionId=${String(rawId)}，targetTitle=${String(rawTitle)}）`);
       return;
     }
+    // P11 exact 开关：只接受布尔；非布尔 → 报错并跳过整条 watch，不退回包含匹配。
+    const rawExact = w && w.exact;
+    if (rawExact !== undefined && typeof rawExact !== 'boolean') {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：字段 exact 必须是布尔（缺省=包含匹配，true=完全相等；当前 exact=${JSON.stringify(rawExact)}，类型=${typeof rawExact}，dir=${dir}）`);
+      relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] ${label} exact 非布尔已跳过整条 watch：dir=${dir} exact=${JSON.stringify(rawExact)}`);
+      return;
+    }
+    const exact = rawExact === true;
     try {
       if (!fs.statSync(dir).isDirectory()) throw new Error('not a directory');
     } catch (err) {
@@ -658,7 +953,7 @@ export function apply(ctx, config = {}) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 done 规则未启用，退回只按 stableMs 投递：${done.error}（dir=${dir}）`);
     }
     const target = hasTitle
-      ? { kind: 'title', value: rawTitle.trim() }
+      ? { kind: 'title', value: rawTitle.trim(), exact }
       : { kind: 'id', value: rawId };
     // 启动期校验＝「现在能否解析到」：解析不到只 warn，不阻断加载，也不影响其他 watch。
     const atLoad = describeTargetNow(ctx, target);
@@ -675,6 +970,8 @@ export function apply(ctx, config = {}) {
   });
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
   relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
+  // P11 A：注册设置 namespace（卡片只作编辑通道，运行期仍只读 config.watches）。
+  void mountSettingsCard(ctx, JSON.parse(JSON.stringify(watches)), stateDir);
   try {
     if (ctx && ctx.agents && typeof ctx.agents.roots === 'function') {
       const ids = (ctx.agents.roots() || []).map((a) => a && a.id).filter(Boolean);
