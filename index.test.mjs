@@ -17,34 +17,26 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { registerHooks } from 'node:module';
-import { pathToFileURL } from 'node:url';
 import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml } from './index.js';
 
-// P14：@deepseek-ai/schemastery 只在宿主 app.asar 的 node_modules 里，插件目录解析不到。
-// ①②两条用例要断言「卡真的注册了」，必须让 z 可解析：这里用模块解析钩子把该 specifier
-// 暂时指向一个最小 z 实现（仅在 schemaStubEnabled=true 时生效，其它用例仍走真实失败路径）。
-const schemaStubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
-const schemaStubFile = path.join(schemaStubDir, 'schemastery-stub.mjs');
-fs.writeFileSync(schemaStubFile, [
-  'const leaf = () => ({ kind: "leaf", default: (v) => ({ kind: "leaf", value: v }) });',
-  'export const any = () => leaf();',
-  'export const array = (item) => ({ kind: "array", item, default: (v) => ({ kind: "array", value: v }) });',
-  'export const object = (shape) => ({ kind: "object", shape });',
-  'export default { any, array, object };',
-  '',
-].join('\n'));
-let schemaStubEnabled = false;
-let schemaStubSeq = 0;
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    if (schemaStubEnabled && specifier === '@deepseek-ai/schemastery') {
-      schemaStubSeq += 1; // 每次给唯一 URL，避免模块缓存把不同用例的桩串起来
-      return { url: `${pathToFileURL(schemaStubFile).href}?v=${schemaStubSeq}`, shortCircuit: true };
-    }
-    return nextResolve(specifier, context);
-  },
-});
+// P14 追加：schemastery 的真实解析基线是 profile 根（<profile>/node_modules）。
+// ①②用例要断言「卡真的注册了」，就在临时 profile 里放一个最小 z 桩包（CJS），
+// 走的正是生产同一条基线；没有桩的用例（P13b）仍走真实失败路径。
+function p14InstallSchemaStub(profileRoot) {
+  const pkgDir = path.join(profileRoot, 'node_modules', '@deepseek-ai', 'schemastery');
+  fs.mkdirSync(pkgDir, { recursive: true });
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/schemastery', version: '0.0.0-test', main: 'index.cjs' }));
+  fs.writeFileSync(path.join(pkgDir, 'index.cjs'), [
+    'const leaf = () => ({ kind: "leaf", default: (v) => ({ kind: "leaf", value: v }) });',
+    'module.exports = {',
+    '  any: () => leaf(),',
+    '  array: (item) => ({ kind: "array", item, default: (v) => ({ kind: "array", value: v }) }),',
+    '  object: (shape) => ({ kind: "object", shape }),',
+    '};',
+    '',
+  ].join('\n'));
+  return path.join(pkgDir, 'index.cjs');
+}
 
 // delivered 落点默认在 profile 根；测试统一改到临时目录，避免污染本机 profile。
 const suiteProfileRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-profile-'));
@@ -2103,8 +2095,8 @@ async function p14WaitFor(cond, label, ms = 3000) {
   let disp = null;
   let injectDeps = null;
   let fiberCatch = false;
+  const stubPath = p14InstallSchemaStub(root);
   warnings.length = 0;
-  schemaStubEnabled = true;
   try {
     const ctx = {
       agents, logger, effect: () => {}, get: (name) => (name === 'settings' ? api : undefined),
@@ -2129,6 +2121,11 @@ async function p14WaitFor(cond, label, ms = 3000) {
       assert.ok(!log.includes('无 settings 服务'), '服务存在时不应走降级 warn');
       assert.equal(fiberCatch, true, 'fiber 应挂 .catch（不许 await）');
     });
+    check('P14 ① schemastery 走 profile 基线解析（不是插件真实路径）', () => {
+      const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+      assert.ok(log.includes(`基线=${path.join(root, 'package.json')}`), `应记录 profile 基线：${log.split('\n').slice(-3).join(' | ')}`);
+      assert.ok(log.includes(`resolved=${stubPath}`), `应从 profile/node_modules 解析到：${log.split('\n').slice(-3).join(' | ')}`);
+    });
     fs.writeFileSync(path.join(d, 'p14a.txt'), 'x\n<!-- DONE -->\n');
     box.cb('change', 'p14a.txt');
     await sleep(150);
@@ -2137,7 +2134,6 @@ async function p14WaitFor(cond, label, ms = 3000) {
       assert.equal(fs.existsSync(path.join(d, 'p14a.txt')), false);
     });
   } finally {
-    schemaStubEnabled = false;
     if (disp) disp();
     restoreProfile();
     fs.rmSync(d, { recursive: true, force: true });
@@ -2158,7 +2154,7 @@ async function p14WaitFor(cond, label, ms = 3000) {
   let disp = null;
   let injectedCb = null;
   warnings.length = 0;
-  schemaStubEnabled = true;
+  p14InstallSchemaStub(root);
   try {
     const ctx = {
       agents, logger, effect: () => {}, get: () => undefined,   // 启动时服务还没到
@@ -2183,7 +2179,6 @@ async function p14WaitFor(cond, label, ms = 3000) {
       assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
     });
   } finally {
-    schemaStubEnabled = false;
     if (disp) disp();
     restoreProfile();
     fs.rmSync(d, { recursive: true, force: true });
@@ -2279,7 +2274,7 @@ async function p14WaitFor(cond, label, ms = 3000) {
   }
 }
 
-for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, schemaStubDir, ...extraDirs]) {
+for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 

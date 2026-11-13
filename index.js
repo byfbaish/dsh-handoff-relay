@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
 export const name = 'dsh-handoff-relay';
 export const inject = ['agents'];
@@ -48,6 +49,20 @@ function profileRootDir() {
   if (typeof envDir === 'string' && envDir.trim() && path.isAbsolute(envDir.trim())) return envDir.trim();
   const profile = String(process.env.DSH_PROFILE || '').trim() || 'desktop';
   return path.join(os.homedir(), '.dsh', 'profiles', profile);
+}
+
+/**
+ * P14 追加：schemastery 的解析基线必须是 profile 根，而不是插件真实路径。
+ * 宿主把 @deepseek-ai/schemastery 装在 <profile>/node_modules 下；插件路径在别的盘符/工作区，
+ * Node 从插件目录往上找永远解析不到。这里用 createRequire(<profile>/package.json) 显式换基线。
+ * 不改 package.json、不装依赖；解析不到就抛给调用方，由它 warn 跳过设置卡。
+ */
+function loadSchemastery() {
+  const baseFile = path.join(profileRootDir(), 'package.json');
+  const req = createRequire(baseFile);
+  const resolved = req.resolve('@deepseek-ai/schemastery');
+  const mod = req('@deepseek-ai/schemastery');
+  return { z: mod && (mod.default || mod), resolved };
 }
 
 function isInsideDir(dir, target) {
@@ -688,13 +703,18 @@ async function mountSettingsCard(ctx, configWatches, stateDir) {
     return;
   }
   let z;
+  let schemaResolved = '';
   try {
-    const mod = await import('@deepseek-ai/schemastery');
-    z = mod && (mod.default || mod);
+    // 解析基线 = profile 根（宿主把 schemastery 装在 <profile>/node_modules 下），
+    // 不是插件真实路径——从插件目录往上找永远到不了 profile。
+    const loaded = loadSchemastery();
+    z = loaded.z;
+    schemaResolved = loaded.resolved;
   } catch (err) {
-    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：无法解析 @deepseek-ai/schemastery（${String(err)}）`);
+    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：无法解析 @deepseek-ai/schemastery（基线=${path.join(profileRootDir(), 'package.json')}，${String(err)}）`);
     return;
   }
+  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 设置卡 schema 基线=${path.join(profileRootDir(), 'package.json')} resolved=${schemaResolved}`);
   let scope;
   try {
     const Schema = z.object({ watches: z.array(z.any()).default([]) });
