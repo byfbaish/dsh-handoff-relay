@@ -1579,6 +1579,166 @@ const p9WithProfile = (root) => {
   }
 }
 
+// ---------------------------------------------------------------- P10：先解析后标记
+// 1) 解析失败不标记 delivered → 同 mtime 再触发仍重试；目标出现后正常投递并移走
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p10-a-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const live = {};                       // 目标会话注册表：一开始为空，模拟「启动早于会话就绪」
+  const ctx = {
+    agents: {
+      get: (id) => live[id],
+      roots: () => Object.entries(live).map(([id, a]) => ({ id, ...a })),
+    },
+    logger: { info: () => {}, warn: (m) => warnings.push(m) },
+  };
+  const box = capturingWatch();
+  warnings.length = 0;
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(ctx, {
+      watches: [{ dir: d, targetSessionId: 'P10-LATE' }], stableMs: 120,
+    }));
+    fs.writeFileSync(path.join(d, 'late.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'late.txt');        // 首个事件（含首事件全量重扫）
+    await sleep(60);
+    const attemptsAfterFirst = warnings.filter((m) => m.includes('解析不到目标')).length;
+    box.cb('change', 'late.txt');        // 同 mtime 再来一次事件
+    await sleep(60);
+    const attemptsAfterSecond = warnings.filter((m) => m.includes('解析不到目标')).length;
+    check('P10 解析失败后不标记 delivered：同 mtime 再触发仍会重新尝试', () => {
+      assert.equal(calls.length, 0, `解析不到时不应投递，实际 ${calls.length}`);
+      assert.ok(attemptsAfterFirst >= 2, `首个事件应触发「重扫 + 按文件名」至少 2 次尝试，实际 ${attemptsAfterFirst}`);
+      assert.ok(attemptsAfterSecond > attemptsAfterFirst,
+        `同 mtime 的后续事件应继续尝试，实际 ${attemptsAfterFirst} → ${attemptsAfterSecond}`);
+      assert.equal(fs.existsSync(path.join(d, 'late.txt')), true, '文件应留在 watch 目录（未投递）');
+      assert.equal(p9Walk(p9DeliveredRoot(root), 'late.txt').length, 0, '未投递不应出现在 delivered');
+    });
+    check('P10 解析失败的 WARN 含文件名、目标标识原样与原因', () => {
+      const line = warnings.filter((m) => m.includes('解析不到目标')).pop() || '';
+      assert.ok(line.includes('late.txt'), `缺文件名：${line}`);
+      assert.ok(line.includes('targetSessionId=P10-LATE'), `缺目标标识：${line}`);
+      assert.ok(line.includes('reason=agent-not-found'), `缺原因：${line}`);
+    });
+    check('P10 解析失败的 WARN 也写进 relay.log', () => {
+      const log = path.join(p9StateDir(root), 'relay.log');
+      assert.equal(fs.existsSync(log), true, `应有 relay.log：${log}`);
+      const text = fs.readFileSync(log, 'utf8');
+      assert.ok(text.includes('解析不到目标') && text.includes('reason=agent-not-found'),
+        `relay.log 应含解析失败行：${text.split('\n').slice(-3).join(' | ')}`);
+    });
+    live['P10-LATE'] = { title: '迟到会话', followup: (m) => calls.push(m) };
+    box.cb('change', 'late.txt');        // 目标就绪后的下一次事件
+    await sleep(80);
+    check('P10 解析成功后正常投递并移走', () => {
+      assert.equal(calls.length, 1, `期望 1 次，实际 ${calls.length}`);
+      assert.equal(fs.existsSync(path.join(d, 'late.txt')), false, '投递后应移走');
+      assert.equal(p9Walk(p9DeliveredRoot(root), 'late.txt').length, 1, 'delivered 下应有该文件');
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// 3c) 加载时文件已在、目标解析不到 → 首个事件全量重扫补投；后续事件不再重扫（latch）
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p10-c-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const live = {};
+  const ctx = {
+    agents: {
+      get: (id) => live[id],
+      roots: () => Object.entries(live).map(([id, a]) => ({ id, ...a })),
+    },
+    logger: { info: () => {}, warn: (m) => warnings.push(m) },
+  };
+  const box = capturingWatch();
+  const nativeReaddir = fs.readdirSync;
+  let scans = 0;
+  let disp = null;
+  warnings.length = 0;
+  try {
+    // 文件在加载前就存在，且此时目标解析不到
+    fs.writeFileSync(path.join(d, 'pre.txt'), 'x\n<!-- DONE -->\n');
+    fs.readdirSync = (p, opts) => {
+      if (p === d) scans += 1;
+      return nativeReaddir(p, opts);
+    };
+    disp = withFs(box.patch, () => apply(ctx, {
+      watches: [{ dir: d, targetSessionId: 'P10-PRE' }], stableMs: 120,
+    }));
+    const scansAfterLoad = scans;
+    box.cb('change', 'pre.txt');          // 首个事件 → 全量重扫（此时仍解析不到）
+    await sleep(60);
+    const scansAfterFirstEvent = scans;
+    live['P10-PRE'] = { title: '补投目标', followup: (m) => calls.push(m) };
+    box.cb('change', 'pre.txt');          // 后续事件 → 不重扫，只按文件名 consider
+    await sleep(80);
+    check('P10 加载时解析失败 + 首个事件重扫 → 补投成功', () => {
+      assert.equal(scansAfterLoad, 1, `加载期应扫 1 次，实际 ${scansAfterLoad}`);
+      assert.equal(scansAfterFirstEvent, 2, `首个事件应重扫 1 次，实际累计 ${scansAfterFirstEvent}`);
+      assert.equal(calls.length, 1, `重扫后目标就绪应补投 1 次，实际 ${calls.length}`);
+      assert.equal(fs.existsSync(path.join(d, 'pre.txt')), false, '补投后应移走');
+      assert.equal(p9Walk(p9DeliveredRoot(root), 'pre.txt').length, 1, 'delivered 下应有该文件');
+    });
+    check('P10 latch：后续事件不再二次重扫', () => {
+      assert.equal(scans, 2, `后续事件不应再扫目录，实际累计 ${scans}`);
+    });
+  } finally {
+    fs.readdirSync = nativeReaddir;
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// 2) 加载期每条 watch 一行解析结果：resolved=<id> / agent-not-found / title-no-match / title-multiple
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p10-b-'));
+  const restoreProfile = p9WithProfile(root);
+  const dirs = [tmp(), tmp(), tmp(), tmp()];
+  const agents = [
+    { id: 'S-OK', title: '正常会话' },
+    { id: 'S-BRIEF1', title: '周简报 A' },
+    { id: 'S-BRIEF2', title: '周简报 B' },
+  ];
+  const ctx = {
+    agents: { get: (id) => agents.find((a) => a.id === id), roots: () => agents },
+    logger: { info: () => {}, warn: () => {} },
+  };
+  const box = capturingWatch();
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(ctx, {
+      watches: [
+        { dir: dirs[0], targetSessionId: 'S-OK' },
+        { dir: dirs[1], targetSessionId: 'S-GONE' },
+        { dir: dirs[2], targetTitle: '不存在的标题' },
+        { dir: dirs[3], targetTitle: '周简报' },
+      ],
+      stableMs: 5000,
+    }));
+    check('P10 加载期每条 watch 写一行解析结果（resolved / agent-not-found / title-no-match / title-multiple）', () => {
+      const text = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+      const lines = text.split('\n').filter((l) => l.includes('加载解析'));
+      assert.equal(lines.length, 4, `期望 4 行，实际 ${lines.length}：${JSON.stringify(lines)}`);
+      assert.ok(lines.some((l) => l.includes('resolved=S-OK') && l.includes(dirs[0])), JSON.stringify(lines));
+      assert.ok(lines.some((l) => l.includes('agent-not-found') && l.includes('targetSessionId=S-GONE') && l.includes(dirs[1])), JSON.stringify(lines));
+      assert.ok(lines.some((l) => l.includes('title-no-match:0') && l.includes('targetTitle="不存在的标题"') && l.includes(dirs[2])), JSON.stringify(lines));
+      assert.ok(lines.some((l) => l.includes('title-multiple:2') && l.includes('targetTitle="周简报"') && l.includes(dirs[3])), JSON.stringify(lines));
+      // 成功投递不写 relay.log：加载行里只有「加载解析」与启动行，不含「已投递」
+      assert.equal(text.includes('已投递'), false, `relay.log 不应记录每次成功投递：${text}`);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }

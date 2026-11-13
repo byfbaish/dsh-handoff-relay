@@ -402,17 +402,21 @@ function hitsText(hits) {
 
 /**
  * 加载期的「现在能否解析到」快照：只用于打日志与 warn，不缓存给投递用。
- * 返回 { ok, id, title, count, hits }；id 型解析不到时 count=0。
+ * 返回 { ok, id, title, count, hits, status }；status 用于加载行：
+ * resolved=<会话 id> / agent-not-found / title-no-match:<命中数> / title-multiple:<命中数>。
  */
 function describeTargetNow(ctx, target) {
   if (target.kind === 'id') {
     const s = resolveSession(ctx, target.value);
-    if (!s.found) return { ok: false, id: '', title: '', count: 0, hits: [] };
-    return { ok: true, id: target.value, title: s.title || '(无标题)', count: 1, hits: [] };
+    if (!s.found) return { ok: false, id: '', title: '', count: 0, hits: [], status: 'agent-not-found' };
+    return { ok: true, id: target.value, title: s.title || '(无标题)', count: 1, hits: [], status: `resolved=${target.value}` };
   }
   const hits = matchSessionsByTitle(ctx, target.value);
-  if (hits.length === 1) return { ok: true, id: hits[0].id, title: hits[0].title, count: 1, hits };
-  return { ok: false, id: '', title: '', count: hits.length, hits };
+  if (hits.length === 1) {
+    return { ok: true, id: hits[0].id, title: hits[0].title, count: 1, hits, status: `resolved=${hits[0].id}` };
+  }
+  const status = hits.length === 0 ? 'title-no-match:0' : `title-multiple:${hits.length}`;
+  return { ok: false, id: '', title: '', count: hits.length, hits, status };
 }
 
 function buildMessage(relName, fullPath, state, reason, template) {
@@ -446,7 +450,8 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   /**
    * 每次投递前现解析目标（不缓存、不按 cwd 猜）：
    * id 型沿用 get(id) → roots() 兜底；title 型走包含匹配，命中必须恰好 1 个。
-   * 解析不到 / 有歧义一律返回 null 并告警，不投递。
+   * 返回 { ok:true, id, title, agent } 或 { ok:false, reason }；
+   * reason ∈ agent-not-found / title-no-match / title-multiple（写 relay.log 用）。
    */
   function resolveNow(relName) {
     if (target.kind === 'id') {
@@ -457,18 +462,18 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
           if (ctx.agents && typeof ctx.agents.roots === 'function') ids = JSON.stringify((ctx.agents.roots() || []).map((a) => a && a.id).filter(Boolean));
         } catch { /* ignore */ }
         log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话未加载：get(${target.value}) 返回 undefined，roots() 中亦无匹配；文件 ${relName} 未投递。当前可用 roots id: ${ids}`);
-        return null;
+        return { ok: false, reason: 'agent-not-found' };
       }
-      return { id: target.value, title: sessionTitleOf(ctx, agent) || '(无标题)', agent };
+      return { ok: true, id: target.value, title: sessionTitleOf(ctx, agent) || '(无标题)', agent };
     }
     const hits = matchSessionsByTitle(ctx, target.value, warnErr);
-    if (hits.length === 1) return hits[0];
+    if (hits.length === 1) return { ok: true, id: hits[0].id, title: hits[0].title, agent: hits[0].agent };
     if (hits.length === 0) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题解析不到：${targetText} 命中 0 条（dir=${watchDir}）；文件 ${relName} 未投递（不按 cwd 兜底）`);
-      return null;
+      return { ok: false, reason: 'title-no-match' };
     }
     log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题有歧义：${targetText} 命中 ${hits.length} 条，候选：${hitsText(hits)}（dir=${watchDir}）；文件 ${relName} 未投递（歧义不猜）`);
-    return null;
+    return { ok: false, reason: 'title-multiple' };
   }
 
   /** 已记录「投递成功但移走失败」的快照：重载后仍跳过，避免同一文件被反复重投。 */
@@ -487,12 +492,18 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const key = `${relName}|${state.sig}`;
     if (delivered.has(key)) return;
     if (isFailedSnapshot(relName, state)) { skipFailed(relName); return; }
-    delivered.add(key);
     clearTimeout(state.timer);
     pending.delete(relName);
     const full = path.join(watchDir, relName);
+    // 先解析、后标记：解析不到就不进 delivered，文件保持「未投递」，下次事件/重载再试。
     const resolved = resolveNow(relName);
-    if (!resolved) return;
+    if (!resolved.ok) {
+      const msg = `[${PLUGIN_NAME}] ${label} 解析不到目标，保持未投递（reason=${resolved.reason}）：${relName}（dir=${watchDir}，目标=${targetText}）`;
+      log(ctx, 'warn', msg);
+      relayLog(ctx, stateDir, 'warn', msg);
+      return;
+    }
+    delivered.add(key);
     const agent = resolved.agent || findAgentById(ctx, resolved.id, warnErr);
     if (!agent) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话 ${resolved.id} 投递时已不可用；文件 ${full} 未投递`);
@@ -552,8 +563,17 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     try { return fs.readdirSync(watchDir, { withFileTypes: true }).filter((e) => e.isFile()).map((e) => e.name); }
     catch { return []; }
   }
+  // P10：加载期扫过一遍；若当时解析不到（文件留在原地、未标记），首个事件到达时补一次全量重扫。
+  // latch 保证每条 watch 每次加载只重扫一次，不新增定时器、不轮询。
+  let firstEventRescanned = false;
+  const rescanOnce = () => {
+    if (firstEventRescanned) return;
+    firstEventRescanned = true;
+    for (const rel of listFiles()) consider(rel);
+  };
   try {
     watcher = fs.watch(watchDir, { persistent: false, encoding: 'utf8' }, (_event, filename) => {
+      rescanOnce();                                        // 首个事件：先全量重扫一遍
       if (filename) consider(filename);
       else for (const rel of listFiles()) consider(rel);   // Windows 下 filename 可能为 null
     });
@@ -648,6 +668,8 @@ export function apply(ctx, config = {}) {
         : `targetSessionId=${target.value}`;
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
+    // 加载期每条 watch 一行解析结果（含 dir 与原样目标标识）：下次解析不到时能定位到是哪条 watch。
+    relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] ${label} 加载解析 dir=${dir} 目标=${target.kind === 'title' ? `targetTitle="${target.value}"` : `targetSessionId=${target.value}`} ${atLoad.status}`);
     const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root, stateDir);
     if (d) { disposers.push(d); startedModes.push(done.mode); }
   });
