@@ -18,6 +18,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml } from './index.js';
+import vm from 'node:vm';
+import { fileURLToPath } from 'node:url';
 
 // P14 追加：schemastery 的真实解析基线是 profile 根（<profile>/node_modules）。
 // ①②用例要断言「卡真的注册了」，就在临时 profile 里放一个最小 z 桩包（CJS），
@@ -2272,6 +2274,87 @@ async function p14WaitFor(cond, label, ms = 3000) {
     fs.rmSync(d, { recursive: true, force: true });
     fs.rmSync(root, { recursive: true, force: true });
   }
+}
+
+// ---------------------------------------------------------------- P15：卡片渲染（client.js 括号错）
+// 真执行 rows.map 的回调体：桩 h 会把函数 child 求值，React 桩让 useState 返回快照。
+// 旧代码（:172 是 `))`）会在求 rows.map 的参数时抛 `ReferenceError: row is not defined`。
+{
+  const p15Render = (clientCode, watches) => {
+    let factory;
+    const sandbox = { window: { __ModuleLoader__: { load: (def) => { factory = def.factory; } } }, console };
+    vm.runInNewContext(clientCode, sandbox, { filename: 'client.js' });
+    if (!factory) throw new Error('未捕获 client factory');
+    const hCalls = [];
+    const React = {
+      useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
+      useEffect: () => {},
+      createElement: (type, props, ...children) => {
+        // 要求：h 对函数 child 求值，避免只断言「组件能调用」
+        const kids = children.map((c) => (typeof c === 'function' ? c() : c));
+        const node = { type, props: props || {}, children: kids };
+        hCalls.push(node);
+        return node;
+      },
+    };
+    const requireStub = (name) => {
+      if (name === 'react') return React;
+      throw new Error(`未知 require：${name}`);
+    };
+    const mod = factory(requireStub);
+    const scope = {
+      getSnapshot: () => ({ value: { watches }, writable: true, status: 'ready', revision: 7 }),
+      subscribe: () => () => {},
+    };
+    let card = null;
+    mod.apply({
+      settingsScope: { bind: () => scope },
+      slots: {
+        inject: (key, fn) => { fn(); },
+        register: (def, component) => { card = component; return component; },
+      },
+    });
+    assert.equal(typeof card, 'function', 'apply 应把 RelayCard 注册到 settings.plugin.item');
+    const tree = card({ scope });
+    return { tree, hCalls };
+  };
+  const p15Walk = (node, out = []) => {
+    if (Array.isArray(node)) { for (const c of node) p15Walk(c, out); return out; }
+    if (!node || typeof node !== 'object') return out;
+    out.push(node);
+    for (const c of node.children || []) p15Walk(c, out);
+    return out;
+  };
+  const clientCode = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'client.js'), 'utf8');
+  const watches = [
+    { dir: 'C:\\watch\\a', targetSessionId: 'session-a', done: { text: '<!-- DONE -->' } },
+    { dir: 'C:\\watch\\b', targetSessionId: 'session-b', done: { regex: '^done$' } },
+    { dir: 'C:\\watch\\c', targetSessionId: 'session-c', done: null },
+  ];
+  let renderErr = null;
+  let rendered = null;
+  try {
+    rendered = p15Render(clientCode, watches);
+  } catch (err) {
+    renderErr = err;
+  }
+  check('P15 卡片渲染：rows.map 回调真执行，不抛 ReferenceError', () => {
+    assert.equal(renderErr, null, `渲染抛错：${renderErr && renderErr.message}`);
+    const nodes = p15Walk(rendered.tree);
+    assert.ok(nodes.length > 0 && rendered.hCalls.length > 0, '应真实构建出元素树');
+    // 三行都应该被 map 处理：每行是一个带 key 的 div
+    const rowNodes = nodes.filter((n) => n.type === 'div' && n.props && n.props.key !== undefined);
+    assert.equal(rowNodes.length, 3, `应有 3 行节点，实际 ${rowNodes.length}`);
+  });
+  check('P15 卡片渲染：doneKind 分支节点按行出现（text/regex 各一，off 无）', () => {
+    const nodes = p15Walk(rendered.tree);
+    const inputs = nodes.filter((n) => n.type === 'input');
+    const textInputs = inputs.filter((n) => n.props.placeholder === '<!-- DONE -->');
+    const regexInputs = inputs.filter((n) => n.props.placeholder === '正则，如 ^done$');
+    assert.equal(textInputs.length, 1, `text 行应有 1 个完成标记输入框，实际 ${textInputs.length}`);
+    assert.equal(regexInputs.length, 1, `regex 行应有 1 个正则输入框，实际 ${regexInputs.length}`);
+    assert.equal(inputs.filter((n) => n.type === 'input' && n.props.type === 'checkbox').length, 3, 'exact 复选框每行一个');
+  });
 }
 
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {

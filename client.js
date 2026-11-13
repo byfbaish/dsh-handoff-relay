@@ -169,7 +169,7 @@ window.__ModuleLoader__.load({
 							h("option", { value: "text" }, "文本标记"),
 							h("option", { value: "regex" }, "正则"),
 							h("option", { value: "off" }, "关闭（只看 stableMs）")),
-						h("button", { style: S.del, disabled: !writable, onClick: () => removeRow(i) }, "删除")),
+						h("button", { style: S.del, disabled: !writable, onClick: () => removeRow(i) }, "删除"),
 						(row.doneKind === "text" || row.doneKind === "regex") && h("div", { style: S.row },
 							h("input", {
 								style: S.input,
@@ -186,7 +186,7 @@ window.__ModuleLoader__.load({
 									onChange: (e) => patchRow(i, { exact: e.target.checked }),
 								}),
 								" exact（标题完全相等）"),
-							h("span", null, ""), h("span", null, ""), h("span", null, ""))),
+							h("span", null, ""), h("span", null, ""), h("span", null, "")))),
 				h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } },
 					h("button", { style: S.btn, onClick: addRow, disabled: !writable }, "新增一行"),
 					h("button", { style: S.btn, onClick: save, disabled: !writable || !dirty }, "保存"),
