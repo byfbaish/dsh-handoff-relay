@@ -18,6 +18,14 @@ const DELIVERED_DIRNAME = 'dsh-handoff-relay';
 const DELIVERED_SUBDIR = 'delivered';
 const MAX_DELIVERED_FILES = 1000;
 const MAX_DELIVERED_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// P9 止血：delivered 移动失败时重试；失败的 (文件,快照) 记进 failed.json，重载后不再重投。
+const RELAY_STATE_DIRNAME = 'dsh-handoff-relay';
+const FAILED_FILENAME = 'failed.json';
+const RELAY_LOG_FILENAME = 'relay.log';
+const MAX_FAILED_ENTRIES = 200;
+const MAX_LOG_BYTES = 256 * 1024;
+const RENAME_RETRIES = 3;
+const RENAME_RETRY_DELAY_MS = 100;
 
 function log(ctx, level, msg) {
   const logger = ctx && ctx.logger;
@@ -50,6 +58,99 @@ function dirKeyOf(dir) {
 
 function defaultDeliveredRoot() {
   return path.join(profileRootDir(), DELIVERED_DIRNAME, DELIVERED_SUBDIR);
+}
+
+// ---------------------------------------------------------------- P9：失败件台账 + 最小日志
+// 落点固定是 <profile 根>/dsh-handoff-relay/，与 delivered 改道（落到 tmpdir）无关。
+function relayStateDir() {
+  return path.join(profileRootDir(), RELAY_STATE_DIRNAME);
+}
+
+/** 去重指纹：与内存 Set 的 (文件 + size + mtime) 口径一致，另带目录，跨目录同名文件不互相误伤。 */
+function fingerOf(watchDir, relName, mtimeMs, size) {
+  return `${watchDir}|${relName}|${mtimeMs}|${size}`;
+}
+
+/** 同步短睡：重试间隔用，不引入异步时序（takeDelivered 在微任务里同步跑）。 */
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* 兜底自旋 */ }
+  }
+}
+
+// stateDir → { entries: [{finger,name,dirKey,at,err}], fingers: Set }；每个 profile 根只读一次。
+const failedRegistry = new Map();
+
+function loadFailedRegistry(ctx, stateDir) {
+  const cached = failedRegistry.get(stateDir);
+  if (cached) return cached;
+  const reg = { entries: [], fingers: new Set(), file: path.join(stateDir, FAILED_FILENAME) };
+  let raw;
+  try {
+    raw = fs.readFileSync(reg.file, 'utf8');
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 读取 failed.json 失败，按空表处理：${String(err)}（file=${reg.file}）`);
+    }
+    failedRegistry.set(stateDir, reg);
+    return reg;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error('顶层不是数组');
+    const kept = parsed.filter((e) => e && typeof e.finger === 'string' && e.finger);
+    if (kept.length !== parsed.length) throw new Error('存在缺 finger 的条目');
+    reg.entries = kept;
+    reg.fingers = new Set(kept.map((e) => e.finger));
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] failed.json 坏档，整表丢弃（本次会重新记录）：${String(err)}（file=${reg.file}）`);
+    reg.entries = [];
+    reg.fingers = new Set();
+  }
+  failedRegistry.set(stateDir, reg);
+  return reg;
+}
+
+/** 记一条失败件；超出 200 条按 at 删最旧；落盘失败只 warn，不阻塞投递链路。 */
+function rememberFailed(ctx, stateDir, record) {
+  let reg;
+  try { reg = loadFailedRegistry(ctx, stateDir); } catch { return; }
+  if (reg.fingers.has(record.finger)) return;
+  reg.entries.push(record);
+  reg.fingers.add(record.finger);
+  if (reg.entries.length > MAX_FAILED_ENTRIES) {
+    reg.entries.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    const dropped = reg.entries.splice(0, reg.entries.length - MAX_FAILED_ENTRIES);
+    for (const d of dropped) reg.fingers.delete(d.finger);
+  }
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(reg.file, `${JSON.stringify(reg.entries, null, 2)}\n`, 'utf8');
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] 写 failed.json 失败（不影响本次投递）：${String(err)}（file=${reg.file}）`);
+  }
+}
+
+/** 只写三条路径：启动、移动失败、跳过已失败件；超过 256KB 截断保留末尾一半。 */
+function relayLog(ctx, stateDir, level, msg) {
+  const line = `${new Date().toISOString()} ${String(level).toUpperCase()} ${msg}\n`;
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    const file = path.join(stateDir, RELAY_LOG_FILENAME);
+    let size = 0;
+    try { size = fs.statSync(file).size; } catch { size = 0; }
+    if (size > MAX_LOG_BYTES) {
+      const buf = fs.readFileSync(file);
+      const keep = Math.floor(MAX_LOG_BYTES / 2);
+      fs.writeFileSync(file, buf.subarray(Math.max(0, buf.length - keep)));
+    }
+    fs.appendFileSync(file, line, 'utf8');
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] 写 relay.log 失败：${String(err)}（dir=${stateDir}）`);
+  }
 }
 
 /** 落点不能在任何 watch 目录之内，否则移动本身会触发事件、形成自激。 */
@@ -93,30 +194,60 @@ function pruneDelivered(ctx, deliveredRoot) {
   }
 }
 
-/** 投递成功后「拿走」：移动到 delivered/<dirKey>/<原文件名>；失败只 warn，投递不回滚。 */
-function takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full) {
+/**
+ * P9：投递成功后「拿走」：先 mkdir -p 目标目录，再 rename；rename 失败重试 3 次（间隔 100ms）。
+ * 仍失败：把 finger 记进 failed.json（重载后不再重投），并写一行 relay.log；投递本身不回滚。
+ * 返回移走后的目标路径；失败返回 null。
+ */
+function takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full, state, stateDir) {
   try { fs.statSync(full); } catch { return null; }   // 已被前一次移动取走：静默跳过
-  const target = path.join(deliveredDirFor(deliveredRoot, watchDir), path.basename(relName));
+  const dirKey = dirKeyOf(watchDir);
+  const target = path.join(deliveredRoot, dirKey, path.basename(relName));
+  const errText = (err) => String(err);
+  const giveUp = (stage, err) => {
+    const msg = `[${PLUGIN_NAME}] ${label} 移动已投递文件失败（${stage}，已重试 ${RENAME_RETRIES} 次）：${errText(err)}（file=${full}，target=${target}）`;
+    log(ctx, 'warn', msg);
+    if (state) {
+      rememberFailed(ctx, stateDir, {
+        finger: fingerOf(watchDir, relName, state.mtimeMs, state.size),
+        name: path.basename(relName),
+        dirKey,
+        at: new Date().toISOString(),
+        err: errText(err),
+      });
+    }
+    relayLog(ctx, stateDir, 'warn', msg);
+    return null;
+  };
   try {
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    try { fs.rmSync(target, { force: true }); } catch { /* 覆盖旧副本 */ }
+  } catch (err) {
+    return giveUp('建目录', err);
+  }
+  try { fs.rmSync(target, { force: true }); } catch { /* 覆盖旧副本 */ }
+  let lastErr;
+  for (let attempt = 1; attempt <= RENAME_RETRIES; attempt += 1) {
     try {
       fs.renameSync(full, target);
+      lastErr = null;
+      break;
     } catch (err) {
+      lastErr = err;
       if (err && err.code === 'EXDEV') {
-        fs.copyFileSync(full, target);
-        fs.rmSync(full, { force: true });
-      } else {
-        throw err;
+        try {
+          fs.copyFileSync(full, target);
+          fs.rmSync(full, { force: true });
+          lastErr = null;
+        } catch (copyErr) { lastErr = copyErr; }
+        if (!lastErr) break;
       }
+      if (attempt < RENAME_RETRIES) sleepSync(RENAME_RETRY_DELAY_MS);
     }
-    log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已移走：${full} → ${target}`);
-    pruneDelivered(ctx, deliveredRoot);
-    return target;
-  } catch (err) {
-    log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 移动已投递文件失败（投递已完成，不重试）：${String(err)}（file=${full}，target=${target}）`);
-    return null;
   }
+  if (lastErr) return giveUp('rename', lastErr);
+  log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已移走：${full} → ${target}`);
+  pruneDelivered(ctx, deliveredRoot);
+  return target;
 }
 
 /** 拒绝嵌套量词（(a+)+、(x*)* 之类），防灾难性回溯卡死事件循环。 */
@@ -297,7 +428,7 @@ function buildMessage(relName, fullPath, state, reason, template) {
   });
 }
 
-function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deliveredRoot) {
+function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deliveredRoot, stateDir) {
   const pending = new Map();   // relName → { size, mtimeMs, sig, timer }；不轮询
   const delivered = new Set(); // 已投递快照，防止同一 (文件,size,mtimeMs) 重复 followup
   let closed = false;
@@ -340,9 +471,22 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     return null;
   }
 
+  /** 已记录「投递成功但移走失败」的快照：重载后仍跳过，避免同一文件被反复重投。 */
+  function isFailedSnapshot(relName, st) {
+    const reg = loadFailedRegistry(ctx, stateDir);
+    return reg.fingers.has(fingerOf(watchDir, relName, st.mtimeMs, st.size));
+  }
+
+  function skipFailed(relName) {
+    const msg = `[${PLUGIN_NAME}] ${label} 跳过已失败件（上次投递成功但移走失败，不再重投）：${relName}（dir=${watchDir}）`;
+    log(ctx, 'warn', msg);
+    relayLog(ctx, stateDir, 'warn', msg);
+  }
+
   function deliver(relName, state, reason) {
     const key = `${relName}|${state.sig}`;
     if (delivered.has(key)) return;
+    if (isFailedSnapshot(relName, state)) { skipFailed(relName); return; }
     delivered.add(key);
     clearTimeout(state.timer);
     pending.delete(relName);
@@ -359,7 +503,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
       agent.followup(message);
       log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${resolved.id}（${label}，文件=${full}，触发=${reason}）`);
       // 移动放在微任务里：同步投递路径（含测试里的 stat 断言）不感知文件尚未移走。
-      queueMicrotask(() => takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full));
+      queueMicrotask(() => takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full, state, stateDir));
     } catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] followup 抛错：${String(err)}`); }
   }
 
@@ -392,6 +536,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     if (!st.isFile()) return;
     const sig = `${st.size}:${st.mtimeMs}`;
     if (delivered.has(`${relName}|${sig}`)) return;
+    if (isFailedSnapshot(relName, { mtimeMs: st.mtimeMs, size: st.size })) { skipFailed(relName); return; }
 
     let state = pending.get(relName);
     // 同一快照的重复事件（Windows 常见）不重复重置 timer，避免稳定后仍被无限推迟。
@@ -450,6 +595,8 @@ export function apply(ctx, config = {}) {
     }
   }
   const delivered = resolveDeliveredRoot(watchDirs);
+  const stateDir = relayStateDir();
+  loadFailedRegistry(ctx, stateDir);   // 坏档在这里就 warn 一次，后续按空表继续
   if (delivered.moved) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] delivered 目录落在 watch 目录内，已改到 ${delivered.root}（原=${delivered.wanted}）`);
   }
@@ -501,10 +648,11 @@ export function apply(ctx, config = {}) {
         : `targetSessionId=${target.value}`;
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
-    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root);
+    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root, stateDir);
     if (d) { disposers.push(d); startedModes.push(done.mode); }
   });
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
+  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
   try {
     if (ctx && ctx.agents && typeof ctx.agents.roots === 'function') {
       const ids = (ctx.agents.roots() || []).map((a) => a && a.id).filter(Boolean);

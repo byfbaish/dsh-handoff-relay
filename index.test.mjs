@@ -1343,6 +1343,242 @@ function makeTitleCtx(calls, entries, opts = {}) {
   }
 }
 
+// ---------------------------------------------------------------- P9：投递后移走失败的止血
+// 每个子场景都换独立的 DSH_PROFILE_DIR，隔离 failed.json / relay.log，互不影响。
+const p9Walk = (dir, name) => {
+  const found = [];
+  const walk = (d) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.isFile() && e.name === name) found.push(full);
+    }
+  };
+  walk(dir);
+  return found;
+};
+const p9DeliveredRoot = (root) => path.join(root, 'dsh-handoff-relay', 'delivered');
+const p9StateDir = (root) => path.join(root, 'dsh-handoff-relay');
+const p9WithProfile = (root) => {
+  const prev = process.env.DSH_PROFILE_DIR;
+  process.env.DSH_PROFILE_DIR = root;
+  return () => {
+    if (prev === undefined) delete process.env.DSH_PROFILE_DIR;
+    else process.env.DSH_PROFILE_DIR = prev;
+  };
+};
+
+// 1) 先 mkdir -p 再 rename；第一次 rename 抛错，第二次成功
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p9-a-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  let disp = null;
+  const nativeRename = fs.renameSync;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P9-A' }], stableMs: 120,
+    }));
+    let attempts = 0;
+    const dirExistedAtCall = [];
+    fs.renameSync = (from, to) => {
+      attempts += 1;
+      dirExistedAtCall.push(fs.existsSync(path.dirname(to)));
+      if (attempts === 1) { const err = new Error('EPERM: transient'); err.code = 'EPERM'; throw err; }
+      return nativeRename(from, to);
+    };
+    fs.writeFileSync(path.join(d, 'retry.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'retry.txt');
+    await sleep(160);
+    check('P9 先建目录再 rename：第一次失败、第二次成功，文件进 delivered/<dirKey>/', () => {
+      assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
+      assert.equal(attempts, 2, `期望 2 次 rename，实际 ${attempts}`);
+      assert.equal(dirExistedAtCall[0], true, '第一次 rename 前目标目录应已存在（mkdir -p 在前）');
+      assert.equal(fs.existsSync(path.join(d, 'retry.txt')), false, '重试成功后 watch 目录里应已取走');
+      const moved = p9Walk(p9DeliveredRoot(root), 'retry.txt');
+      assert.equal(moved.length, 1, `delivered 下应有 1 个同名文件：${JSON.stringify(moved)}`);
+      assert.ok(moved[0].includes(`${path.sep}${dirKey(d)}${path.sep}`), `应按 dirKey 分桶：${moved[0]}`);
+    });
+    check('P9 成功路径不写失败台账', () => {
+      const failedFile = path.join(p9StateDir(root), 'failed.json');
+      assert.equal(fs.existsSync(failedFile), false, '没有 move 失败时不应产生 failed.json');
+    });
+  } finally {
+    fs.renameSync = nativeRename;
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// 2) rename 三次全失败 → failed.json 落一条；再次加载同一文件不二次投递
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p9-b-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const nativeRename = fs.renameSync;
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P9-B' }], stableMs: 120,
+    }));
+    fs.renameSync = () => { const err = new Error('EACCES: readonly'); err.code = 'EACCES'; throw err; };
+    const body = 'x\n<!-- DONE -->\n';
+    fs.writeFileSync(path.join(d, 'giveup.txt'), body);
+    box.cb('change', 'giveup.txt');
+    await sleep(500);
+    check('P9 rename 三次全失败 → 写 failed.json（finger/name/dirKey/at/err）', () => {
+      assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
+      assert.equal(fs.existsSync(path.join(d, 'giveup.txt')), true, '失败时文件应留在原处');
+      const failedFile = path.join(p9StateDir(root), 'failed.json');
+      assert.equal(fs.existsSync(failedFile), true, `应有 failed.json：${failedFile}`);
+      const list = JSON.parse(fs.readFileSync(failedFile, 'utf8'));
+      assert.equal(list.length, 1, `期望 1 条，实际 ${list.length}`);
+      const entry = list[0];
+      assert.equal(entry.name, 'giveup.txt');
+      assert.equal(entry.dirKey, dirKey(d));
+      assert.equal(typeof entry.at, 'string');
+      assert.ok(entry.err.includes('EACCES'), `err 应保留原始错误：${entry.err}`);
+      const st = fs.statSync(path.join(d, 'giveup.txt'));
+      assert.equal(entry.finger, `${d}|giveup.txt|${st.mtimeMs}|${st.size}`);
+    });
+    fs.renameSync = nativeRename;
+    disp();
+    disp = null;
+    // 重载同一目录：同一 (文件,size,mtime) 命中 failed.json → 跳过，不二次投递
+    warnings.length = 0;
+    const box2 = capturingWatch();
+    fs.renameSync = () => { const err = new Error('EACCES: readonly'); err.code = 'EACCES'; throw err; };
+    disp = withFs(box2.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P9-B' }], stableMs: 120,
+    }));
+    await sleep(150);
+    check('P9 重载后命中 failed.json → 跳过投递（消息只发过 1 次）', () => {
+      assert.equal(calls.length, 1, `期望仍 1 次，实际 ${calls.length}`);
+      assert.ok(warnings.some((m) => m.includes('跳过已失败件')), JSON.stringify(warnings));
+    });
+  } finally {
+    fs.renameSync = nativeRename;
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// 3) failed.json 超过 200 条 → 按 at 裁掉最旧
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p9-c-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const stateDir = p9StateDir(root);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const seed = [];
+  const base = Date.now() - 500000;
+  for (let i = 0; i < 250; i += 1) {
+    seed.push({
+      finger: `seed|${i}|0|0`, name: `seed-${i}.txt`, dirKey: 'seeddir',
+      at: new Date(base + i * 100).toISOString(), err: 'EACCES',
+    });
+  }
+  fs.writeFileSync(path.join(stateDir, 'failed.json'), `${JSON.stringify(seed, null, 2)}\n`);
+  const nativeRename = fs.renameSync;
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P9-C' }], stableMs: 120,
+    }));
+    fs.renameSync = () => { const err = new Error('EACCES: readonly'); err.code = 'EACCES'; throw err; };
+    fs.writeFileSync(path.join(d, 'cap.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'cap.txt');
+    await sleep(500);
+    check('P9 failed.json 超过 200 条 → 保留最新 200，最旧的被裁掉', () => {
+      const list = JSON.parse(fs.readFileSync(path.join(stateDir, 'failed.json'), 'utf8'));
+      assert.equal(list.length, 200, `期望 200 条，实际 ${list.length}`);
+      assert.equal(list.some((e) => e.name === 'seed-0.txt'), false, '最旧的 seed-0 应被裁掉');
+      assert.equal(list.some((e) => e.name === 'seed-249.txt'), true, '较新的 seed-249 应保留');
+      assert.equal(list.some((e) => e.name === 'cap.txt'), true, '本次失败件应保留');
+    });
+  } finally {
+    fs.renameSync = nativeRename;
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// 4) 坏档 / 写失败：不抛、只 warn
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p9-d-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const stateDir = p9StateDir(root);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'failed.json'), '{not json,,,');
+  warnings.length = 0;
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P9-D' }], stableMs: 120,
+    }));
+    check('P9 failed.json 坏 JSON → 不抛、整表丢弃并 warn', () => {
+      assert.equal(calls.length, 0, '加载期不应投递');
+      assert.ok(warnings.some((m) => m.includes('failed.json 坏档'), JSON.stringify(warnings)));
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// 5) relay.log：move 失败有行；超过 256KB 截断保留末尾一半
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p9-e-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const stateDir = p9StateDir(root);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const logFile = path.join(stateDir, 'relay.log');
+  const filler = '2026-01-01T00:00:00.000Z INFO 填充行\n'.repeat(12000);   // > 256KB
+  fs.writeFileSync(logFile, filler);
+  const bigSize = fs.statSync(logFile).size;
+  const nativeRename = fs.renameSync;
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P9-E' }], stableMs: 120,
+    }));
+    fs.renameSync = () => { const err = new Error('EACCES: readonly'); err.code = 'EACCES'; throw err; };
+    fs.writeFileSync(path.join(d, 'logfail.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'logfail.txt');
+    await sleep(500);
+    check('P9 relay.log 超过 256KB 被截断（保留末尾一半），并写入本轮失败行', () => {
+      assert.ok(bigSize > 256 * 1024, `预置日志应超过 256KB，实际 ${bigSize}`);
+      const size = fs.statSync(logFile).size;
+      assert.ok(size <= 128 * 1024 + 4096, `截断后应为末尾一半（128KB）再加本次写入行，实际 ${size}`);
+      const tail = fs.readFileSync(logFile, 'utf8');
+      assert.ok(tail.includes('移动已投递文件失败'), `日志尾部应含失败行：${tail.slice(-400)}`);
+    });
+    check('P9 relay.log 只在启动 / 失败 / 跳过三条路径写行（启动行存在且带 ISO 时间）', () => {
+      const text = fs.readFileSync(logFile, 'utf8');
+      const line = text.split('\n').find((l) => l.includes('启动') && l.includes('个 watch')) || '';
+      assert.ok(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(line), `启动行应有 ISO 时间：${line}`);
+    });
+  } finally {
+    fs.renameSync = nativeRename;
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }
