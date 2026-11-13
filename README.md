@@ -63,6 +63,13 @@ watch, the wanted title, and the number of matches (with candidates when it is
 ambiguous) is logged. There is no `cwd` fallback — the plugin never guesses a
 "most recently active" session.
 
+Set `exact: true` on a watch to require the whole title to be equal instead of
+a substring: with `exact: true`, the title must be exactly `周简报` and `周简报 A`
+no longer matches. `exact` accepts booleans only. A non-boolean value (for
+example the string `"true"`) is an error that **skips the whole watch**: nothing
+is delivered for it and it does not fall back to substring matching. Omitting
+`exact` keeps the substring behaviour described above.
+
 The notification is one user message. Its default text is
 `文件 <absolute path> 已就绪（触发=stable|DONE），请继续。`, so the receiver can
 open the file straight from that path. If the target session is not loaded, a
@@ -92,7 +99,8 @@ the profile's `package.json` or its bundle list.
 
 ### Install from the marketplace
 
-`dsh-handoff-relay` is published to npm (current release `0.3.2`), so the in-app
+`dsh-handoff-relay` is published to npm (the Releases page lists the current
+version), so the in-app
 marketplace finds it by name: search for `dsh-handoff-relay` and install it
 there. From the command line, the same package name works directly:
 
@@ -152,11 +160,12 @@ dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
 ```
 
 For a local checkout, `git pull` in that checkout and restart; if the change
-does not show up, re-run the `add` command once. Pin a release by appending a
-ref:
+does not show up, re-run the `add` command once. To pin a specific release,
+append the tag shown below — the repository's Releases page stays authoritative:
+after a new release, use the latest tag listed there.
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.2
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.4.0
 ```
 
 ### Uninstall and check status
@@ -195,6 +204,11 @@ profile tree and exits without booting the app.
   `targetSessionId`: writing both or neither skips that watch with a warning.
   Resolved afresh before each delivery; zero matches or more than one match
   means nothing is delivered, only a warning. There is no `cwd` fallback.
+- `watches[].exact` — title matching mode, boolean only. Omitted or `false`:
+  substring matching (the behaviour above, unchanged). `true`: the whole title
+  must be equal. Any non-boolean value (for example the string `"true"`) is an
+  error that skips that watch entirely — it does not deliver and does not fall
+  back to substring matching; the warning names the watch and the field.
 - `stableMs` — silence window in milliseconds, shared by all watches (default
   `5000`). A file counts as finished once `(size, mtimeMs)` has been unchanged
   for this long. Per-entry overrides are not supported.
@@ -217,6 +231,37 @@ working. Nothing is cached — every delivery resolves the target again.
 change when the host restarts, so re-wire `targetSessionId` after every
 restart; a `targetTitle` watch needs no re-wiring.**
 
+## Settings page
+
+From `0.4.0` the plugin also contributes a card to the host's plugin settings
+page. The card is an editor only: `watches` in `cordis.patch.yml` remains the
+single source of truth at runtime.
+
+- Each watch is one row: directory, target session (text input, checked for
+  existence before saving), completion rule, and `exact`.
+- Rows can be added, edited and removed; saving writes the whole `watches` array
+  back into `cordis.patch.yml` and leaves the rest of the file untouched.
+- Saving does **not** hot-reload the running relay. **Restart DSH for the new
+  watches to take effect** — this release has no live reload.
+
+## Startup rescan
+
+A watch whose target cannot be resolved at load time is retried a bounded
+number of times: 3 attempts, roughly 1 s / 5 s / 15 s after startup, all inside
+a 21-second window (`RETRY_DELAYS_MS = [1000, 5000, 15000]`,
+`MAX_SCAN_ATTEMPTS = 3`, `MAX_SCAN_WINDOW_MS = 21000`). Each attempt appends one
+INFO line to `relay.log`:
+
+```
+rescan#1 dir=<dir> result=not-found
+rescan#2 dir=<dir> result=resolved
+```
+
+The first successful attempt delivers the pending files immediately and cancels
+the remaining attempts. If all three fail the plugin stops retrying — there is
+no standing timer and no polling loop. A watch that resolves at load time never
+rescans, and a normal delivery still writes nothing to `relay.log`.
+
 ## Config
 
 | Field | Meaning |
@@ -225,6 +270,7 @@ restart; a `targetTitle` watch needs no re-wiring.**
 | `watches[].dir` | Absolute path of the directory to watch. Required. |
 | `watches[].targetSessionId` | Id of the session to notify. Exactly one of this and `targetTitle` is required. |
 | `watches[].targetTitle` | Substring of the target session's title (case-sensitive); resolved before every delivery; zero or multiple matches mean no delivery. Exactly one of this and `targetSessionId` is required. |
+| `watches[].exact` | Boolean title-matching switch. Omitted/`false` = substring match; `true` = whole title must be equal; a non-boolean value is an error that skips the whole watch. |
 | `stableMs` | Silence window in ms, shared by all watches. Default `5000`. |
 | `message` | Optional template; supports `{path}` (absolute path of the delivered file), `{file}` (file name), `{reason}`, `{size}`, `{mtimeMs}`. |
 | `watches[].done` | Per-watch completion rule: omitted = default text, `{ text }`, `{ regex }`, or `null` (off). |

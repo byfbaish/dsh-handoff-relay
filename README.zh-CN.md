@@ -50,6 +50,11 @@
 watch、找的是什么标题、命中几条（有歧义时列出候选）。**不做 `cwd` 兜底**——插件
 不会去猜「最近活跃的那个会话」。
 
+把某条 watch 的 `exact` 设为 `true`，就要求标题**完全相等**而不是包含：此时标题必须
+正好是 `周简报`，`周简报 A` 不再命中。`exact` 只接受布尔值；写成非布尔（比如字符串
+`"true"`）会报错并**跳过整条 watch**——该条既不投递，也不退回包含匹配。省略 `exact`
+则保持上面的包含匹配行为。
+
 通知是一条用户消息，默认文本形如
 `文件 <绝对路径> 已就绪（触发=stable|DONE），请继续。`，收件方可以按该路径直接读文件。
 如果目标会话尚未加载，则写一条警告日志，不发送任何消息。
@@ -77,7 +82,7 @@ watch、找的是什么标题、命中几条（有歧义时列出候选）。**�
 
 ### 从插件市场安装
 
-`dsh-handoff-relay` 已发布到 npm（当前版本 `0.3.2`），应用内插件市场按包名就能
+`dsh-handoff-relay` 已发布到 npm（当前版本见仓库 Releases 页），应用内插件市场按包名就能
 搜到它：在市场里搜索 `dsh-handoff-relay` 即可安装。命令行也可以直接用包名装：
 
 ```bash
@@ -134,10 +139,10 @@ dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
 ```
 
 本地检出的情形：在该检出目录里 `git pull` 后重启；若没生效，再执行一次 `add` 命令。
-要固定版本就带 ref：
+要固定某个版本就带下面的 tag，但以仓库 Releases 页为准：发版后取那里当前最新的 tag。
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.3.2
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.4.0
 ```
 
 ### 卸载与查看状态
@@ -170,6 +175,10 @@ dsh --dump-config --profile desktop
   `简报` 会命中 `周简报`）。与 `targetSessionId` **二选一**：都写或都不写，该条
   watch 会被跳过并告警。每次投递前都重新解析；命中 0 条或多条都不投递、只告警；
   不做 `cwd` 兜底。
+- `watches[].exact` —— 标题匹配模式，只接受布尔值。省略或 `false`：包含匹配
+  （即上面的行为，保持不变）。`true`：要求标题完全相等。写成非布尔值（比如字符串
+  `"true"`）会报错并**跳过整条 watch**——既不投递，也不退回包含匹配；警告会点名
+  该 watch 与该字段。
 - `stableMs` —— 静默窗口，单位毫秒，所有监控项共用（默认 `5000`）。文件的
   `(size, mtimeMs)` 持续这么久不变即判定为已完成。不支持为单项单独覆盖。
 - `watches[].done` —— 每条 watch 的完成规则，四种状态：
@@ -188,6 +197,33 @@ dsh --dump-config --profile desktop
 **`targetSessionId` 必须指向当前存在的会话；宿主重启后会话 id 会变化，每次重启后
 都需要重新接线。用 `targetTitle` 的 watch 不需要重新接线。**
 
+## 设置页
+
+从 `0.4.0` 起，插件还会在宿主的插件设置页里贡献一张卡片。卡片**只作编辑通道**：
+运行期的唯一真相仍然是 `cordis.patch.yml` 里的 `watches`。
+
+- 每条 watch 一行：目录、目标会话（文本输入，保存前校验是否存在）、完成规则、`exact`。
+- 可以新增、编辑、删除行；保存时把整个 `watches` 数组写回 `cordis.patch.yml`，
+  文件里的其它内容保持不动。
+- 保存**不会热更新**正在运行的 relay。**重启 DSH 后新的 watches 才生效**——
+  本版本不做热更新。
+
+## 启动期有限重扫
+
+加载时解析不到目标的 watch 会自动重试有限次：3 次，大约在启动后 1 秒 / 5 秒 / 15 秒，
+全部落在 21 秒窗口内（`RETRY_DELAYS_MS = [1000, 5000, 15000]`、
+`MAX_SCAN_ATTEMPTS = 3`、`MAX_SCAN_WINDOW_MS = 21000`）。每次尝试向 `relay.log`
+追加一行 INFO：
+
+```
+rescan#1 dir=<dir> result=not-found
+rescan#2 dir=<dir> result=resolved
+```
+
+第一次成功就立即补投待投文件，并取消剩余尝试。三次全失败就停止重试——没有常驻
+定时器，也没有轮询循环。加载时就能解析到的 watch 不会重扫，常规投递成功仍不写
+`relay.log`。
+
 ## 配置
 
 | 字段 | 含义 |
@@ -196,6 +232,7 @@ dsh --dump-config --profile desktop
 | `watches[].dir` | 要监控的目录，绝对路径。必填。 |
 | `watches[].targetSessionId` | 接收通知的会话 id。与 `targetTitle` 二选一，必选其一。 |
 | `watches[].targetTitle` | 目标会话标题的一部分（包含匹配，区分大小写）；每次投递前重新解析；命中 0 条或多条都不投递。与 `targetSessionId` 二选一，必选其一。 |
+| `watches[].exact` | 标题匹配开关，布尔值。省略/`false` = 包含匹配；`true` = 标题完全相等；非布尔值报错并跳过整条 watch。 |
 | `stableMs` | 静默窗口，单位毫秒，所有监控项共用。默认 `5000`。 |
 | `message` | 可选消息模板；支持 `{path}`（被投递文件的绝对路径）、`{file}`（文件名）、`{reason}`、`{size}`、`{mtimeMs}`。 |
 | `watches[].done` | 每条 watch 的完成规则：省略=默认文本，`{ text }`、`{ regex }` 或 `null`（关闭）。 |
