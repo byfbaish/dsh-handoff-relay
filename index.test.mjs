@@ -2324,6 +2324,7 @@ async function p14WaitFor(cond, label, ms = 3000) {
   };
   const p15Walk = (node, out = []) => {
     if (Array.isArray(node)) { for (const c of node) p15Walk(c, out); return out; }
+    if (typeof node === 'string') { out.push(node); return out; }
     if (!node || typeof node !== 'object') return out;
     out.push(node);
     for (const c of node.children || []) p15Walk(c, out);
@@ -2350,14 +2351,20 @@ async function p14WaitFor(cond, label, ms = 3000) {
     const rowNodes = nodes.filter((n) => n.type === 'div' && n.props && n.props.key !== undefined);
     assert.equal(rowNodes.length, 3, `应有 3 行节点，实际 ${rowNodes.length}`);
   });
-  check('P15 卡片渲染：doneKind 分支节点按行出现（text/regex 各一，off 无）', () => {
+  check('P22c 旧宿主渲染：只读、无 input/textarea/select/button，提示文案与真实 watch 命中', () => {
     const nodes = p15Walk(rendered.tree);
-    const inputs = nodes.filter((n) => n.type === 'input');
-    const textInputs = inputs.filter((n) => n.props.placeholder === '<!-- DONE -->');
-    const regexInputs = inputs.filter((n) => n.props.placeholder === '正则，如 ^done$');
-    assert.equal(textInputs.length, 1, `text 行应有 1 个完成标记输入框，实际 ${textInputs.length}`);
-    assert.equal(regexInputs.length, 1, `regex 行应有 1 个正则输入框，实际 ${regexInputs.length}`);
-    assert.equal(inputs.filter((n) => n.type === 'input' && n.props.type === 'checkbox').length, 3, 'exact 复选框每行一个');
+    const interactive = nodes.filter((n) => n.type === 'input' || n.type === 'textarea' || n.type === 'select' || n.type === 'button');
+    assert.equal(interactive.length, 0, `旧宿主不应有可编辑控件或按钮，实际 ${interactive.map((n) => n.type).join(',')}`);
+    const text = nodes.filter((n) => typeof n === 'string').join(' | ');
+    const hint = '当前宿主版本较旧，不支持本插件的配置界面。请直接编辑 cordis.patch.yml 里的 dsh-handoff-relay 配置，重启后生效。';
+    assert.ok(text.includes(hint), `缺只读提示：${text}`);
+    assert.ok(text.includes('exact 为 true 时标题必须完全相等（缺省 true）；填 false 则按包含匹配。'), `缺 exact 文案：${text}`);
+    assert.ok(text.includes('C:\\watch\\a') && text.includes('session-a'), `应展示真实 watch 值：${text}`);
+    assert.ok(text.includes('文本：<!-- DONE -->') && text.includes('正则：^done$'), `应展示完成规则：${text}`);
+  });
+  check('P22c 旧宿主文案：无「缺省为包含匹配」，无 session id 手填字样', () => {
+    assert.equal(clientCode.includes('缺省为包含匹配'), false);
+    assert.equal(/session id/i.test(clientCode), false, 'client.js 不应出现 session id 字样');
   });
 }
 

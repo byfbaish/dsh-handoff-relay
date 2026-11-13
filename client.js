@@ -95,117 +95,44 @@ window.__ModuleLoader__.load({
 			});
 		}
 
-		// ---------------------------------------------------------- 旧宿主卡片（P15/P17 形态）
+		// ---------------------------------------------------------- 旧宿主卡片（P22c：只读）
+		function relayDoneLabel(row) {
+			if (row.doneKind === "text") return `文本：${(row.done && row.done.text) || ""}`;
+			if (row.doneKind === "regex") return `正则：${(row.done && row.done.regex) || ""}`;
+			if (row.doneKind === "off") return "不使用";
+			return "默认（<!-- DONE -->）";
+		}
+
 		function RelayCard(props) {
 			const scope = props.scope;
 			const [snapshot, setSnapshot] = React.useState(() => scope.getSnapshot());
-			const [rows, setRows] = React.useState(() => toRows(snapshot.value && snapshot.value.watches));
-			const [dirty, setDirty] = React.useState(false);
-			const [status, setStatus] = React.useState("");
 
 			React.useEffect(() => scope.subscribe(() => setSnapshot(scope.getSnapshot())), [scope]);
 
-			React.useEffect(() => {
-				if (dirty) return; // 本地有未保存编辑时不用远端覆盖
-				const next = toRows(snapshot.value && snapshot.value.watches);
-				setRows(next);
-			}, [snapshot]);
-
-			const writable = snapshot.writable !== false;
+			const rows = toRows(snapshot.value && snapshot.value.watches);
 			const syncText = snapshot.status === "ready"
 				? `已同步 Host（revision ${snapshot.revision ?? "?"}）`
 				: snapshot.status === "loading" ? "正在读取 Host 设置…" : "Host 未提供该 namespace";
-
-			const patchRow = (i, patch) => {
-				setRows((prev) => prev.map((r, k) => (k === i ? { ...r, ...patch } : r)));
-				setDirty(true);
-				setStatus("");
-			};
-
-			const addRow = () => {
-				setRows((prev) => [...prev, {
-					dir: "", targetSessionId: "", targetTitle: "", exact: false,
-					doneKind: "default", done: undefined,
-				}]);
-				setDirty(true);
-			};
-
-			const removeRow = (i) => {
-				setRows((prev) => prev.filter((_, k) => k !== i));
-				setDirty(true);
-				setStatus("");
-			};
-
-			const save = async () => {
-				const errors = validateRows(rows);
-				if (errors.length) { setStatus("未保存：" + errors.join("；")); return; }
-				try {
-					await scope.set("watches", toWatches(rows));
-					setDirty(false);
-					setStatus("已保存（Host 会回写 cordis.patch.yml，重启 DSH 后生效）");
-				} catch (err) {
-					setStatus("保存失败：" + String(err && err.message ? err.message : err));
-				}
-			};
-
-			const reset = () => {
-				setRows(toRows(snapshot.value && snapshot.value.watches));
-				setDirty(false);
-				setStatus("已丢弃未保存的编辑");
-			};
+			const readonlyHint = "当前宿主版本较旧，不支持本插件的配置界面。请直接编辑 cordis.patch.yml 里的 dsh-handoff-relay 配置，重启后生效。";
 
 			return h("div", { style: S.wrap },
+				h("div", { style: S.hint }, readonlyHint),
 				h("div", { style: S.hint },
-					"watches 的运行时真相是 cordis.patch.yml；这里只做编辑通道。保存会回写 yml，重启 DSH 后生效。exact 表示标题完全相等（缺省为包含匹配）。"),
+					"exact 为 true 时标题必须完全相等（缺省 true）；填 false 则按包含匹配。"),
+				h("div", { style: S.hint }, "以下为当前 watch 的只读视图；本宿主不提供保存入口。"),
 				h("div", { style: S.head },
-					h("span", null, "目录（绝对路径）"),
-					h("span", null, "目标会话（session id）"),
+					h("span", null, "目录"),
+					h("span", null, "目标会话"),
 					h("span", null, "完成规则"),
 					h("span", null, "")),
 				rows.length === 0
-					? h("div", { style: S.hint }, "还没有 watch。点「新增一行」开始。")
+					? h("div", { style: S.hint }, "还没有 watch。")
 					: rows.map((row, i) => h("div", { key: i, style: S.row },
-						h("input", {
-							style: S.input, value: row.dir, disabled: !writable,
-							placeholder: "C:\\path\\to\\watch",
-							onChange: (e) => patchRow(i, { dir: e.target.value }),
-						}),
-						h("input", {
-							style: S.input, value: row.targetSessionId, disabled: !writable,
-							placeholder: "session-xxxxxxxx",
-							onChange: (e) => patchRow(i, { targetSessionId: e.target.value }),
-						}),
-						h("select", {
-							style: S.select, value: row.doneKind, disabled: !writable,
-							onChange: (e) => patchRow(i, { doneKind: e.target.value, done: doneOfKind(e.target.value, row.done) }),
-						},
-							h("option", { value: "default" }, "默认（<!-- DONE -->）"),
-							h("option", { value: "text" }, "文本标记"),
-							h("option", { value: "regex" }, "正则"),
-							h("option", { value: "off" }, "关闭（只看 stableMs）")),
-						h("button", { style: S.del, disabled: !writable, onClick: () => removeRow(i) }, "删除"),
-						(row.doneKind === "text" || row.doneKind === "regex") && h("div", { style: S.row },
-							h("input", {
-								style: S.input,
-								value: (row.done && (row.done.text || row.done.regex)) || "",
-								disabled: !writable,
-								placeholder: row.doneKind === "text" ? DEFAULT_DONE_TEXT : "正则，如 ^done$",
-								onChange: (e) => patchRow(i, { done: row.doneKind === "text" ? { text: e.target.value } : { regex: e.target.value } }),
-							}),
-							h("span", null, ""), h("span", null, ""), h("span", null, "")),
-						h("div", { style: S.row },
-							h("label", { style: S.hint },
-								h("input", {
-									type: "checkbox", checked: row.exact, disabled: !writable,
-									onChange: (e) => patchRow(i, { exact: e.target.checked }),
-								}),
-								" exact（标题完全相等）"),
-							h("span", null, ""), h("span", null, ""), h("span", null, "")))),
-				h("div", { style: { display: "flex", gap: "8px", alignItems: "center" } },
-					h("button", { style: S.btn, onClick: addRow, disabled: !writable }, "新增一行"),
-					h("button", { style: S.btn, onClick: save, disabled: !writable || !dirty }, "保存"),
-					h("button", { style: S.btn, onClick: reset, disabled: !dirty }, "放弃修改"),
-					h("span", { style: S.status }, status || syncText)));
+						h("span", null, row.dir || "（未填目录）"),
+						h("span", null, row.targetTitle || row.targetSessionId || "（未绑定会话）"),
+						h("span", null, `${relayDoneLabel(row)}；${row.exact === false ? "包含匹配" : "完全相等"}`),
+						h("span", null, ""))),
+				h("div", { style: S.status }, syncText));
 		}
 
 		// ---------------------------------------------------------- P22b 三列卡片
