@@ -2459,12 +2459,13 @@ async function p14WaitFor(cond, label, ms = 3000) {
   const calls = [];
   warnings.length = 0;
   const ctx = makeTitleCtx(calls, [{ id: 'P22-T', title: '周简报' }, { id: 'P22-T2', title: '周简报 A' }]);
-  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '周简报', exact: true }], stableMs: 120 });
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '周简报' }], stableMs: 120 });
   fs.writeFileSync(path.join(d, 'exact.txt'), 'x\n<!-- DONE -->\n');
   await sleep(400);
-  check('P22a ② 只有标题 + exact=true：只投完全同名的会话', () => {
+  check('P22a ② 只有标题 + exact 缺省(true)：只投完全同名的会话', () => {
     assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
     assert.ok(calls[0].content[0].text.includes('exact.txt'));
+    assert.equal(calls.every((c) => c.content[0].text.includes('exact.txt')), true);
     assert.equal(warnings.filter((m) => m.includes('无法解析会话标题')).length, 0, JSON.stringify(warnings));
   });
   disp();
