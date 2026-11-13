@@ -1943,9 +1943,19 @@ const p9WithProfile = (root) => {
 // 严格 ctx：访问未声明属性即抛 `cannot get property "<x>" without inject`（与 cordis 一致）。
 // 只播种 agents / logger / effect / get；get('settings') 返回 undefined（宿主无该服务）。
 {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p13-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p13-'));
   const restoreProfile = p9WithProfile(root);
-  const d = tmp();
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p13-'));
+  const assertOutsideWatchZones = (p) => {
+    const tmpPrefix = path.resolve(os.tmpdir()) + path.sep;
+    assert.ok(path.resolve(p).startsWith(tmpPrefix), `临时目录必须由 os.tmpdir() 派生：${p}`);
+    const relRepo = path.relative(path.resolve('.'), p);
+    assert.ok(relRepo.startsWith('..') || path.isAbsolute(relRepo), `临时目录不得在仓库内：${p}`);
+    const relDsh = path.relative(path.join(os.homedir(), '.dsh'), p);
+    assert.ok(relDsh.startsWith('..') || path.isAbsolute(relDsh), `临时目录不得在 ~/.dsh 内：${p}`);
+  };
+  assertOutsideWatchZones(d);
+  out(`P13 临时目录（绝对路径）：${d}`);
   const calls = [];
   const seen = [];
   const target = {
@@ -1974,21 +1984,63 @@ const p9WithProfile = (root) => {
     check('P13 严格 ctx：apply 不抛（未声明 settings 也不会同步崩）', () => {
       assert.equal(typeof disp, 'function', 'apply 应正常返回 dispose');
     });
+    // 真起 watcher：丢一个 DONE 文件，等真实事件 + 投递，从投递结果断言，而不是只看 startWatch。
     fs.writeFileSync(path.join(d, 'p13.txt'), 'x\n<!-- DONE -->\n');
     box.cb('change', 'p13.txt');
-    await sleep(120);
+    await sleep(150);
     check('P13 严格 ctx：watch 照常启动并投递（设置卡缺席不阻断主链路）', () => {
       assert.equal(calls.length, 1, `期望投递 1 次，实际 ${calls.length}；warnings=${JSON.stringify(warnings)}`);
       assert.equal(fs.existsSync(path.join(d, 'p13.txt')), false, '投递后应移走');
+      assert.equal(p9Walk(p9DeliveredRoot(root), 'p13.txt').length, 1, 'delivered 下应有该文件');
     });
     check('P13 严格 ctx：relay.log 写明「宿主无 settings 服务」', () => {
       const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
       assert.ok(log.includes('无 settings 服务'), `relay.log 应有降级说明：${log.split('\n').slice(-4).join(' | ')}`);
-      assert.equal(fs.existsSync(path.join(d, 'p13.txt')), false);
     });
   } finally {
     if (disp) disp();
     restoreProfile();
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// P13 b：宿主有 settings 服务、但 @deepseek-ai/schemastery 解析不到 → warn 跳过设置卡，watch 照常。
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p13-sch-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p13-'));
+  out(`P13b 临时目录（绝对路径）：${d}`);
+  const calls = [];
+  const target = {
+    agents: { get: (id) => (id === 'P13B' ? { followup: (m) => calls.push(m) } : undefined), roots: () => [] },
+    logger: { info: () => {}, warn: (m) => warnings.push(m) },
+    effect: () => {},
+    get: (name) => (name === 'settings'
+      ? { register: () => { throw new Error('schemastery 不可解析时不应走到 register'); } }
+      : undefined),
+  };
+  const box = capturingWatch();
+  let disp = null;
+  warnings.length = 0;
+  try {
+    disp = withFs(box.patch, () => apply(target, {
+      watches: [{ dir: d, targetSessionId: 'P13B' }], stableMs: 120,
+    }));
+    fs.writeFileSync(path.join(d, 'p13b.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'p13b.txt');
+    await sleep(150);
+    check('P13 有 settings 但 schemastery 不可解析：warn 跳过设置卡，watch 照常投递', () => {
+      const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+      assert.ok(log.includes('无法解析 @deepseek-ai/schemastery'), `relay.log 应写明跳过原因：${log.split('\n').slice(-3).join(' | ')}`);
+      assert.equal(calls.length, 1, `watch 应照常投递，实际 ${calls.length}`);
+      assert.equal(fs.existsSync(path.join(d, 'p13b.txt')), false, '投递后应移走');
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 }
 
