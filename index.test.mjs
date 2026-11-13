@@ -2583,10 +2583,13 @@ async function p14WaitFor(cond, label, ms = 3000) {
     vm.runInNewContext(clientCode, sandbox, { filename: 'client.js' });
     if (!factory) throw new Error('未捕获 client factory');
     const messages = [];
+    const setterCalls = [];
+    let hookIndex = 0;
     const React = {
       useState: (init) => {
+        const index = hookIndex++;
         let value = typeof init === 'function' ? init() : init;
-        return [value, (next) => { if (typeof next === 'string') messages.push(next); value = next; }];
+        return [value, (next) => { setterCalls.push({ index, next }); if (typeof next === 'string') messages.push(next); value = next; }];
       },
       useEffect: () => {},
       createElement: (type, props, ...children) => ({
@@ -2617,7 +2620,7 @@ async function p14WaitFor(cond, label, ms = 3000) {
     assert.equal(slot && slot.name, 'plugins.row.config');
     assert.equal(slot.key, 'dsh-handoff-relay#dsh-handoff-relay');
     const tree = component({ ctx: { get: () => undefined }, controller });
-    return { tree, messages, controller };
+    return { tree, messages, controller, setterCalls };
   };
   const walk = (node, out = []) => {
     if (Array.isArray(node)) { for (const c of node) walk(c, out); return out; }
@@ -2659,6 +2662,25 @@ async function p14WaitFor(cond, label, ms = 3000) {
     assert.deepEqual(selects.map((n) => n.props.value), ['text', 'regex', 'off']);
     const optionText = selects.flatMap((n) => (n.children || []).flatMap((c) => (c && c.children) || [])).join(' | ');
     assert.ok(optionText.includes('文本') && optionText.includes('正则') && optionText.includes('不使用'), optionText);
+  });
+
+  check('P22b 三态切换：第三行“不使用”切到“正则”，done 同步变成 { regex: "" }', () => {
+    const { tree, setterCalls } = p22bRender(baseRows);
+    const nodes = walk(tree);
+    const select = nodes.filter((n) => n && n.type === 'select')[2];
+    select.props.onChange({ target: { value: 'regex' } });
+    const updater = setterCalls.find((call) => typeof call.next === 'function');
+    assert.ok(updater, '切换应调用 setRows');
+    const initial = [
+      { dir: 'C:\\watch\\a', targetTitle: '会话 A', targetSessionId: '', exact: true, doneKind: 'text', done: { text: '<!-- DONE -->' } },
+      { dir: 'C:\\watch\\b', targetTitle: '会话 B', targetSessionId: '', exact: true, doneKind: 'regex', done: { regex: '^done$' } },
+      { dir: 'C:\\watch\\c', targetTitle: '会话 C', targetSessionId: '', exact: true, doneKind: 'off', done: null },
+    ];
+    const next = updater.next(initial);
+    assert.equal(next[2].doneKind, 'regex');
+    assert.equal(next[2].done.regex, '');
+    assert.equal(next[2].done.text, undefined);
+    assert.equal(next[0].doneKind, 'text', '其它行不受影响');
   });
 
   check('P22b 正则约束常驻，编译失败只标红该行', () => {
