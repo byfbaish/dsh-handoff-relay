@@ -440,6 +440,14 @@ function describeTargetNow(ctx, target) {
   if (hits.length === 1) {
     return { ok: true, id: hits[0].id, title: hits[0].title, count: 1, hits, status: `resolved=${hits[0].id}` };
   }
+  // 标题没命中或多义：有 id 兜底就按 id 校验（与投递期顺序一致）。
+  if (target.id) {
+    const s = resolveSession(ctx, target.id);
+    if (s.found) {
+      return { ok: true, id: target.id, title: s.title || '(无标题)', count: hits.length, hits, status: `title-fallback=${target.id}` };
+    }
+    return { ok: false, id: '', title: '', count: hits.length, hits, status: 'title-fallback-miss' };
+  }
   const status = hits.length === 0 ? 'title-no-match:0' : `title-multiple:${hits.length}`;
   return { ok: false, id: '', title: '', count: hits.length, hits, status };
 }
@@ -762,12 +770,16 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     for (const state of pending.values()) clearTimeout(state.timer);
     pending.clear();
   }
-  const targetText = target.kind === 'title' ? `targetTitle="${target.value}"${target.exact === true ? ' exact=true' : ''}` : `targetSessionId=${target.value}`;
+  const titleText = `targetTitle="${target.value}" exact=${target.exact === true ? 'true' : 'false'}`;
+  const targetText = target.kind === 'title'
+    ? (target.id ? `${titleText}（targetSessionId=${target.id} 兜底）` : titleText)
+    : `targetSessionId=${target.value}`;
   const warnErr = (kind, err) => log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} ${kind}：${String(err)}`);
 
   /**
    * 每次投递前现解析目标（不缓存、不按 cwd 猜）：
-   * id 型沿用 get(id) → roots() 兜底；title 型走包含匹配，命中必须恰好 1 个。
+   * 标题优先（exact=true 完全相等，false 包含），没命中或多义时若给了 targetSessionId
+   * 再按 id 精确兜底；只有 id 的旧形态仍走 get(id) → roots()。
    * 返回 { ok:true, id, title, agent } 或 { ok:false, reason }；
    * reason ∈ agent-not-found / title-no-match / title-multiple（写 relay.log 用）。
    */
@@ -786,6 +798,13 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     }
     const hits = matchSessionsByTitle(ctx, target.value, warnErr, target.exact === true);
     if (hits.length === 1) return { ok: true, id: hits[0].id, title: hits[0].title, agent: hits[0].agent };
+    // 标题没命中或多义：有 id 就按 id 精确兜底（id 是唯一命中，不会多义）。
+    if (target.id) {
+      const agent = findAgentById(ctx, target.id, warnErr);
+      if (agent) return { ok: true, id: target.id, title: sessionTitleOf(ctx, agent) || '(无标题)', agent };
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标无法解析：${targetText} 标题命中 ${hits.length} 条，targetSessionId=${target.id} 也解析不到（dir=${watchDir}）；文件 ${relName} 未投递（不按 cwd 兜底）`);
+      return { ok: false, reason: 'agent-not-found' };
+    }
     if (hits.length === 0) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 目标标题解析不到：${targetText} 命中 0 条（dir=${watchDir}${target.exact === true ? '，exact=true' : ''}）；文件 ${relName} 未投递（不按 cwd 兜底）`);
       return { ok: false, reason: 'title-no-match' };
@@ -960,22 +979,19 @@ export function apply(ctx, config = {}) {
     }
     const hasId = typeof rawId === 'string' && rawId.trim() !== '';
     const hasTitle = typeof rawTitle === 'string' && rawTitle.trim() !== '';
-    if (hasId && hasTitle) {
-      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetSessionId 与 targetTitle 只能二选一（两个都写了，不猜哪个优先）`);
-      return;
-    }
     if (!hasId && !hasTitle) {
-      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetSessionId 必须是非空字符串（或改用 targetTitle，二者二选一；当前 targetSessionId=${String(rawId)}，targetTitle=${String(rawTitle)}）`);
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetTitle 或 targetSessionId 至少给一个（当前 targetSessionId=${String(rawId)}，targetTitle=${String(rawTitle)}）`);
       return;
     }
     // P11 exact 开关：只接受布尔；非布尔 → 报错并跳过整条 watch，不退回包含匹配。
+    // P22a：缺省改为 exact=true（标题优先、按完全相等匹配）。
     const rawExact = w && w.exact;
     if (rawExact !== undefined && typeof rawExact !== 'boolean') {
-      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：字段 exact 必须是布尔（缺省=包含匹配，true=完全相等；当前 exact=${JSON.stringify(rawExact)}，类型=${typeof rawExact}，dir=${dir}）`);
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：字段 exact 必须是布尔（缺省=true 完全相等，false=包含匹配；当前 exact=${JSON.stringify(rawExact)}，类型=${typeof rawExact}，dir=${dir}）`);
       relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] ${label} exact 非布尔已跳过整条 watch：dir=${dir} exact=${JSON.stringify(rawExact)}`);
       return;
     }
-    const exact = rawExact === true;
+    const exact = rawExact === undefined ? true : rawExact === true;
     try {
       if (!fs.statSync(dir).isDirectory()) throw new Error('not a directory');
     } catch (err) {
@@ -993,18 +1009,21 @@ export function apply(ctx, config = {}) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 done 规则未启用，退回只按 stableMs 投递：${done.error}（dir=${dir}）`);
     }
     const target = hasTitle
-      ? { kind: 'title', value: rawTitle.trim(), exact }
-      : { kind: 'id', value: rawId };
+      ? { kind: 'title', value: rawTitle.trim(), exact, id: hasId ? rawId.trim() : undefined }
+      : { kind: 'id', value: rawId, exact };
     // 启动期校验＝「现在能否解析到」：解析不到只 warn，不阻断加载，也不影响其他 watch。
     const atLoad = describeTargetNow(ctx, target);
+    const targetLabel = target.kind === 'title'
+      ? `targetTitle="${target.value}" exact=${target.exact === true ? 'true' : 'false'}${target.id ? `（targetSessionId=${target.id} 兜底）` : ''}`
+      : `targetSessionId=${target.value}`;
     if (!atLoad.ok) {
       const which = target.kind === 'title'
-        ? `targetTitle="${target.value}" 命中 ${atLoad.count} 条${atLoad.count ? `，候选：${hitsText(atLoad.hits)}` : ''}`
+        ? `${targetLabel} 标题命中 ${atLoad.count} 条${atLoad.count ? `，候选：${hitsText(atLoad.hits)}` : ''}`
         : `targetSessionId=${target.value}`;
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
     // 加载期每条 watch 一行解析结果（含 dir 与原样目标标识）：下次解析不到时能定位到是哪条 watch。
-    relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] ${label} 加载解析 dir=${dir} 目标=${target.kind === 'title' ? `targetTitle="${target.value}"` : `targetSessionId=${target.value}`} ${atLoad.status}`);
+    relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] ${label} 加载解析 dir=${dir} 目标=${targetLabel} ${atLoad.status}`);
     const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root, stateDir);
     if (d) { disposers.push(d); startedModes.push(done.mode); }
   });

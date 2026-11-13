@@ -376,7 +376,7 @@ const infoCtx = (calls, opts) => {
   const p3 = apply(makeCtx([]), { watches: [{ dir: d, targetSessionId: 123 }] });
   check('dir 非绝对路径、targetSessionId 空或非字符串 → 逐条跳过并点名', () => {
     assert.ok(warnings.some((m) => m.includes('dir 必须是绝对路径')), `缺 dir 校验日志：${JSON.stringify(warnings)}`);
-    assert.equal(warnings.filter((m) => m.includes('targetSessionId 必须是非空字符串')).length, 2,
+    assert.equal(warnings.filter((m) => m.includes('targetTitle 或 targetSessionId 至少给一个')).length, 2,
       `应有 2 条 target 校验日志：${JSON.stringify(warnings)}`);
   });
   p1(); p2(); p3();
@@ -978,7 +978,7 @@ function makeTitleCtx(calls, entries, opts = {}) {
   };
 }
 
-// targetSessionId / targetTitle 二选一：双写、双空都只跳过该条
+// targetSessionId / targetTitle 双写 → P22a 新语义：标题优先、id 兜底，不再跳过
 {
   const dDup = tmp();
   const dNone = tmp();
@@ -990,18 +990,21 @@ function makeTitleCtx(calls, entries, opts = {}) {
     watches: [
       { dir: dDup, targetSessionId: 'P6-OK', targetTitle: '周简报' },
       { dir: dNone },
-      { dir: dOk, targetTitle: '简报' },
+      { dir: dOk, targetTitle: '简报', exact: false },
     ],
     stableMs: 120,
   });
+  fs.writeFileSync(path.join(dDup, 'dup.txt'), 'x\n<!-- DONE -->\n');
   fs.writeFileSync(path.join(dOk, 'ok.txt'), 'x\n<!-- DONE -->\n');
   await sleep(400);
-  check('P6 双写 / 双空 → 只跳过该条并点名 warn，其他 watch 照常投递', () => {
-    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
-    assert.ok(calls[0].content[0].text.includes('ok.txt'), calls[0].content[0].text);
-    assert.ok(warnings.some((m) => m.includes('跳过 watches[0]') && m.includes('只能二选一')),
-      `缺双写 warn：${JSON.stringify(warnings)}`);
-    assert.ok(warnings.some((m) => m.includes('跳过 watches[1]') && m.includes('targetSessionId 必须是非空字符串')),
+  check('P6 双写按标题优先投递 / 双空仍跳过 → 其他 watch 照常投递', () => {
+    assert.equal(calls.length, 2, `期望 2（双写按标题 + 包含匹配），实际 ${calls.length}`);
+    const texts = calls.map((c) => c.content[0].text).join(' | ');
+    assert.ok(texts.includes('dup.txt'), `双写 watch 应按标题投递：${texts}`);
+    assert.ok(texts.includes('ok.txt'), texts);
+    assert.equal(warnings.some((m) => m.includes('只能二选一')), false,
+      `双写不应再因二选一被跳过：${JSON.stringify(warnings)}`);
+    assert.ok(warnings.some((m) => m.includes('跳过 watches[1]') && m.includes('targetTitle 或 targetSessionId 至少给一个')),
       `缺双空 warn：${JSON.stringify(warnings)}`);
   });
   disp();
@@ -1030,7 +1033,7 @@ function makeTitleCtx(calls, entries, opts = {}) {
   const calls = [];
   warnings.length = 0;
   const ctx = makeTitleCtx(calls, [{ id: 'P6-B1', title: '周简报' }, { id: 'P6-B2', title: '周简报（二）' }]);
-  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报' }], stableMs: 120 });
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报', exact: false }], stableMs: 120 });
   fs.writeFileSync(path.join(d, 'two.txt'), 'x\n<!-- DONE -->\n');
   await sleep(400);
   check('P6 title 命中 2 条 → 不投递，warn 列出候选 id 与标题', () => {
@@ -1049,7 +1052,7 @@ function makeTitleCtx(calls, entries, opts = {}) {
   const calls = [];
   warnings.length = 0;
   const ctx = makeTitleCtx(calls, [{ id: 'P6-C', title: '周简报' }]);
-  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报' }], stableMs: 120 });
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报', exact: false }], stableMs: 120 });
   fs.writeFileSync(path.join(d, 'contains.txt'), 'x\n<!-- DONE -->\n');
   await sleep(400);
   check('P6 包含匹配（简报 命中 周简报）→ 投递正确且 source.kind 不变', () => {
@@ -1119,7 +1122,7 @@ function makeTitleCtx(calls, entries, opts = {}) {
   ctx.logger = { info: (m) => infos.push(m), warn: (m) => warnings.push(m) };
   const disp = apply(ctx, {
     watches: [
-      { dir: dOk, targetTitle: '简报' },
+      { dir: dOk, targetTitle: '简报', exact: false },
       { dir: dMiss, targetTitle: '不存在' },
     ],
     stableMs: 5000,
@@ -1739,7 +1742,7 @@ const p9WithProfile = (root) => {
         { dir: dirs[0], targetSessionId: 'S-OK' },
         { dir: dirs[1], targetSessionId: 'S-GONE' },
         { dir: dirs[2], targetTitle: '不存在的标题' },
-        { dir: dirs[3], targetTitle: '周简报' },
+        { dir: dirs[3], targetTitle: '周简报', exact: false },
       ],
       stableMs: 5000,
     }));
@@ -1761,7 +1764,7 @@ const p9WithProfile = (root) => {
 }
 
 // ---------------------------------------------------------------- P11：exact / 启动期重扫 / 设置卡回写
-// 1) exact 三态：缺省=包含匹配、true=完全相等、非布尔=报错并跳过整条 watch
+// 1) exact 三态：缺省=true 完全相等、false=包含匹配、非布尔=报错并跳过整条 watch
 {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p11-a-'));
   const restoreProfile = p9WithProfile(root);
@@ -1784,28 +1787,29 @@ const p9WithProfile = (root) => {
   try {
     disp = withFs(box.patch, () => apply(ctx, {
       watches: [
-        { dir: dirs[0], targetTitle: '周简报' },                    // 缺省：包含 → 命中 2 条，不投
-        { dir: dirs[1], targetTitle: '周简报', exact: true },        // 完全相等 → 命中 1 条
+        { dir: dirs[0], targetTitle: '周简报' },                    // 缺省 exact=true：完全相等 → 命中 1 条
+        { dir: dirs[1], targetTitle: '周简报', exact: false },       // 包含 → 命中 2 条，不投
         { dir: dirs[2], targetTitle: '周简报', exact: 'true' },      // 非布尔 → 整条跳过
       ],
       stableMs: 120,
     }));
     fs.writeFileSync(path.join(dirs[0], 'a.txt'), 'x\n<!-- DONE -->\n');
-    box.cb('change', 'a.txt');
+    box.cbs[0]('change', 'a.txt');
     fs.writeFileSync(path.join(dirs[1], 'b.txt'), 'x\n<!-- DONE -->\n');
-    box.cb('change', 'b.txt');
+    box.cbs[1]('change', 'b.txt');
     fs.writeFileSync(path.join(dirs[2], 'c.txt'), 'x\n<!-- DONE -->\n');
     box.cb('change', 'c.txt');
     await sleep(200);
-    check('P11 exact 缺省=包含匹配：标题命中多条时按原语义跳过（不投递）', () => {
-      assert.equal(fs.existsSync(path.join(dirs[0], 'a.txt')), true, '缺省包含匹配命中 2 条应不投递，文件应留在原地');
-      assert.ok(warnings.some((m) => m.includes('无法解析会话标题') && m.includes('命中 2 条') && m.includes(dirs[0])),
-        `应写明命中多条并点名该 watch：${JSON.stringify(warnings.slice(-4))}`);
-    });
-    check('P11 exact=true 完全相等：只命中同名会话并正常投递移走', () => {
+    check('P11 exact 缺省=true：完全相等只命中同名会话并正常投递移走', () => {
       const hit = calls.filter((c) => c.id === 'S-EXACT');
-      assert.equal(hit.length, 1, `期望投给 S-EXACT 1 次，实际 ${calls.map((c) => c.id)}`);
-      assert.equal(fs.existsSync(path.join(dirs[1], 'b.txt')), false, '投递后应移走');
+      assert.equal(hit.length, 1, `期望投给 S-EXACT 1 次，实际 ${JSON.stringify(calls.map((c) => c.id))}`);
+      assert.equal(fs.existsSync(path.join(dirs[0], 'a.txt')), false, '投递后应移走');
+      assert.equal(calls.filter((c) => c.id === 'S-LONG').length, 0, '缺省=完全相等，不应包含命中 S-LONG');
+    });
+    check('P11 exact=false 包含匹配：标题命中多条时跳过（不投递）', () => {
+      assert.equal(fs.existsSync(path.join(dirs[1], 'b.txt')), true, '包含匹配命中 2 条应不投递，文件应留在原地');
+      assert.ok(warnings.some((m) => m.includes('无法解析会话标题') && m.includes('命中 2 条') && m.includes(dirs[1])),
+        `应写明命中多条并点名该 watch：${JSON.stringify(warnings.slice(-4))}`);
     });
     check('P11 exact 非布尔：报错并跳过整条 watch（连加载解析行都没有）', () => {
       assert.equal(calls.filter((c) => c.id === 'S-EXACT' || c.id === 'S-LONG').length, 1,
@@ -2430,6 +2434,119 @@ async function p14WaitFor(cond, label, ms = 3000) {
     assert.equal(registered, 0);
     assert.ok(warns.some((w) => w.includes('无 configForms')), `应有 warn，实际：${warns.join(' | ')}`);
   });
+}
+
+// ---------------------------------------------------------------- P22a：标题优先、id 兜底、exact 缺省 true
+// ① 只有 targetSessionId：旧形态行为不变
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P22-ID', title: '旧形态' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetSessionId: 'P22-ID' }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'by-id.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P22a ① 只有 targetSessionId：旧形态行为不变（投递 1 次）', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('by-id.txt'), calls[0].content[0].text);
+  });
+  disp();
+}
+
+// ② 只有标题、exact=true（缺省）：完全相等命中
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P22-T', title: '周简报' }, { id: 'P22-T2', title: '周简报 A' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '周简报', exact: true }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'exact.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P22a ② 只有标题 + exact=true：只投完全同名的会话', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('exact.txt'));
+    assert.equal(warnings.filter((m) => m.includes('无法解析会话标题')).length, 0, JSON.stringify(warnings));
+  });
+  disp();
+}
+
+// ③ 只有标题、exact=false：包含匹配
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P22-C', title: '周简报' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报', exact: false }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'contains.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P22a ③ 只有标题 + exact=false：包含匹配命中并投递', () => {
+    assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes('contains.txt'));
+  });
+  disp();
+}
+
+// ④ 标题多义：warn 且不投（不按 cwd、不按 id 猜——本 watch 没有 id）
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P22-B1', title: '周简报' }, { id: 'P22-B2', title: '周简报（二）' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '简报', exact: false }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'amb.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P22a ④ 标题多义：warn 带 dir 与绑定值原文，不投递', () => {
+    assert.equal(calls.length, 0, `多义不应投递，实际 ${calls.length}`);
+    assert.ok(warnings.some((m) => m.includes('命中 2 条') && m.includes(d) && m.includes('targetTitle="简报"')),
+      `缺多义 warn：${JSON.stringify(warnings)}`);
+    assert.equal(fs.existsSync(path.join(d, 'amb.txt')), true, '文件应留在原地');
+  });
+  disp();
+}
+
+// ⑤ 标题失配但有 id → 按 id 投；标题多义但有 id → 同样按 id 兜底（P22a §2b）
+{
+  const dMiss = tmp();
+  const dAmbig = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P22-F', title: '兜底目标' }, { id: 'P22-B1', title: '周简报' }, { id: 'P22-B2', title: '周简报（二）' }]);
+  const disp = apply(ctx, {
+    watches: [
+      { dir: dMiss, targetTitle: '不存在的标题', targetSessionId: 'P22-F' },
+      { dir: dAmbig, targetTitle: '简报', exact: false, targetSessionId: 'P22-F' },
+    ],
+    stableMs: 120,
+  });
+  fs.writeFileSync(path.join(dMiss, 'miss.txt'), 'x\n<!-- DONE -->\n');
+  fs.writeFileSync(path.join(dAmbig, 'amb.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P22a ⑤ 标题失配 / 多义但有 targetSessionId：按 id 兜底投递', () => {
+    assert.equal(calls.length, 2, `期望两条都按 id 投，实际 ${calls.length}`);
+    const text = calls.map((c) => c.content[0].text).join(' | ');
+    assert.ok(text.includes('miss.txt'), text);
+    assert.ok(text.includes('amb.txt'), text);
+    assert.equal(calls.every((c) => c.content[0].text.includes('文件')), true);
+  });
+  disp();
+}
+
+// ⑥ 标题失配且 id 也解析不到：warn 且不投
+{
+  const d = tmp();
+  const calls = [];
+  warnings.length = 0;
+  const ctx = makeTitleCtx(calls, [{ id: 'P22-OK', title: '随便一个' }]);
+  const disp = apply(ctx, { watches: [{ dir: d, targetTitle: '不存在的标题', targetSessionId: 'P22-GONE' }], stableMs: 120 });
+  fs.writeFileSync(path.join(d, 'none.txt'), 'x\n<!-- DONE -->\n');
+  await sleep(400);
+  check('P22a ⑥ 标题失配且 id 解析不到：warn 带 dir 与两个绑定值，不投递', () => {
+    assert.equal(calls.length, 0, `不应投递，实际 ${calls.length}`);
+    assert.ok(warnings.some((m) => m.includes(d) && m.includes('targetTitle="不存在的标题"') && m.includes('P22-GONE')),
+      `缺兜底失败 warn：${JSON.stringify(warnings)}`);
+    assert.equal(fs.existsSync(path.join(d, 'none.txt')), true, '文件应留在原地');
+  });
+  disp();
 }
 
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
