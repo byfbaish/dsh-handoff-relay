@@ -17,7 +17,34 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { registerHooks } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml } from './index.js';
+
+// P14：@deepseek-ai/schemastery 只在宿主 app.asar 的 node_modules 里，插件目录解析不到。
+// ①②两条用例要断言「卡真的注册了」，必须让 z 可解析：这里用模块解析钩子把该 specifier
+// 暂时指向一个最小 z 实现（仅在 schemaStubEnabled=true 时生效，其它用例仍走真实失败路径）。
+const schemaStubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+const schemaStubFile = path.join(schemaStubDir, 'schemastery-stub.mjs');
+fs.writeFileSync(schemaStubFile, [
+  'const leaf = () => ({ kind: "leaf", default: (v) => ({ kind: "leaf", value: v }) });',
+  'export const any = () => leaf();',
+  'export const array = (item) => ({ kind: "array", item, default: (v) => ({ kind: "array", value: v }) });',
+  'export const object = (shape) => ({ kind: "object", shape });',
+  'export default { any, array, object };',
+  '',
+].join('\n'));
+let schemaStubEnabled = false;
+let schemaStubSeq = 0;
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (schemaStubEnabled && specifier === '@deepseek-ai/schemastery') {
+      schemaStubSeq += 1; // 每次给唯一 URL，避免模块缓存把不同用例的桩串起来
+      return { url: `${pathToFileURL(schemaStubFile).href}?v=${schemaStubSeq}`, shortCircuit: true };
+    }
+    return nextResolve(specifier, context);
+  },
+});
 
 // delivered 落点默认在 profile 根；测试统一改到临时目录，避免污染本机 profile。
 const suiteProfileRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-profile-'));
@@ -1983,6 +2010,7 @@ const p9WithProfile = (root) => {
     }));
     check('P13 严格 ctx：apply 不抛（未声明 settings 也不会同步崩）', () => {
       assert.equal(typeof disp, 'function', 'apply 应正常返回 dispose');
+      assert.ok(!warnings.some((w) => String(w).includes('without inject')), `不应碰未声明属性：${JSON.stringify(warnings)}`);
     });
     // 真起 watcher：丢一个 DONE 文件，等真实事件 + 投递，从投递结果断言，而不是只看 startWatch。
     fs.writeFileSync(path.join(d, 'p13.txt'), 'x\n<!-- DONE -->\n');
@@ -2044,7 +2072,214 @@ const p9WithProfile = (root) => {
   }
 }
 
-for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
+// ---------------------------------------------------------------- P14：ctx.inject(['settings'], cb) 挂卡
+// ① settings 先就绪 → 回调立即执行、register 恰好一次；② 先注入、settings 后到 → 到达时挂；
+const p14SettingsApi = () => {
+  const reg = [];
+  const scope = { get: () => ({ watches: [] }), update: async () => {}, watch: () => {} };
+  const api = { register: (...args) => { reg.push(args); return scope; } };
+  return { api, reg, scope };
+};
+const p14Child = (agents, logger, api) => ({
+  agents, logger, effect: () => {},
+  get: (name) => (name === 'settings' ? api : undefined),
+});
+async function p14WaitFor(cond, label, ms = 3000) {
+  const t0 = Date.now();
+  while (!cond() && Date.now() - t0 < ms) await sleep(10);
+  assert.ok(cond(), `等待超时：${label}`);
+}
+
+{
+  // ① settings 先就绪
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const calls = [];
+  const agents = { get: (id) => (id === 'P14A' ? { followup: (m) => calls.push(m) } : undefined), roots: () => [] };
+  const logger = { info: () => {}, warn: (m) => warnings.push(m) };
+  const { api, reg } = p14SettingsApi();
+  const box = capturingWatch();
+  let disp = null;
+  let injectDeps = null;
+  let fiberCatch = false;
+  warnings.length = 0;
+  schemaStubEnabled = true;
+  try {
+    const ctx = {
+      agents, logger, effect: () => {}, get: (name) => (name === 'settings' ? api : undefined),
+      inject: (deps, cb) => {
+        injectDeps = deps;
+        cb(p14Child(agents, logger, api));   // settings 已就绪：回调同步触发
+        return { catch: () => { fiberCatch = true; }, then: () => {} };
+      },
+    };
+    disp = withFs(box.patch, () => apply(ctx, { watches: [{ dir: d, targetSessionId: 'P14A' }], stableMs: 120 }));
+    await p14WaitFor(() => reg.length > 0, 'settings.register 被调用');
+    check('P14 ① settings 先就绪：inject 声明的依赖正确，register 恰好 1 次', () => {
+      assert.deepEqual(injectDeps, ['settings'], '应以 ["settings"] 注入，且不写进 required inject');
+      assert.equal(reg.length, 1, `register 应恰好 1 次，实际 ${reg.length}`);
+      assert.equal(typeof reg[0][1], 'object', 'register 拿到的 schema 不应为空');
+    });
+    check('P14 ① settings 先就绪：服务对象非 undefined（不是只触发回调）', () => {
+      // register 是 spy 挂在 api 上，只有 mountSettingsCard 真拿到该对象并调用其方法才会命中。
+      assert.equal(typeof api.register, 'function');
+      assert.ok(reg.length === 1 && reg[0][0] && typeof reg[0][0] === 'string');
+      const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+      assert.ok(!log.includes('无 settings 服务'), '服务存在时不应走降级 warn');
+      assert.equal(fiberCatch, true, 'fiber 应挂 .catch（不许 await）');
+    });
+    fs.writeFileSync(path.join(d, 'p14a.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'p14a.txt');
+    await sleep(150);
+    check('P14 ① settings 先就绪：watch 照常投递', () => {
+      assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
+      assert.equal(fs.existsSync(path.join(d, 'p14a.txt')), false);
+    });
+  } finally {
+    schemaStubEnabled = false;
+    if (disp) disp();
+    restoreProfile();
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  // ② settings 后到：先 inject，后 provide；用轮询 flag 判就绪，不用固定 sleep
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const calls = [];
+  const agents = { get: (id) => (id === 'P14B' ? { followup: (m) => calls.push(m) } : undefined), roots: () => [] };
+  const logger = { info: () => {}, warn: (m) => warnings.push(m) };
+  const { api, reg } = p14SettingsApi();
+  const box = capturingWatch();
+  let disp = null;
+  let injectedCb = null;
+  warnings.length = 0;
+  schemaStubEnabled = true;
+  try {
+    const ctx = {
+      agents, logger, effect: () => {}, get: () => undefined,   // 启动时服务还没到
+      inject: (deps, cb) => { injectedCb = cb; return { catch: () => {}, then: () => {} }; },
+    };
+    disp = withFs(box.patch, () => apply(ctx, { watches: [{ dir: d, targetSessionId: 'P14B' }], stableMs: 120 }));
+    check('P14 ② settings 后到：启动时服务未就绪，register 尚未发生', () => {
+      assert.equal(typeof injectedCb, 'function', 'apply 应通过 ctx.inject 注册就绪回调');
+      assert.equal(reg.length, 0, `服务未到时不应提前注册，实际 ${reg.length}`);
+    });
+    // settings 服务 provide：等价于宿主在 fiber 树里提供该服务后 cordis 回调
+    injectedCb(p14Child(agents, logger, api));
+    await p14WaitFor(() => reg.length > 0, '后到的 settings 触发 register', 3000);
+    check('P14 ② settings 后到：服务到达时挂卡，register 恰好 1 次', () => {
+      assert.equal(reg.length, 1, `register 应恰好 1 次，实际 ${reg.length}`);
+      assert.equal(typeof reg[0][1], 'object');
+    });
+    fs.writeFileSync(path.join(d, 'p14b.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'p14b.txt');
+    await sleep(150);
+    check('P14 ② settings 后到：watch 照常投递', () => {
+      assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
+    });
+  } finally {
+    schemaStubEnabled = false;
+    if (disp) disp();
+    restoreProfile();
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  // ③ 无 settings 服务：inject 回调立即执行但取不到服务 → warn 跳过、watch 照常、无异常
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const calls = [];
+  const agents = { get: (id) => (id === 'P14C' ? { followup: (m) => calls.push(m) } : undefined), roots: () => [] };
+  const logger = { info: () => {}, warn: (m) => warnings.push(m) };
+  const box = capturingWatch();
+  let disp = null;
+  warnings.length = 0;
+  try {
+    const ctx = {
+      agents, logger, effect: () => {}, get: () => undefined,
+      inject: (deps, cb) => { cb(p14Child(agents, logger, undefined)); return { catch: () => {}, then: () => {} }; },
+    };
+    let threw = null;
+    try {
+      disp = withFs(box.patch, () => apply(ctx, { watches: [{ dir: d, targetSessionId: 'P14C' }], stableMs: 120 }));
+    } catch (err) { threw = err; }
+    check('P14 ③ 无 settings：apply 不抛（服务缺席只降级）', () => {
+      assert.equal(threw, null, `apply 不应抛：${String(threw)}`);
+      assert.equal(typeof disp, 'function');
+    });
+    await p14WaitFor(() => {
+      try { return fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8').includes('无 settings 服务'); } catch { return false; }
+    }, 'relay.log 出现降级 warn');
+    check('P14 ③ 无 settings：warn 跳过设置卡，watch 照常投递', () => {
+      const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+      assert.ok(log.includes('无 settings 服务'), '应写降级 warn');
+      fs.writeFileSync(path.join(d, 'p14c.txt'), 'x\n<!-- DONE -->\n');
+      box.cb('change', 'p14c.txt');
+    });
+    await sleep(150);
+    check('P14 ③ 无 settings：watch 真的投递了文件', () => {
+      assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
+      assert.equal(fs.existsSync(path.join(d, 'p14c.txt')), false);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+{
+  // ④ 回调体抛错：inject 返回的 fiber 被 reject → 只降级 warn，apply 不 fatal，watch 照常
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-p14-'));
+  const calls = [];
+  const agents = { get: (id) => (id === 'P14D' ? { followup: (m) => calls.push(m) } : undefined), roots: () => [] };
+  const logger = { info: () => {}, warn: (m) => warnings.push(m) };
+  const box = capturingWatch();
+  let disp = null;
+  warnings.length = 0;
+  try {
+    const ctx = {
+      agents, logger, effect: () => {}, get: () => undefined,
+      inject: () => ({ catch: (fn) => { fn(new Error('回调体抛错（P14 模拟）')); }, then: () => {} }),
+    };
+    let threw = null;
+    try {
+      disp = withFs(box.patch, () => apply(ctx, { watches: [{ dir: d, targetSessionId: 'P14D' }], stableMs: 120 }));
+    } catch (err) { threw = err; }
+    await p14WaitFor(() => {
+      try { return fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8').includes('意外异常'); } catch { return false; }
+    }, '回调异常被降级');
+    check('P14 ④ 回调体抛错：apply 不 fatal，异常只落 relay.log warn', () => {
+      assert.equal(threw, null, `apply 不应抛：${String(threw)}`);
+      const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+      assert.ok(log.includes('设置卡未挂载：意外异常'), '应记录降级 warn');
+      fs.writeFileSync(path.join(d, 'p14d.txt'), 'x\n<!-- DONE -->\n');
+      box.cb('change', 'p14d.txt');
+    });
+    await sleep(150);
+    check('P14 ④ 回调体抛错：watch 照常启动并投递', () => {
+      assert.equal(calls.length, 1, `期望 1 次投递，实际 ${calls.length}`);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+    fs.rmSync(d, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, schemaStubDir, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }
 

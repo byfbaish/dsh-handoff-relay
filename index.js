@@ -990,10 +990,37 @@ export function apply(ctx, config = {}) {
   });
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
   relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
-  // P11 A：注册设置 namespace（卡片只作编辑通道，运行期仍只读 config.watches）。
-  // 用 .catch 兜底：设置卡整段是可选能力，任何异常都不许冒泡成未处理拒绝拖垮启动。
-  void mountSettingsCard(ctx, JSON.parse(JSON.stringify(watches)), stateDir)
-    .catch((err) => relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：意外异常（${String(err)}）`));
+  // P11 A / P14：设置 namespace 必须在 settings 服务就绪后挂载。
+  // `ctx.inject(['settings'], cb)` 等价于开一个子 plugin fiber：settings 先到（回调立即执行）
+  // 或后到（服务 provide 时再执行）都只触发一次；该 fiber 是 thenable（await 会等加载结束），
+  // settings 永不到来时会永远挂住启动链，所以只能 fire-and-forget + .catch，绝不 await。
+  const watchesCopy = JSON.parse(JSON.stringify(watches));
+  const cardError = (err) => relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：意外异常（${String(err)}）`);
+  // 回调体内异常不许抛回 cordis（那会升级成 fatal load failure）：同步段 try/catch，异步段 .catch。
+  const mountOnReady = (c) => Promise.resolve()
+    .then(() => mountSettingsCard(c, watchesCopy, stateDir))
+    .catch(cardError);
+  // 注意：严格 ctx 连方法读取都可能抛（cordis 代理），取 inject 本身也要 try/catch。
+  let injectFn = null;
+  try {
+    if (ctx && typeof ctx.inject === 'function') injectFn = ctx.inject.bind(ctx);
+  } catch { injectFn = null; }
+  if (injectFn) {
+    let fiber;
+    try {
+      fiber = injectFn(['settings'], (c) => {
+        try { mountOnReady(c); } catch (err) { cardError(err); }
+      });
+    } catch (err) {
+      // inject 自身不可用（老宿主/严格 ctx 无此方法）→ 退回直接尝试一次（内部仍会安全降级）。
+      cardError(err);
+      mountOnReady(ctx);
+    }
+    if (fiber && typeof fiber.catch === 'function') fiber.catch(cardError);
+  } else {
+    // 没有 ctx.inject 的宿主：保持 P13 的降级路径（getService 取不到就 warn 跳过）。
+    mountOnReady(ctx);
+  }
   try {
     if (ctx && ctx.agents && typeof ctx.agents.roots === 'function') {
       const ids = (ctx.agents.roots() || []).map((a) => a && a.id).filter(Boolean);
