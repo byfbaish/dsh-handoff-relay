@@ -699,7 +699,7 @@ function getService(ctx, name) {
 async function mountSettingsCard(ctx, configWatches, stateDir) {
   const settings = getService(ctx, 'settings');
   if (!settings || typeof settings.register !== 'function') {
-    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：宿主无 settings 服务（跳过，不影响 watch）`);
+    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：本版本不提供设置卡入口（跳过，不影响 watch）；如需配置请直接改 cordis.patch.yml`);
     return;
   }
   let z;

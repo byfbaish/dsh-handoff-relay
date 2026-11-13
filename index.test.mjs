@@ -2015,9 +2015,9 @@ const p9WithProfile = (root) => {
       assert.equal(fs.existsSync(path.join(d, 'p13.txt')), false, '投递后应移走');
       assert.equal(p9Walk(p9DeliveredRoot(root), 'p13.txt').length, 1, 'delivered 下应有该文件');
     });
-    check('P13 严格 ctx：relay.log 写明「宿主无 settings 服务」', () => {
+    check('P13 严格 ctx：relay.log 写明「不提供设置卡入口」', () => {
       const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
-      assert.ok(log.includes('无 settings 服务'), `relay.log 应有降级说明：${log.split('\n').slice(-4).join(' | ')}`);
+      assert.ok(log.includes('不提供设置卡入口'), `relay.log 应有降级说明：${log.split('\n').slice(-4).join(' | ')}`);
     });
   } finally {
     if (disp) disp();
@@ -2120,7 +2120,7 @@ async function p14WaitFor(cond, label, ms = 3000) {
       assert.equal(typeof api.register, 'function');
       assert.ok(reg.length === 1 && reg[0][0] && typeof reg[0][0] === 'string');
       const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
-      assert.ok(!log.includes('无 settings 服务'), '服务存在时不应走降级 warn');
+      assert.ok(!log.includes('不提供设置卡入口'), '服务存在时不应走降级 warn');
       assert.equal(fiberCatch, true, 'fiber 应挂 .catch（不许 await）');
     });
     check('P14 ① schemastery 走 profile 基线解析（不是插件真实路径）', () => {
@@ -2213,11 +2213,11 @@ async function p14WaitFor(cond, label, ms = 3000) {
       assert.equal(typeof disp, 'function');
     });
     await p14WaitFor(() => {
-      try { return fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8').includes('无 settings 服务'); } catch { return false; }
+      try { return fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8').includes('不提供设置卡入口'); } catch { return false; }
     }, 'relay.log 出现降级 warn');
     check('P14 ③ 无 settings：warn 跳过设置卡，watch 照常投递', () => {
       const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
-      assert.ok(log.includes('无 settings 服务'), '应写降级 warn');
+      assert.ok(log.includes('不提供设置卡入口'), '应写降级 warn');
       fs.writeFileSync(path.join(d, 'p14c.txt'), 'x\n<!-- DONE -->\n');
       box.cb('change', 'p14c.txt');
     });
