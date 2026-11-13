@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 export const name = 'dsh-handoff-relay';
 export const inject = ['agents'];
 const PLUGIN_NAME = 'dsh-handoff-relay';
@@ -14,9 +14,10 @@ const TAIL_BYTES = 4096;
 const MAX_REGEX_LENGTH = 200;
 const DEFAULT_STABLE_MS = 5000;
 const DEFAULT_MESSAGE = '文件 {path} 已就绪（触发={reason}），请继续。';
-const STATE_FILENAME = 'dsh-handoff-relay-state.json';
-const STATE_VERSION = 1;
-const MAX_FINGERPRINTS = 500;
+const DELIVERED_DIRNAME = 'dsh-handoff-relay';
+const DELIVERED_SUBDIR = 'delivered';
+const MAX_DELIVERED_FILES = 1000;
+const MAX_DELIVERED_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 function log(ctx, level, msg) {
   const logger = ctx && ctx.logger;
@@ -25,9 +26,9 @@ function log(ctx, level, msg) {
   }
   (level === 'warn' ? console.warn : console.info)(msg);
 }
-// ---------------------------------------------------------------- 落盘去重表
-// 指纹 = dir|relName|mtimeMs|size（不含目标）；同一指纹下记已投达的目标集合，
-// 因此同目录两条 watch 各投各的、互不吞；热重载 / 重启只跳过「同快照 + 同目标」。
+// ---------------------------------------------------------------- 已投件落点
+// 「已投」由文件系统承载：投递成功后把文件移出 watch 目录，重启/热重载天然不重放。
+// 落点 = <profile 根>/dsh-handoff-relay/delivered/<dirKey>/<原文件名>，dirKey 是目录的稳定短哈希。
 
 function profileRootDir() {
   const envDir = process.env.DSH_PROFILE_DIR;
@@ -41,100 +42,81 @@ function isInsideDir(dir, target) {
   return rel === '' || (!path.isAbsolute(rel) && rel.split(path.sep)[0] !== '..');
 }
 
-/** 状态文件必须落在任何 watch 目录之外，否则自身写入会触发事件、形成自激。 */
-function resolveStateFile(watchDirs) {
-  const override = process.env.DSH_RELAY_STATE_FILE;
-  const wanted = typeof override === 'string' && override.trim() && path.isAbsolute(override.trim())
-    ? override.trim()
-    : path.join(profileRootDir(), STATE_FILENAME);
-  if (!watchDirs.some((d) => isInsideDir(d, wanted))) return { file: wanted, moved: false, wanted };
-  const fallback = path.join(os.homedir(), '.dsh', STATE_FILENAME);
-  if (!watchDirs.some((d) => isInsideDir(d, fallback))) return { file: fallback, moved: true, wanted };
-  return { file: path.join(os.tmpdir(), STATE_FILENAME), moved: true, wanted };
+/** 目录的稳定短标识：sha1 前 12 位；Windows 下路径大小写不敏感，先小写。 */
+function dirKeyOf(dir) {
+  const normalized = (process.platform === 'win32' ? path.resolve(dir).toLowerCase() : path.resolve(dir));
+  return createHash('sha1').update(normalized).digest('hex').slice(0, 12);
 }
 
-/** 严格校验整表；任何一处不符都抛错（调用方整表丢弃并从空表重建）。 */
-function parseState(raw) {
-  let data;
-  try { data = JSON.parse(raw); }
-  catch { throw new Error('JSON 不可解析'); }
-  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('顶层不是对象');
-  if (data.version !== STATE_VERSION) throw new Error(`version 不认识（${String(data.version)}）`);
-  const src = data.entries;
-  if (!src || typeof src !== 'object' || Array.isArray(src)) throw new Error('entries 不是对象');
-  const out = {};
-  for (const [key, value] of Object.entries(src)) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`条目 ${key} 结构不符`);
-    if (typeof value.deliveredAt !== 'string' || !value.deliveredAt) throw new Error(`条目 ${key} 缺 deliveredAt`);
-    if (!Array.isArray(value.targets) || value.targets.some((t) => typeof t !== 'string')) {
-      throw new Error(`条目 ${key} 的 targets 不是字符串数组`);
-    }
-    out[key] = { deliveredAt: value.deliveredAt, targets: value.targets.slice() };
-  }
-  return out;
+function defaultDeliveredRoot() {
+  return path.join(profileRootDir(), DELIVERED_DIRNAME, DELIVERED_SUBDIR);
 }
 
-/** 单文件单表、所有 watch 共用；读失败按规格降级，写失败只 warn。 */
-function createStateStore(ctx, file) {
-  let entries = {};
-  let rebuilt = false;
+/** 落点不能在任何 watch 目录之内，否则移动本身会触发事件、形成自激。 */
+function resolveDeliveredRoot(watchDirs) {
+  const wanted = defaultDeliveredRoot();
+  if (!watchDirs.some((d) => isInsideDir(d, wanted))) return { root: wanted, moved: false, wanted };
+  const fallback = path.join(os.tmpdir(), DELIVERED_DIRNAME, DELIVERED_SUBDIR);
+  return { root: fallback, moved: true, wanted };
+}
+
+function deliveredDirFor(deliveredRoot, watchDir) {
+  return path.join(deliveredRoot, dirKeyOf(watchDir));
+}
+
+/** 清理 delivered 自身：>7 天或总量 >1000 时删最旧；失败只 warn，绝不碰 watch 目录。 */
+function pruneDelivered(ctx, deliveredRoot) {
   try {
-    entries = parseState(fs.readFileSync(file, 'utf8'));
-  } catch (err) {
-    if (err && err.code === 'ENOENT') {
-      // 文件不存在：视为空表，正常启动。
-    } else {
-      rebuilt = true;
-      log(ctx, 'warn', `[${PLUGIN_NAME}] 状态文件不可用，整表丢弃并从空表重建（功能不关闭）：${String(err && err.message ? err.message : err)}（file=${file}）`);
-    }
-  }
-  function trim() {
-    const keys = Object.keys(entries);
-    if (keys.length <= MAX_FINGERPRINTS) return;
-    const oldest = keys.sort((a, b) => String(entries[a].deliveredAt).localeCompare(String(entries[b].deliveredAt)));
-    for (const key of oldest.slice(0, keys.length - MAX_FINGERPRINTS)) delete entries[key];
-  }
-  /** 原子写：同目录临时文件 + rename；失败只 warn，不重试、不阻塞投递。 */
-  function write() {
-    const payload = { version: STATE_VERSION, entries };
-    const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
-    try {
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-      fs.renameSync(tmp, file);
-      return true;
-    } catch (err) {
-      try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
-      log(ctx, 'warn', `[${PLUGIN_NAME}] 状态文件写入失败（本次投递照常，内存表继续用）：${String(err)}（file=${file}）`);
-      return false;
-    }
-  }
-  return {
-    file,
-    rebuilt,
-    count: () => Object.keys(entries).length,
-    isDelivered: (fp, targetId) => Boolean(entries[fp] && entries[fp].targets.includes(targetId)),
-    record(fp, targetId) {
-      const now = new Date().toISOString();
-      const current = entries[fp];
-      if (current) {
-        if (!current.targets.includes(targetId)) current.targets.push(targetId);
-        current.deliveredAt = now;
-      } else {
-        entries[fp] = { deliveredAt: now, targets: [targetId] };
+    const files = [];
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.isFile()) files.push({ full, mtimeMs: fs.statSync(full).mtimeMs });
       }
-      trim();
-      write();
-    },
-  };
+    };
+    walk(deliveredRoot);
+    const cutoff = Date.now() - MAX_DELIVERED_AGE_MS;
+    const fresh = [];
+    for (const f of files) {
+      if (f.mtimeMs < cutoff) { try { fs.rmSync(f.full, { force: true }); } catch { /* 单件失败忽略 */ } }
+      else fresh.push(f);
+    }
+    if (fresh.length > MAX_DELIVERED_FILES) {
+      fresh.sort((a, b) => a.mtimeMs - b.mtimeMs);
+      for (const f of fresh.slice(0, fresh.length - MAX_DELIVERED_FILES)) {
+        try { fs.rmSync(f.full, { force: true }); } catch { /* 单件失败忽略 */ }
+      }
+    }
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] 清理 delivered 目录失败（不影响投递）：${String(err)}（root=${deliveredRoot}）`);
+  }
 }
 
-function fingerprint(dir, relName, state) {
-  return `${dir}|${relName}|${state.mtimeMs}|${state.size}`;
-}
-
-function targetIdOf(target) {
-  return target.kind === 'title' ? `title:${target.value}` : target.value;
+/** 投递成功后「拿走」：移动到 delivered/<dirKey>/<原文件名>；失败只 warn，投递不回滚。 */
+function takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full) {
+  try { fs.statSync(full); } catch { return null; }   // 已被前一次移动取走：静默跳过
+  const target = path.join(deliveredDirFor(deliveredRoot, watchDir), path.basename(relName));
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    try { fs.rmSync(target, { force: true }); } catch { /* 覆盖旧副本 */ }
+    try {
+      fs.renameSync(full, target);
+    } catch (err) {
+      if (err && err.code === 'EXDEV') {
+        fs.copyFileSync(full, target);
+        fs.rmSync(full, { force: true });
+      } else {
+        throw err;
+      }
+    }
+    log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已移走：${full} → ${target}`);
+    pruneDelivered(ctx, deliveredRoot);
+    return target;
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 移动已投递文件失败（投递已完成，不重试）：${String(err)}（file=${full}，target=${target}）`);
+    return null;
+  }
 }
 
 /** 拒绝嵌套量词（(a+)+、(x*)* 之类），防灾难性回溯卡死事件循环。 */
@@ -315,7 +297,7 @@ function buildMessage(relName, fullPath, state, reason, template) {
   });
 }
 
-function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, store) {
+function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deliveredRoot) {
   const pending = new Map();   // relName → { size, mtimeMs, sig, timer }；不轮询
   const delivered = new Set(); // 已投递快照，防止同一 (文件,size,mtimeMs) 重复 followup
   let closed = false;
@@ -372,18 +354,12 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, stor
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话 ${resolved.id} 投递时已不可用；文件 ${full} 未投递`);
       return;
     }
-    // 落盘去重：仅拦截「同一快照 + 同一目标」；同快照换目标照投并追加。
-    const targetId = targetIdOf(target);
-    const fp = fingerprint(watchDir, relName, state);
-    if (store && store.isDelivered(fp, targetId)) {
-      log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 跳过重复投递：${relName}（目标 ${targetId} 已收到过同一快照，指纹=${fp}）`);
-      return;
-    }
     const message = buildMessage(relName, full, state, reason, cfg.message);
     try {
       agent.followup(message);
       log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${resolved.id}（${label}，文件=${full}，触发=${reason}）`);
-      if (store) store.record(fp, targetId);
+      // 移动放在微任务里：同步投递路径（含测试里的 stat 断言）不感知文件尚未移走。
+      queueMicrotask(() => takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full));
     } catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] followup 抛错：${String(err)}`); }
   }
 
@@ -409,6 +385,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, stor
   /** fs.watch 事件到达：记 (size, mtimeMs)，重置静默 timer；DONE 则立即投递。 */
   function consider(relName) {
     if (closed || !relName) return;
+    if (relName === '.gitkeep') return;   // 占位文件永不投递、永不移动
     const full = path.join(watchDir, relName);
     let st;
     try { st = fs.statSync(full); } catch { return; }   // 删除事件 / 临时文件
@@ -441,10 +418,13 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, stor
     dispose();
     return null;
   }
+  // 停机期间留下的文件：启动后扫一遍，保证补发一次；已投过的文件已被移走，不会重放。
+  for (const rel of listFiles()) consider(rel);
   const resolvedText = atLoad.ok
     ? `解析到 ${atLoad.id}（${atLoad.title}）`
     : '解析不到，投递时会跳过';
-  log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已加载：dir=${watchDir}，目标=${targetText} → ${resolvedText}，stableMs=${cfg.stableMs}，done=${mode}`);
+  const deliveredText = deliveredDirFor(deliveredRoot, watchDir);
+  log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已加载：dir=${watchDir}，目标=${targetText} → ${resolvedText}，stableMs=${cfg.stableMs}，done=${mode}，delivered=${deliveredText}`);
   return dispose;
 }
 
@@ -461,7 +441,7 @@ export function apply(ctx, config = {}) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] 未启动：watches 必须是长度 ≥1 的数组`);
     return dispose;
   }
-  // 状态文件必须落在所有 watch 目录之外：先把可读的目录收齐，再定最终路径。
+  // 已投件落点必须在所有 watch 目录之外：先把可读的目录收齐，再定最终路径。
   const watchDirs = [];
   for (const w of watches) {
     const dir = w && w.dir;
@@ -469,12 +449,12 @@ export function apply(ctx, config = {}) {
       try { if (fs.statSync(dir).isDirectory()) watchDirs.push(dir); } catch { /* 不可读的 dir 不参与路径判定 */ }
     }
   }
-  const statePath = resolveStateFile(watchDirs);
-  if (statePath.moved) {
-    log(ctx, 'warn', `[${PLUGIN_NAME}] 状态文件路径落在 watch 目录内，已改到 ${statePath.file}（原=${statePath.wanted}）`);
+  const delivered = resolveDeliveredRoot(watchDirs);
+  if (delivered.moved) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] delivered 目录落在 watch 目录内，已改到 ${delivered.root}（原=${delivered.wanted}）`);
   }
-  const store = createStateStore(ctx, statePath.file);
-  log(ctx, 'info', `[${PLUGIN_NAME}] 状态文件：${statePath.file}（已载入 ${store.count()} 个指纹${store.rebuilt ? '，损坏已重建' : ''}）`);
+  log(ctx, 'info', `[${PLUGIN_NAME}] delivered 目录：${delivered.root}（每个 watch 的落点见各自加载行）`);
+  const seenDirs = new Set();
   watches.forEach((w, i) => {
     const label = `watches[${i}]`;
     const dir = w && w.dir;
@@ -500,6 +480,12 @@ export function apply(ctx, config = {}) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：dir 不可读（${String(err)}，dir=${dir}）`);
       return;
     }
+    const dirKey = dirKeyOf(dir);
+    if (seenDirs.has(dirKey)) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：一个目录只支持一个目标，多播需走发布订阅模式，本期不支持（dir=${dir}，已由前一条同目录 watch 占用）`);
+      return;
+    }
+    seenDirs.add(dirKey);
     const done = normalizeDone(w && w.done);
     if (done.error) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 done 规则未启用，退回只按 stableMs 投递：${done.error}（dir=${dir}）`);
@@ -515,7 +501,7 @@ export function apply(ctx, config = {}) {
         : `targetSessionId=${target.value}`;
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
-    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, store);
+    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root);
     if (d) { disposers.push(d); startedModes.push(done.mode); }
   });
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
