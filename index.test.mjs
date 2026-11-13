@@ -2308,7 +2308,7 @@ async function p14WaitFor(cond, label, ms = 3000) {
     };
     let card = null;
     mod.apply({
-      settingsScope: { bind: () => scope },
+      get: (name) => (name === 'settingsScope' ? { bind: () => scope } : undefined),
       slots: {
         inject: (key, fn) => { fn(); },
         register: (def, component) => { card = component; return component; },
@@ -2354,6 +2354,81 @@ async function p14WaitFor(cond, label, ms = 3000) {
     assert.equal(textInputs.length, 1, `text 行应有 1 个完成标记输入框，实际 ${textInputs.length}`);
     assert.equal(regexInputs.length, 1, `regex 行应有 1 个正则输入框，实际 ${regexInputs.length}`);
     assert.equal(inputs.filter((n) => n.type === 'input' && n.props.type === 'checkbox').length, 3, 'exact 复选框每行一个');
+  });
+}
+
+// ---------------------------------------------------------------- P17：客户端 inject 不得硬绑旧服务名
+// 0.2.2-rc.1 起服务名是 configForms；硬注入旧 settingsScope 会让客户端条目永远 pending。
+{
+  const clientJs = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'client.js'), 'utf8');
+  const p17Load = (warns) => {
+    let factory;
+    const sandbox = {
+      window: { __ModuleLoader__: { load: (def) => { factory = def.factory; } } },
+      console: { log: () => {}, warn: (m) => warns.push(String(m)), error: () => {} },
+    };
+    vm.runInNewContext(clientJs, sandbox, { filename: 'client.js' });
+    return factory((name) => {
+      if (name === 'react') return { useState: (init) => [typeof init === 'function' ? init() : init, () => {}], useEffect: () => {}, createElement: () => ({}) };
+      throw new Error(`未知 require：${name}`);
+    });
+  };
+  check('P17 ① client inject 只含 slots（不含 settingsScope / configForms）', () => {
+    const mod = p17Load([]);
+    assert.deepEqual(Array.from(mod.inject), ['slots']);
+    assert.equal(mod.inject.includes('settingsScope'), false);
+    assert.equal(mod.inject.includes('configForms'), false);
+  });
+  check('P17 ② 只有 configForms：卡片挂载一次，服务对象非 undefined', () => {
+    const mod = p17Load([]);
+    const service = { bind: () => ({ namespace: 'dsh-handoff-relay', kind: 'configForms' }) };
+    let registered = 0;
+    let mountedScope;
+    mod.apply({
+      get: (name) => (name === 'configForms' ? service : undefined),
+      slots: {
+        inject: (key, fn) => { assert.equal(key, 'settings.plugin.item'); fn(); },
+        register: (def) => { registered += 1; mountedScope = def.inject().scope; return def; },
+      },
+    });
+    assert.equal(registered, 1, `应恰好挂载 1 次，实际 ${registered}`);
+    assert.notEqual(mountedScope, undefined, '取到的服务对象不能是 undefined');
+    assert.equal(mountedScope.kind, 'configForms');
+  });
+  check('P17 ③ 只有旧 settingsScope：同样挂载一次', () => {
+    const mod = p17Load([]);
+    const service = { bind: () => ({ namespace: 'dsh-handoff-relay', kind: 'settingsScope' }) };
+    let registered = 0;
+    let mountedScope;
+    mod.apply({
+      get: (name) => (name === 'settingsScope' ? service : undefined),
+      slots: { inject: (k, fn) => fn(), register: (def) => { registered += 1; mountedScope = def.inject().scope; return def; } },
+    });
+    assert.equal(registered, 1);
+    assert.notEqual(mountedScope, undefined);
+    assert.equal(mountedScope.kind, 'settingsScope');
+  });
+  check('P17 ④ 两个服务都没有：不抛、不挂卡、不 pending，回调里仍没有则只 warn', () => {
+    const warns = [];
+    const mod = p17Load(warns);
+    let registered = 0;
+    let injected = null;
+    let injectedCb = null;
+    assert.doesNotThrow(() => {
+      mod.apply({
+        get: () => undefined,
+        slots: { inject: (k, fn) => fn(), register: () => { registered += 1; } },
+        inject: (names, cb) => { injected = names; injectedCb = cb; },
+      });
+    });
+    // apply 同步返回（不 await、不挂死）；此时没有服务，卡片不挂
+    assert.deepEqual(Array.from(injected), ['configForms']);
+    assert.equal(registered, 0);
+    assert.equal(typeof injectedCb, 'function', '回调应被登记');
+    // 服务始终不到来时，回调里取不到 → warn 跳过，不抛
+    assert.doesNotThrow(() => injectedCb({ get: () => undefined }));
+    assert.equal(registered, 0);
+    assert.ok(warns.some((w) => w.includes('无 configForms')), `应有 warn，实际：${warns.join(' | ')}`);
   });
 }
 

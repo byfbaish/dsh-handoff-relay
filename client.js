@@ -1,7 +1,7 @@
 // dsh-handoff-relay · 浏览器半身（手写 lazy-CJS 工厂，无打包器）
 // 只 require 宿主播种的 specifier（react / react/jsx-runtime）；不 value import
 // dsh-client-ui-settings-plugins 的表单模型。卡片只作编辑通道：保存走
-// ctx.settingsScope.bind({ namespace }).set('watches', ...)，Host observe 后回写
+// ctx.configForms（旧宿主为 ctx.settingsScope）.bind({ namespace }).set('watches', ...)，Host observe 后回写
 // cordis.patch.yml；relay 运行期仍只读 config.watches。
 window.__ModuleLoader__.load({
 	id: "dsh-handoff-relay",
@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
 
 		const SETTINGS_NS = "dsh-handoff-relay";
 		const DEFAULT_DONE_TEXT = "<!-- DONE -->";
-		const inject = ["slots", "settingsScope"];
+		const inject = ["slots"];
 
 		const S = {
 			wrap: { display: "flex", flexDirection: "column", gap: "12px", padding: "4px 0" },
@@ -194,13 +194,43 @@ window.__ModuleLoader__.load({
 					h("span", { style: S.status }, status || syncText)));
 		}
 
+		// 0.2.2-rc.1 起宿主把设置服务改名为 configForms；旧宿主只有 settingsScope。
+		// 不把任一名字写进 inject：硬注入不存在的服务会让条目永远 pending。
+		function readService(ctx, name) {
+			try {
+				return typeof ctx.get === "function" ? ctx.get(name) : undefined;
+			} catch {
+				return undefined;
+			}
+		}
+
 		function apply(ctx) {
-			const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NS });
-			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
-				name: "settings.plugin.item",
-				key: SETTINGS_NS,
-				inject: () => ({ scope }),
-			}, RelayCard));
+			const mountWith = (service) => {
+				const scope = service.bind({ namespace: SETTINGS_NS });
+				ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
+					name: "settings.plugin.item",
+					key: SETTINGS_NS,
+					inject: () => ({ scope }),
+				}, RelayCard));
+			};
+			const forms = readService(ctx, "configForms") ?? readService(ctx, "settingsScope");
+			if (forms) {
+				mountWith(forms);
+				return;
+			}
+			// 两个都没有：等服务就绪再挂；apply 本身立即返回，绝不 await。
+			if (typeof ctx.inject !== "function") {
+				console.warn("宿主无 configForms/settingsScope 服务（跳过设置卡，不影响 watch）");
+				return;
+			}
+			ctx.inject(["configForms"], (c) => {
+				const late = readService(c, "configForms");
+				if (!late) {
+					console.warn("宿主无 configForms 服务（跳过设置卡，不影响 watch）");
+					return;
+				}
+				mountWith(late);
+			});
 		}
 
 		exports.apply = apply;
