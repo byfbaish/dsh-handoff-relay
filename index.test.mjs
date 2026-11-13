@@ -1939,6 +1939,59 @@ const p9WithProfile = (root) => {
   }
 }
 
+// ---------------------------------------------------------------- P13：未声明 inject 的服务不许直接读
+// 严格 ctx：访问未声明属性即抛 `cannot get property "<x>" without inject`（与 cordis 一致）。
+// 只播种 agents / logger / effect / get；get('settings') 返回 undefined（宿主无该服务）。
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p13-'));
+  const restoreProfile = p9WithProfile(root);
+  const d = tmp();
+  const calls = [];
+  const seen = [];
+  const target = {
+    agents: {
+      get: (id) => (id === 'P13' ? { followup: (m) => calls.push(m) } : undefined),
+      roots: () => [{ id: 'P13', title: '严格 ctx 目标' }],
+    },
+    logger: { info: (m) => seen.push(m), warn: (m) => warnings.push(m) },
+    effect: () => {},
+    get: () => undefined,                     // 没有 settings 服务
+  };
+  const strictCtx = new Proxy(target, {
+    get(t, prop, receiver) {
+      if (typeof prop === 'symbol') return Reflect.get(t, prop, receiver);
+      if (prop in t) return Reflect.get(t, prop, receiver);
+      throw new Error(`cannot get property "${String(prop)}" without inject`);
+    },
+  });
+  const box = capturingWatch();
+  let disp = null;
+  warnings.length = 0;
+  try {
+    disp = withFs(box.patch, () => apply(strictCtx, {
+      watches: [{ dir: d, targetSessionId: 'P13' }], stableMs: 120,
+    }));
+    check('P13 严格 ctx：apply 不抛（未声明 settings 也不会同步崩）', () => {
+      assert.equal(typeof disp, 'function', 'apply 应正常返回 dispose');
+    });
+    fs.writeFileSync(path.join(d, 'p13.txt'), 'x\n<!-- DONE -->\n');
+    box.cb('change', 'p13.txt');
+    await sleep(120);
+    check('P13 严格 ctx：watch 照常启动并投递（设置卡缺席不阻断主链路）', () => {
+      assert.equal(calls.length, 1, `期望投递 1 次，实际 ${calls.length}；warnings=${JSON.stringify(warnings)}`);
+      assert.equal(fs.existsSync(path.join(d, 'p13.txt')), false, '投递后应移走');
+    });
+    check('P13 严格 ctx：relay.log 写明「宿主无 settings 服务」', () => {
+      const log = fs.readFileSync(path.join(p9StateDir(root), 'relay.log'), 'utf8');
+      assert.ok(log.includes('无 settings 服务'), `relay.log 应有降级说明：${log.split('\n').slice(-4).join(' | ')}`);
+      assert.equal(fs.existsSync(path.join(d, 'p13.txt')), false);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
 }

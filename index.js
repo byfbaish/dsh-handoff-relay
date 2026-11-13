@@ -661,12 +661,32 @@ function sameJson(a, b) {
 }
 
 /**
+ * 安全取一个宿主服务：cordis 的 ctx 是严格代理，未在 inject 声明过的服务
+ * 直接读 `ctx.<name>` 会同步抛 `cannot get property "<name>" without inject`，
+ * 只有 `ctx.get(name)` 在服务缺席时返回 undefined。这里再包一层 try/catch，
+ * 取不到就返回 undefined（调用方自己决定降级或告警）。
+ */
+function getService(ctx, name) {
+  try {
+    if (!ctx || typeof ctx.get !== 'function') return undefined;
+    return ctx.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * 注册 settings namespace 并把卡片写入的 watches 回写 yml。
  * 失败只 warn，不影响 relay 主链路（运行期仍只读 config.watches）。
+ * 注意：`settings` 不能写进 inject（部分宿主没有这个服务），只能用 ctx.get 取；
+ * 取不到就整段跳过，绝不触碰 ctx.settings 属性。
  */
 async function mountSettingsCard(ctx, configWatches, stateDir) {
-  const settings = ctx && ctx.settings;
-  if (!settings || typeof settings.register !== 'function') return;
+  const settings = getService(ctx, 'settings');
+  if (!settings || typeof settings.register !== 'function') {
+    relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：宿主无 settings 服务（跳过，不影响 watch）`);
+    return;
+  }
   let z;
   try {
     const mod = await import('@deepseek-ai/schemastery');
@@ -971,7 +991,9 @@ export function apply(ctx, config = {}) {
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
   relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
   // P11 A：注册设置 namespace（卡片只作编辑通道，运行期仍只读 config.watches）。
-  void mountSettingsCard(ctx, JSON.parse(JSON.stringify(watches)), stateDir);
+  // 用 .catch 兜底：设置卡整段是可选能力，任何异常都不许冒泡成未处理拒绝拖垮启动。
+  void mountSettingsCard(ctx, JSON.parse(JSON.stringify(watches)), stateDir)
+    .catch((err) => relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] 设置卡未挂载：意外异常（${String(err)}）`));
   try {
     if (ctx && ctx.agents && typeof ctx.agents.roots === 'function') {
       const ids = (ctx.agents.roots() || []).map((a) => a && a.id).filter(Boolean);
