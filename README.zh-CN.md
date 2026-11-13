@@ -142,7 +142,7 @@ dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
 要固定某个版本就带下面的 tag，但以仓库 Releases 页为准：发版后取那里当前最新的 tag。
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.5.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.4.0
 ```
 
 ### 卸载与查看状态
@@ -199,32 +199,14 @@ dsh --dump-config --profile desktop
 
 ## 设置页
 
-**当前版本没有内置配置界面**；配置只有一处：profile 的 `cordis.patch.yml` 里本插件那一行的
-`config.watches`。内置配置界面在后续版本提供——这一版本先把投递能力做稳，等宿主那边的设置卡
-入口（槽位）稳定后再接回界面。
+从 `0.4.0` 起，插件还会在宿主的插件设置页里贡献一张卡片。卡片**只作编辑通道**：
+运行期的唯一真相仍然是 `cordis.patch.yml` 里的 `watches`。
 
-一条 watch 就是 `watches` 数组里的一项，三个键就够：
-
-```yaml
-- id: dsh-handoff-relay
-  name: dsh-handoff-relay
-  config:
-    stableMs: 5000
-    watches:
-      - dir: /absolute/path/to/outbox
-        targetSessionId: session-xxxxxxxx
-        done:
-          text: '<!-- DONE -->'
-```
-
-- `dir`：要监控的目录，绝对路径。
-- `targetSessionId`：接收通知的会话 id；也可以用 `targetTitle` 按标题匹配代替。
-- `done`：完成规则。省略 = 默认文本 `<!-- DONE -->`；`{ text: '...' }` = 自定义文本；
-  `{ regex: '...' }` = 正则（只扫文件尾部约 4KB、固定 `m` 标志、上限 200 字符、禁止嵌套量词）；
-  `null` = 关闭完成规则，只按静默窗口投递。
-
-改完保存文件，**重启宿主后生效**（本版本不做热更新）。`targetSessionId` 在宿主重启后会变，
-用 id 接线的 watch 需要重新接线；用 `targetTitle` 的不用。
+- 每条 watch 一行：目录、目标会话（文本输入，保存前校验是否存在）、完成规则、`exact`。
+- 可以新增、编辑、删除行；保存时把整个 `watches` 数组写回 `cordis.patch.yml`，
+  文件里的其它内容保持不动。
+- 保存**不会热更新**正在运行的 relay。**重启 DSH 后新的 watches 才生效**——
+  本版本不做热更新。
 
 ## 启动期有限重扫
 

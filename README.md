@@ -165,7 +165,7 @@ append the tag shown below — the repository's Releases page stays authoritativ
 after a new release, use the latest tag listed there.
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.5.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.4.0
 ```
 
 ### Uninstall and check status
@@ -233,35 +233,16 @@ restart; a `targetTitle` watch needs no re-wiring.**
 
 ## Settings page
 
-**This version has no built-in settings UI.** Configuration lives in one place only:
-`config.watches` on the plugin's row in the profile's `cordis.patch.yml`. A built-in
-settings UI is planned for a later release: this version stabilises delivery first, and the
-UI will be wired back once the host's settings-card slot is stable.
+From `0.4.0` the plugin also contributes a card to the host's plugin settings
+page. The card is an editor only: `watches` in `cordis.patch.yml` remains the
+single source of truth at runtime.
 
-One watch is one entry in the `watches` array, and three keys are all you need:
-
-```yaml
-- id: dsh-handoff-relay
-  name: dsh-handoff-relay
-  config:
-    stableMs: 5000
-    watches:
-      - dir: /absolute/path/to/outbox
-        targetSessionId: session-xxxxxxxx
-        done:
-          text: '<!-- DONE -->'
-```
-
-- `dir`: absolute path of the directory to watch.
-- `targetSessionId`: the receiving session id; `targetTitle` may be used instead to match by title.
-- `done`: the completion rule. Omitted = default text `<!-- DONE -->`; `{ text: '...' }` = custom text;
-  `{ regex: '...' }` = regular expression (tail of the file only, ~4 KB; `m` flag always on;
-  max 200 characters; nested quantifiers rejected); `null` = no completion rule, deliver on the
-  quiet window alone.
-
-Save the file and **restart the host** for changes to take effect (no hot reload in this version).
-`targetSessionId` values change across host restarts, so id-based watches must be re-wired after a
-restart; `targetTitle`-based ones do not.
+- Each watch is one row: directory, target session (text input, checked for
+  existence before saving), completion rule, and `exact`.
+- Rows can be added, edited and removed; saving writes the whole `watches` array
+  back into `cordis.patch.yml` and leaves the rest of the file untouched.
+- Saving does **not** hot-reload the running relay. **Restart DSH for the new
+  watches to take effect** — this release has no live reload.
 
 ## Startup rescan
 
