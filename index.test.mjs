@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config } from './index.js';
+import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest } from './index.js';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
@@ -2990,9 +2990,13 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   const p29Render = (ctx, opts = {}) => {
     let factory;
     const sandbox = {
-      window: { __ModuleLoader__: { load: (def) => { factory = def.factory; } } },
-      console, setTimeout, clearTimeout,
+      window: {
+        location: { origin: 'https://dsh.test' },
+        __ModuleLoader__: { load: (def) => { factory = def.factory; } },
+      },
+      console, setTimeout, clearTimeout, URL, AbortController,
     };
+    if (opts.fetch) sandbox.fetch = opts.fetch;
     if (opts.picker) sandbox.__DSH_DIRECTORY_PICKER__ = opts.picker;
     vm.runInNewContext(clientJs, sandbox, { filename: 'client.js' });
     if (!factory) throw new Error('未捕获 client factory');
@@ -3135,8 +3139,12 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
         return undefined;
       },
     };
-    const { getTree } = p29Render(ctx, { dirs: ['C:\\good', 'C:\\bad'] });
-    await sleep(40);
+    const fetchStub = async (url) => {
+      const target = new URL(url).searchParams.get('path');
+      return { ok: true, json: async () => ({ kind: target === 'C:\\good' ? 'ok' : 'bad' }) };
+    };
+    const { getTree } = p29Render(ctx, { dirs: ['C:\\good', 'C:\\bad'], fetch: fetchStub });
+    await sleep(450);
     const dots = p29Dots(getTree());
     assert.equal(dots.filter((n) => n.props.title === '目录可读').length, 1, 'ok:true 应有一个绿点');
     assert.equal(dots.filter((n) => n.props.title === '目录不可读或不存在').length, 1, 'ok:false 应有一个红点');
@@ -3152,8 +3160,9 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
         return undefined;
       },
     };
-    const { getTree } = p29Render(ctx, { dirs: ['C:\\bad'] });
-    await sleep(40);
+    const fetchStub = async () => ({ ok: true, json: async () => ({ kind: 'bad' }) });
+    const { getTree } = p29Render(ctx, { dirs: ['C:\\bad'], fetch: fetchStub });
+    await sleep(450);
     assert.ok(p29Text(getTree()).includes('目录不可读或不存在'), '应已有红点文案');
     const input = p29Inputs(getTree())[0];
     input.props.onChange({ target: { value: 'C:\\bad2' } });
@@ -3333,6 +3342,96 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     });
     disp();
   }
+}
+
+// ---------------------------------------------------------------- P44：主进程目录探测路由
+{
+  const checkP44 = async (label, fn) => {
+    try {
+      await fn();
+      results.push(`PASS  ${label}`);
+      out(`PASS  ${label}`);
+    } catch (err) {
+      failed += 1;
+      results.push(`FAIL  ${label} :: ${err.message}`);
+      out(`FAIL  ${label} :: ${err.message}`);
+    }
+  };
+  const p44Root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p44-'));
+  const p44File = path.join(p44Root, 'not-a-dir.txt');
+  fs.writeFileSync(p44File, 'x\n');
+  const p44Missing = path.join(p44Root, 'missing-subdir');
+  const p44Response = () => {
+    const out = { status: null, headers: null, body: null };
+    return {
+      out,
+      writeHead: (status, headers) => { out.status = status; out.headers = headers || null; },
+      end: (body) => { out.body = body === undefined ? '' : String(body); },
+    };
+  };
+
+  check('P44 路由注册：exact GET /handoff-relay/probe（空 watches 也注册）', () => {
+    const routes = [];
+    const ctx = {
+      logger: { info: () => {}, warn: () => {} },
+      inject: (names, cb) => {
+        if (names.includes('webServer')) {
+          const wctx = {
+            webServer: { register: (route) => { routes.push(route); return () => {}; } },
+            effect: (fn) => { fn(); },
+          };
+          cb(wctx);
+        }
+        return { catch: () => {} };
+      },
+    };
+    apply(ctx, { watches: [] });
+    assert.equal(routes.length, 1, `应注册恰好 1 条路由，实际 ${routes.length}`);
+    assert.equal(routes[0].kind, 'exact', '必须是 exact 路由');
+    assert.equal(routes[0].path, PROBE_ROUTE_PATH, '路由路径必须精确匹配');
+    assert.equal(typeof routes[0].handler, 'function', '路由必须有 handler');
+  });
+
+  await checkP44('P44 合法目录 → ok', async () => {
+    const result = await probePath(p44Root);
+    assert.deepEqual(result, { kind: 'ok', absolute: path.normalize(p44Root), reason: 'readable' });
+  });
+
+  await checkP44('P44 不存在目录 → missing', async () => {
+    const result = await probePath(p44Missing);
+    assert.deepEqual(result, { kind: 'missing', absolute: path.normalize(p44Missing), reason: 'not-found' });
+  });
+
+  await checkP44('P44 文件路径 → file', async () => {
+    const result = await probePath(p44File);
+    assert.deepEqual(result, { kind: 'file', absolute: path.normalize(p44File), reason: 'is-file' });
+  });
+
+  await checkP44('P44 非绝对路径 → none', async () => {
+    const result = await probePath('relative/dir');
+    assert.deepEqual(result, { kind: 'none', absolute: '', reason: 'invalid-path' });
+  });
+
+  await checkP44('P44 跨源请求 → 403 且不执行 fs', async () => {
+    let fsTouched = 0;
+    const io = {
+      stat: async () => { fsTouched += 1; return { isDirectory: () => true }; },
+      access: async () => { fsTouched += 1; },
+    };
+    const req = {
+      method: 'GET',
+      url: `${PROBE_ROUTE_PATH}?path=${encodeURIComponent(p44Root)}`,
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { host: '127.0.0.1:1234', 'sec-fetch-site': 'cross-site' },
+    };
+    const res = p44Response();
+    const result = await handleProbeRequest(req, res, null, io);
+    assert.equal(res.out.status, 403, '跨源必须 403');
+    assert.equal(fsTouched, 0, '跨源不得执行 stat/access');
+    assert.deepEqual(result, { kind: 'none', absolute: '', reason: 'forbidden' });
+    const body = JSON.parse(res.out.body);
+    assert.equal(body.error, 'forbidden');
+  });
 }
 
 console.log('\n===== 自测汇总 =====');

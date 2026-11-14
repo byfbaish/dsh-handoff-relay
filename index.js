@@ -30,6 +30,7 @@ const MAX_FAILED_ENTRIES = 200;
 const MAX_LOG_BYTES = 256 * 1024;
 const RENAME_RETRIES = 3;
 const RENAME_RETRY_DELAY_MS = 100;
+export const PROBE_ROUTE_PATH = '/handoff-relay/probe';
 // P11：启动期有限重扫 + 设置卡 namespace
 const RETRY_DELAYS_MS = [1000, 5000, 15000];
 const MAX_SCAN_ATTEMPTS = 3;
@@ -81,6 +82,160 @@ function log(ctx, level, msg) {
     try { logger[level](msg); return; } catch { /* to console */ }
   }
   (level === 'warn' ? console.warn : console.info)(msg);
+}
+
+// ---------------------------------------------------------------- P44：目录探测路由
+// 渲染层只发同源 GET；主进程只 stat/access，不 readdir、不读文件内容。
+function header(request, name) {
+  const value = request && request.headers ? request.headers[name] : undefined;
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function isLoopback(value) {
+  const address = String(value || '').toLowerCase().replace(/^\[|\]$/g, '');
+  return address === 'localhost' || address === 'localhost.' || address === '::1'
+    || address.startsWith('127.')
+    || address.startsWith('::ffff:127.');
+}
+
+function getConnection(ctx, depth = 0) {
+  if (!ctx || depth > 5) return undefined;
+  try {
+    const fromCtx = ctx.reflect && typeof ctx.reflect.get === 'function'
+      ? (ctx.reflect.get('connection') || ctx.connection)
+      : (typeof ctx.get === 'function' ? (ctx.get('connection') || ctx.connection) : ctx.connection);
+    if (fromCtx) return fromCtx;
+    if (ctx.root) return getConnection(ctx.root, depth + 1);
+  } catch { /* 服务读取失败按无 connection 处理 */ }
+  return undefined;
+}
+
+/** 同源校验：优先用宿主 connection.requestRejection；没有时回退到 loopback + sec-fetch-site + origin/host。 */
+export function isTrustedProbeRequest(request, targetCtx = null) {
+  const conn = getConnection(targetCtx);
+  if (conn && typeof conn.requestRejection === 'function') {
+    try {
+      if (conn.requestRejection(request) !== undefined) return false;
+    } catch {
+      return false;
+    }
+  } else {
+    if (!isLoopback(request && request.socket && request.socket.remoteAddress)) return false;
+    const site = header(request, 'sec-fetch-site');
+    if (site !== undefined && site !== 'same-origin' && site !== 'none') return false;
+  }
+  const origin = header(request, 'origin');
+  const host = header(request, 'host');
+  if (origin !== undefined) {
+    if (host === undefined) return false;
+    try {
+      const parsed = new URL(origin);
+      return parsed.host === host;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function normalizeProbePath(raw) {
+  if (typeof raw !== 'string') return '';
+  const value = raw.trim();
+  if (!value || value.includes('\0') || !path.isAbsolute(value)) return '';
+  try { return path.normalize(value); } catch { return ''; }
+}
+
+function probeReason(error) {
+  const code = error && error.code;
+  if (code === 'ENOENT') return 'not-found';
+  if (code === 'EACCES' || code === 'EPERM') return 'access-denied';
+  return 'stat-error';
+}
+
+/** 只读探测：ok / missing / denied / file / none；io 参数只给单测注入断言用。 */
+export async function probePath(raw, io = null) {
+  const absolute = normalizeProbePath(raw);
+  if (!absolute) return { kind: 'none', absolute: '', reason: 'invalid-path' };
+  const stat = io && io.stat ? io.stat : fs.promises.stat;
+  const access = io && io.access ? io.access : fs.promises.access;
+  let stats;
+  try {
+    stats = await stat(absolute);
+  } catch (err) {
+    const reason = probeReason(err);
+    if (reason === 'not-found') return { kind: 'missing', absolute, reason };
+    if (reason === 'access-denied') return { kind: 'denied', absolute, reason };
+    return { kind: 'none', absolute, reason };
+  }
+  if (!stats || typeof stats.isDirectory !== 'function' || !stats.isDirectory()) {
+    return { kind: 'file', absolute, reason: 'is-file' };
+  }
+  try {
+    await access(absolute, fs.constants.R_OK);
+    return { kind: 'ok', absolute, reason: 'readable' };
+  } catch (err) {
+    return { kind: 'denied', absolute, reason: probeReason(err) };
+  }
+}
+
+function writeJson(response, status, payload) {
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  response.end(JSON.stringify(payload));
+}
+
+/** 路由 handler：跨源 403 且不触碰 fs；只接受 GET。 */
+export async function handleProbeRequest(request, response, targetCtx = null, io = null) {
+  if (!isTrustedProbeRequest(request, targetCtx)) {
+    writeJson(response, 403, { error: 'forbidden' });
+    return { kind: 'none', absolute: '', reason: 'forbidden' };
+  }
+  if ((request && request.method) !== 'GET') {
+    response.writeHead(405, { allow: 'GET' });
+    response.end();
+    return { kind: 'none', absolute: '', reason: 'method-not-allowed' };
+  }
+  let raw = '';
+  try {
+    raw = new URL(String(request.url || ''), 'http://localhost').searchParams.get('path') || '';
+  } catch { raw = ''; }
+  const result = await probePath(raw, io);
+  writeJson(response, 200, result);
+  return result;
+}
+
+function registerProbeRoute(ctx) {
+  let injectFn = null;
+  try {
+    if (ctx && typeof ctx.inject === 'function') injectFn = ctx.inject.bind(ctx);
+  } catch { injectFn = null; }
+  if (!injectFn) return;
+  const warn = (err) => log(ctx, 'warn', `[${PLUGIN_NAME}] 目录探测路由未注册：${String(err)}`);
+  let fiber;
+  try {
+    fiber = injectFn(['webServer'], (wctx) => {
+      try {
+        const mount = () => {
+          if (!wctx || !wctx.webServer || typeof wctx.webServer.register !== 'function') return () => {};
+          return wctx.webServer.register({
+            kind: 'exact',
+            path: PROBE_ROUTE_PATH,
+            handler: (request, response) => handleProbeRequest(request, response, wctx),
+          });
+        };
+        if (typeof wctx.effect === 'function') wctx.effect(mount, `${PLUGIN_NAME}: probe route`);
+        else mount();
+      } catch (err) {
+        warn(err);
+      }
+    });
+  } catch (err) {
+    warn(err);
+    return;
+  }
+  if (fiber && typeof fiber.catch === 'function') fiber.catch(warn);
 }
 // ---------------------------------------------------------------- 已投件落点
 // 「已投」由文件系统承载：投递成功后把文件移出 watch 目录，重启/热重载天然不重放。
@@ -1123,6 +1278,8 @@ export function apply(ctx, config = {}) {
   const disposers = [];
   const startedModes = [];
   const dispose = () => { for (const d of disposers) { try { d(); } catch { /* ignore */ } } };
+  // P44：探测路由必须在 watches 早退之前注册，否则空 watches 时设置卡仍拿不到目录核验。
+  registerProbeRoute(ctx);
   const watches = config && Array.isArray(config.watches) ? config.watches : [];
   if (watches.length === 0) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] 未启动：watches 必须是长度 ≥1 的数组`);

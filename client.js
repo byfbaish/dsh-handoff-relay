@@ -169,9 +169,9 @@ window.__ModuleLoader__.load({
 			return String(session.displayTitle || session.title || "");
 		}
 
-		// ---------------------------------------------------------- P29 目录选择与可读性探测
+		// ---------------------------------------------------------- P29/P44 目录选择与可读性探测
 		const DIR_CHECK_TIMEOUT_MS = 3000;
-		const dirProbeCache = new WeakMap();
+		const DIR_PROBE_DEBOUNCE_MS = 350;
 
 		function directoryPickerOf() {
 			try {
@@ -182,96 +182,122 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		function workspaceFilesOf(ctx, access) {
+		function probeKindOf(body) {
+			const kind = body && body.kind;
+			return kind === "ok" || kind === "missing" || kind === "denied" || kind === "file" || kind === "bad" ? kind : "none";
+		}
+
+		/** P44：同源 GET 主进程路由；不使用宿主 transport 的跨源基址。 */
+		function probeDirectory(dir, signal) {
+			const target = String(dir || "").trim();
+			if (!target) return Promise.resolve({ kind: "none" });
+			let origin = "";
 			try {
-				const candidates = [];
-				if (access) {
-					if (access.workspaceFiles) candidates.push(access.workspaceFiles);
-					if (access.remote && access.remote.workspaceFiles) candidates.push(access.remote.workspaceFiles);
-				}
-				const remote = readService(ctx, "remote");
-				if (remote && remote.workspaceFiles) candidates.push(remote.workspaceFiles);
-				const direct = readService(ctx, "remote.workspaceFiles");
-				if (direct) candidates.push(direct);
-				return candidates.find((files) => files && typeof files.list === "function") || null;
+				origin = String(globalThis.window && globalThis.window.location && globalThis.window.location.origin || "");
 			} catch {
-				return null;
+				origin = "";
 			}
-		}
-
-		function firstSessionId(ctx) {
-			const map = sessionMap(ctx);
-			return Object.keys(map)[0] || "";
-		}
-
-		function probeDirectory(ctx, dir, sessionId) {
-			if (!dir || !String(dir).trim() || !sessionId) return Promise.resolve({ kind: "none" });
-			let access;
+			if (!origin || origin === "null" || typeof fetch !== "function") return Promise.resolve({ kind: "none" });
+			let url;
 			try {
-				access = ctx && typeof ctx.get === "function" ? ctx.get("remoteAccess") : undefined;
+				url = new URL("/handoff-relay/probe", origin);
+				url.searchParams.set("path", target);
 			} catch {
 				return Promise.resolve({ kind: "none" });
 			}
-			if (!access) return Promise.resolve({ kind: "none" });
-			const files = workspaceFilesOf(ctx, access);
-			if (!files) return Promise.resolve({ kind: "none" });
-			const cacheKey = `${sessionId}\u0000${String(dir).trim()}`;
-			const cached = dirProbeCache.get(ctx);
-			if (cached && cached.has(cacheKey)) return cached.get(cacheKey);
-			const pending = new Promise((resolve) => {
-				let timer;
-				Promise.race([
-					Promise.resolve().then(() => files.list(sessionId, String(dir).trim())),
-					new Promise((resolveTimeout) => {
-						timer = setTimeout(() => resolveTimeout({ __timeout: true }), DIR_CHECK_TIMEOUT_MS);
-					}),
-				]).then((result) => {
-					clearTimeout(timer);
-					if (result && result.__timeout) resolve({ kind: "none" });
-					else resolve(result && result.ok === true ? { kind: "ok" } : { kind: "bad" });
-				}, () => {
-					clearTimeout(timer);
-					resolve({ kind: "none" });
-				});
+			const ctrl = new AbortController();
+			const onAbort = () => ctrl.abort();
+			const timer = setTimeout(() => ctrl.abort(), DIR_CHECK_TIMEOUT_MS);
+			if (signal) {
+				if (signal.aborted) ctrl.abort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+			}
+			return fetch(url.toString(), {
+				method: "GET",
+				credentials: "same-origin",
+				cache: "no-store",
+				signal: ctrl.signal,
+			}).then((response) => {
+				if (!response || response.ok !== true) return { kind: "none" };
+				return response.json().then((body) => ({ kind: probeKindOf(body) }), () => ({ kind: "none" }));
+			}).catch(() => ({ kind: "none" })).finally(() => {
+				clearTimeout(timer);
+				if (signal) signal.removeEventListener("abort", onAbort);
 			});
-			const bucket = cached || new Map();
-			bucket.set(cacheKey, pending);
-			try { dirProbeCache.set(ctx, bucket); } catch { /* ignore */ }
-			return pending;
 		}
 
 		function dirFrameStyle(kind) {
 			if (kind === "ok") return { borderColor: "#2e7d32", boxShadow: "0 0 0 1px #2e7d32 inset" };
-			if (kind === "bad") return { borderColor: "#d33", boxShadow: "0 0 0 1px #d33 inset" };
+			if (kind === "bad" || kind === "missing" || kind === "denied" || kind === "file") {
+				return { borderColor: "#d33", boxShadow: "0 0 0 1px #d33 inset" };
+			}
 			if (kind === "checking" || kind === "none") return { borderColor: "#9e9e9e", boxShadow: "0 0 0 1px #9e9e9e inset" };
 			return {};
 		}
 
 		function dirStatusTitle(kind) {
 			if (kind === "ok") return "目录可读";
-			if (kind === "bad") return "目录不可读或不存在";
+			if (kind === "missing") return "目录不存在";
+			if (kind === "denied") return "无读取权限";
+			if (kind === "file") return "这是文件，不是目录";
 			if (kind === "none") return "宿主未提供目录核验";
+			if (kind === "bad") return "目录不可读或不存在";
 			if (kind === "checking") return "检查中…";
 			return "";
 		}
 
+		function dirStatusText(kind) {
+			if (kind === "ok") return "目录可读";
+			if (kind === "missing") return "目录不存在";
+			if (kind === "denied") return "无读取权限";
+			if (kind === "file") return "这是文件，不是目录";
+			if (kind === "none") return "宿主未提供目录核验";
+			if (kind === "bad") return "目录不可读或不存在";
+			if (kind === "checking") return "检查中…";
+			return "";
+		}
+
+		function dirStatusColor(kind) {
+			if (kind === "ok") return "#2e7d32";
+			if (kind === "checking" || kind === "none") return "#9e9e9e";
+			return "#d33";
+		}
+
 		function DirPathField(props) {
 			const hasDir = !!String(props.dir || "").trim();
-			const [status, setStatus] = React.useState({ dir: hasDir ? props.dir : "", kind: hasDir ? "checking" : "idle" });
+			const [status, setStatus] = React.useState({ dir: hasDir ? props.dir : "", kind: "idle" });
 			React.useEffect(() => {
 				if (!hasDir) {
 					setStatus({ dir: "", kind: "idle" });
 					return undefined;
 				}
 				let cancelled = false;
-				setStatus({ dir: props.dir, kind: "checking" });
-				probeDirectory(props.ctx, props.dir, props.sessionId).then((result) => {
-					if (!cancelled) setStatus({ dir: props.dir, kind: result.kind });
-				});
-				return () => { cancelled = true; };
-			}, [props.ctx, props.dir, props.sessionId, hasDir]);
+				const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+				setStatus({ dir: props.dir, kind: "idle" });
+				const timer = setTimeout(() => {
+					if (cancelled) return;
+					setStatus({ dir: props.dir, kind: "checking" });
+					if (typeof props.onProbe === "function") props.onProbe(props.index, "checking");
+					probeDirectory(props.dir, ctrl ? ctrl.signal : null).then((result) => {
+						if (cancelled) return;
+						const kind = result && result.kind ? result.kind : "none";
+						setStatus({ dir: props.dir, kind });
+						if (typeof props.onProbe === "function") props.onProbe(props.index, kind);
+					}, () => {
+						if (cancelled) return;
+						setStatus({ dir: props.dir, kind: "none" });
+						if (typeof props.onProbe === "function") props.onProbe(props.index, "none");
+					});
+				}, DIR_PROBE_DEBOUNCE_MS);
+				return () => {
+					cancelled = true;
+					clearTimeout(timer);
+					if (ctrl) ctrl.abort();
+				};
+			}, [props.ctx, props.dir, hasDir]);
 			const kind = hasDir ? (status.dir === props.dir ? status.kind : "checking") : "idle";
 			const title = dirStatusTitle(kind);
+			const text = dirStatusText(kind);
 			return h("div", { style: { display: "flex", flexDirection: "column", gap: "4px", flex: "1 1 auto", minWidth: "0" } },
 				h("div", { style: { display: "flex", gap: "6px", alignItems: "center", minWidth: "0" } },
 					h("input", {
@@ -287,8 +313,8 @@ window.__ModuleLoader__.load({
 							onClick: () => props.chooseDir(),
 						}, "选择目录…")
 						: null),
-				kind === "bad" ? h("div", { style: { fontSize: "12px", color: "#d33", lineHeight: 1.6 } }, "目录不可读或不存在") : null,
-				kind === "none" ? h("div", { style: { fontSize: "12px", color: "#9e9e9e", lineHeight: 1.6 } }, "宿主未提供目录核验") : null);
+				text ? h("div", { style: { fontSize: "12px", color: dirStatusColor(kind), lineHeight: 1.6 } }, text) : null,
+				props.saveWarn ? h("div", { style: { fontSize: "12px", color: "#d33", lineHeight: 1.6 } }, "目录当前不可读，保存后需确认") : null);
 		}
 
 		function sessionById(map, id) {
@@ -373,6 +399,8 @@ window.__ModuleLoader__.load({
 			const [picker, setPicker] = React.useState(null);
 			const [query, setQuery] = React.useState("");
 			const [pickerExpanded, setPickerExpanded] = React.useState(false);
+			const [probeKinds, setProbeKinds] = React.useState([]);
+			const [saveWarn, setSaveWarn] = React.useState([]);
 
 			React.useEffect(() => {
 				if (!controller || typeof controller.subscribe !== "function") return undefined;
@@ -391,7 +419,14 @@ window.__ModuleLoader__.load({
 			const map = sessionMap(props && props.ctx);
 			const mapReady = Object.keys(map).length > 0;
 			const dirPicker = directoryPickerOf();
-			const probeSessionId = firstSessionId(props && props.ctx);
+			const noteProbe = (i, kind) => {
+				setProbeKinds((prev) => {
+					if (prev[i] === kind) return prev;
+					const next = prev.slice();
+					next[i] = kind;
+					return next;
+				});
+			};
 			const syncText = !controller
 				? "当前宿主未提供 configForms，只能查看，不能在界面保存"
 				: snapshot.status === "ready"
@@ -400,8 +435,16 @@ window.__ModuleLoader__.load({
 
 			const patchRow = (i, patch) => {
 				setRows((prev) => prev.map((row, k) => (k === i ? { ...row, ...patch } : row)));
+				if (Object.prototype.hasOwnProperty.call(patch, "dir")) {
+					setProbeKinds((prev) => {
+						const next = prev.slice();
+						next[i] = undefined;
+						return next;
+					});
+				}
 				setDirty(true);
 				setStatus("");
+				setSaveWarn([]);
 			};
 
 			const addRow = () => {
@@ -411,12 +454,14 @@ window.__ModuleLoader__.load({
 				}]);
 				setDirty(true);
 				setStatus("");
+				setSaveWarn([]);
 			};
 
 			const removeRow = (i) => {
 				setRows((prev) => prev.filter((_, k) => k !== i));
 				setDirty(true);
 				setStatus("");
+				setSaveWarn([]);
 			};
 
 			const chooseSession = (i, session) => {
@@ -445,6 +490,7 @@ window.__ModuleLoader__.load({
 				const failures = [];
 				const nextWatches = [];
 				const original = (snapshot.value && snapshot.value.watches) || [];
+				setSaveWarn(rows.map((_, i) => (probeKinds[i] || "none") !== "ok"));
 				rows.forEach((row, i) => {
 					const problem = validateSettingsRow(row);
 					if (problem) {
@@ -487,6 +533,7 @@ window.__ModuleLoader__.load({
 				setPicker(null);
 				setQuery("");
 				setPickerExpanded(false);
+				setSaveWarn([]);
 				setStatus("已放弃修改，恢复到最后一次保存值");
 			};
 
@@ -544,7 +591,8 @@ window.__ModuleLoader__.load({
 						cwd: (sessionById(map, row.targetSessionId) || {}).cwd || "",
 						ctx: props && props.ctx,
 						dirPicker,
-						probeSessionId,
+						onProbe: noteProbe,
+						saveWarn: !!saveWarn[i],
 						chooseDir: () => chooseDir(i),
 					})),
 				pickerNode,
@@ -567,11 +615,12 @@ window.__ModuleLoader__.load({
 					h(DirPathField, {
 						ctx: opts.ctx,
 						dir: row.dir,
-						sessionId: opts.probeSessionId,
 						writable: opts.writable,
 						index: i,
 						patchRow: opts.patchRow,
 						dirPicker: opts.dirPicker,
+						onProbe: opts.onProbe,
+						saveWarn: opts.saveWarn,
 						chooseDir: opts.chooseDir,
 					})),
 				h("div", { style: S.target },
