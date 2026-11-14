@@ -2949,6 +2949,223 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   });
 }
 
+// ---------------------------------------------------------------- P29：目录选择与可读性提示
+{
+  const clientJs = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'client.js'), 'utf8');
+  const checkAwait = async (label, fn) => {
+    try {
+      await fn();
+      results.push(`PASS  ${label}`);
+      out(`PASS  ${label}`);
+    } catch (err) {
+      failed += 1;
+      results.push(`FAIL  ${label} :: ${err.message}`);
+      out(`FAIL  ${label} :: ${err.message}`);
+    }
+  };
+  const walkP29 = (node, out = []) => {
+    if (Array.isArray(node)) { for (const c of node) walkP29(c, out); return out; }
+    if (typeof node === 'string') { out.push(node); return out; }
+    if (!node || typeof node !== 'object') return out;
+    out.push(node);
+    for (const c of node.children || []) walkP29(c, out);
+    return out;
+  };
+  const p29Text = (tree) => walkP29(tree).filter((n) => typeof n === 'string').join(' | ');
+  const p29Inputs = (tree) => walkP29(tree).filter((n) => n && n.type === 'input'
+    && n.props && n.props.placeholder === 'C:\\path\\to\\watch');
+  const p29Button = (tree, label) => walkP29(tree).find((n) => n && n.type === 'button'
+    && (n.children || []).includes(label));
+  const p29Dots = (tree) => walkP29(tree).filter((n) => n && n.props
+    && ['目录可读', '目录不可读或不存在', '检查中…'].includes(n.props.title));
+  const p29Sessions = () => ({
+    sessions: {
+      list: {
+        getSnapshot: () => ({
+          byId: { s1: { id: 's1', displayTitle: '会话 A', cwd: 'C:\\work\\a' } },
+        }),
+      },
+    },
+  });
+  const p29Render = (ctx, opts = {}) => {
+    let factory;
+    const sandbox = {
+      window: { __ModuleLoader__: { load: (def) => { factory = def.factory; } } },
+      console, setTimeout, clearTimeout,
+    };
+    if (opts.picker) sandbox.__DSH_DIRECTORY_PICKER__ = opts.picker;
+    vm.runInNewContext(clientJs, sandbox, { filename: 'client.js' });
+    if (!factory) throw new Error('未捕获 client factory');
+    const states = [];
+    const effects = [];
+    const pending = [];
+    let hookIndex = 0;
+    let effectIndex = 0;
+    let tree;
+    let component;
+    let render = () => {};
+    const sameDeps = (a, b) => a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+    const React = {
+      useState: (init) => {
+        const i = hookIndex++;
+        if (!(i in states)) states[i] = typeof init === 'function' ? init() : init;
+        return [states[i], (next) => {
+          const value = typeof next === 'function' ? next(states[i]) : next;
+          if (Object.is(states[i], value)) return;
+          states[i] = value;
+          render();
+        }];
+      },
+      useEffect: (fn, deps) => {
+        const i = effectIndex++;
+        const next = Array.isArray(deps) ? deps : [];
+        const prev = effects[i];
+        if (!prev || !sameDeps(prev.deps, next)) {
+          const effect = { fn, deps: next };
+          effects[i] = effect;
+          pending.push(effect);
+        }
+      },
+      createElement: (type, props, ...children) => {
+        if (typeof type === 'function') {
+          return type({ ...(props || {}), children: children.length === 1 ? children[0] : children });
+        }
+        return {
+          type, props: props || {},
+          children: children.map((c) => (typeof c === 'function' ? c() : c)),
+        };
+      },
+    };
+    const mod = factory((name) => {
+      if (name === 'react') return React;
+      throw new Error(`未知 require：${name}`);
+    });
+    const dirs = opts.dirs || ['C:\\watch\\a'];
+    const controller = {
+      getSnapshot: () => ({
+        status: 'ready', writable: true, revision: 1,
+        value: {
+          watches: dirs.map((dir, i) => ({
+            dir, targetTitle: '会话 A', targetSessionId: 's1', exact: true,
+            done: { text: '<!-- DONE -->' },
+          })),
+          stableMs: 5000,
+        },
+      }),
+      subscribe: () => () => {},
+      mutate: async () => true,
+    };
+    let registered = null;
+    const base = ctx || {};
+    const appCtx = {
+      ...base,
+      get: (name) => {
+        if (name === 'configForms') return { get: () => controller };
+        return typeof base.get === 'function' ? base.get(name) : undefined;
+      },
+      slots: {
+        inject: (key, fn) => { if (key === 'plugins.row.config') fn(); },
+        register: (def, comp) => { registered = comp; return comp; },
+      },
+    };
+    mod.apply(appCtx);
+    assert.equal(typeof registered, 'function', '应注册 plugins.row.config 组件');
+    const flush = () => {
+      let guard = 0;
+      while (pending.length && guard++ < 20) {
+        const batch = pending.splice(0);
+        for (const effect of batch) effect.fn();
+      }
+    };
+    render = () => { hookIndex = 0; effectIndex = 0; tree = registered({ ctx: appCtx, controller }); flush(); };
+    render();
+    return { mod, getTree: () => tree };
+  };
+
+  check('P29 a 无 __DSH_DIRECTORY_PICKER__ ⇒ 不渲染「选择目录…」', () => {
+    const { getTree } = p29Render({}, { dirs: [''] });
+    assert.equal(p29Button(getTree(), '选择目录…'), undefined, '无选择器时不应渲染按钮');
+  });
+
+  await checkAwait('P29 b pick 返回 C:\\x ⇒ 该行 dir 写成 C:\\x', async () => {
+    const { getTree } = p29Render({}, {
+      picker: { pick: async () => 'C:\\x' },
+      dirs: ['C:\\old'],
+    });
+    const button = p29Button(getTree(), '选择目录…');
+    assert.ok(button, '应渲染「选择目录…」');
+    await button.props.onClick();
+    assert.equal(p29Inputs(getTree())[0].props.value, 'C:\\x');
+  });
+
+  await checkAwait('P29 c pick 返回 null ⇒ dir 保持原值、不报错', async () => {
+    const { getTree } = p29Render({}, {
+      picker: { pick: async () => null },
+      dirs: ['C:\\keep'],
+    });
+    const button = p29Button(getTree(), '选择目录…');
+    assert.ok(button, '应渲染「选择目录…」');
+    await button.props.onClick();
+    assert.equal(p29Inputs(getTree())[0].props.value, 'C:\\keep');
+  });
+
+  await checkAwait('P29 d ctx.get(remoteAccess) 抛错 ⇒ 不崩、不显示任何点', async () => {
+    const ctx = {
+      ...p29Sessions(),
+      get: (name) => {
+        if (name === 'remoteAccess') throw new Error('no remote access');
+        return undefined;
+      },
+    };
+    const { mod, getTree } = p29Render(ctx, { dirs: ['C:\\x'] });
+    await sleep(40);
+    assert.deepEqual(Array.from(mod.inject), ['slots', 'sessions'], '不得硬 inject remoteAccess');
+    assert.equal(p29Dots(getTree()).length, 0, '服务取不到时不应显示点');
+    assert.equal(p29Text(getTree()).includes('目录不可读或不存在'), false, '不应画成红点文案');
+  });
+
+  await checkAwait('P29 e list ok:true ⇒ 绿点；ok:false ⇒ 红点 + 行内文案', async () => {
+    const ctx = {
+      ...p29Sessions(),
+      remoteAccess: { workspaceFiles: { list: async (sessionId, dir) => ({ ok: dir === 'C:\\good' }) } },
+      get: (name) => {
+        if (name === 'remoteAccess') {
+          return { workspaceFiles: { list: async (sessionId, dir) => ({ ok: dir === 'C:\\good' }) } };
+        }
+        return undefined;
+      },
+    };
+    const { getTree } = p29Render(ctx, { dirs: ['C:\\good', 'C:\\bad'] });
+    await sleep(40);
+    const dots = p29Dots(getTree());
+    assert.equal(dots.filter((n) => n.props.title === '目录可读').length, 1, 'ok:true 应有一个绿点');
+    assert.equal(dots.filter((n) => n.props.title === '目录不可读或不存在').length, 1, 'ok:false 应有一个红点');
+    assert.ok(p29Text(getTree()).includes('目录不可读或不存在'), '应出现行内不可读文案');
+  });
+
+  await checkAwait('P29 f 红点出现后保存仍可用（校验只提示、不阻断）', async () => {
+    const ctx = {
+      ...p29Sessions(),
+      remoteAccess: { workspaceFiles: { list: async () => ({ ok: false }) } },
+      get: (name) => {
+        if (name === 'remoteAccess') return { workspaceFiles: { list: async () => ({ ok: false }) } };
+        return undefined;
+      },
+    };
+    const { getTree } = p29Render(ctx, { dirs: ['C:\\bad'] });
+    await sleep(40);
+    assert.ok(p29Text(getTree()).includes('目录不可读或不存在'), '应已有红点文案');
+    const input = p29Inputs(getTree())[0];
+    input.props.onChange({ target: { value: 'C:\\bad2' } });
+    await sleep(40);
+    const save = p29Button(getTree(), '保存');
+    assert.ok(save, '应有保存按钮');
+    assert.equal(save.props.disabled, false, '红点不得 disable 保存');
+    await save.props.onClick();
+    assert.ok(p29Text(getTree()).includes('已保存'), '红点存在时保存仍应执行');
+  });
+}
+
 // ---------------------------------------------------------------- P31：投递层物理去重（落盘 dedupe.json）
 {
   const dedupeFile = () => path.join(suiteProfileRoot, 'dsh-handoff-relay', 'dedupe.json');

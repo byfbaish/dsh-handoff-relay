@@ -169,6 +169,94 @@ window.__ModuleLoader__.load({
 			return String(session.displayTitle || session.title || "");
 		}
 
+		// ---------------------------------------------------------- P29 目录选择与可读性探测
+		const DIR_CHECK_TIMEOUT_MS = 3000;
+		const dirProbeCache = new WeakMap();
+
+		function directoryPickerOf() {
+			try {
+				const picker = globalThis.__DSH_DIRECTORY_PICKER__;
+				return picker && typeof picker.pick === "function" ? picker : null;
+			} catch {
+				return null;
+			}
+		}
+
+		function workspaceFilesOf(ctx, access) {
+			try {
+				const candidates = [];
+				if (access) {
+					if (access.workspaceFiles) candidates.push(access.workspaceFiles);
+					if (access.remote && access.remote.workspaceFiles) candidates.push(access.remote.workspaceFiles);
+				}
+				const remote = readService(ctx, "remote");
+				if (remote && remote.workspaceFiles) candidates.push(remote.workspaceFiles);
+				const direct = readService(ctx, "remote.workspaceFiles");
+				if (direct) candidates.push(direct);
+				return candidates.find((files) => files && typeof files.list === "function") || null;
+			} catch {
+				return null;
+			}
+		}
+
+		function firstSessionId(ctx) {
+			const map = sessionMap(ctx);
+			return Object.keys(map)[0] || "";
+		}
+
+		function probeDirectory(ctx, dir, sessionId) {
+			if (!dir || !String(dir).trim() || !sessionId) return Promise.resolve({ kind: "none" });
+			let access;
+			try {
+				access = ctx && typeof ctx.get === "function" ? ctx.get("remoteAccess") : undefined;
+			} catch {
+				return Promise.resolve({ kind: "none" });
+			}
+			if (!access) return Promise.resolve({ kind: "none" });
+			const files = workspaceFilesOf(ctx, access);
+			if (!files) return Promise.resolve({ kind: "none" });
+			const cacheKey = `${sessionId}\u0000${String(dir).trim()}`;
+			const cached = dirProbeCache.get(ctx);
+			if (cached && cached.has(cacheKey)) return cached.get(cacheKey);
+			const pending = new Promise((resolve) => {
+				let timer;
+				Promise.race([
+					Promise.resolve().then(() => files.list(sessionId, String(dir).trim())),
+					new Promise((resolveTimeout) => {
+						timer = setTimeout(() => resolveTimeout({ __timeout: true }), DIR_CHECK_TIMEOUT_MS);
+					}),
+				]).then((result) => {
+					clearTimeout(timer);
+					if (result && result.__timeout) resolve({ kind: "none" });
+					else resolve(result && result.ok === true ? { kind: "ok" } : { kind: "bad" });
+				}, () => {
+					clearTimeout(timer);
+					resolve({ kind: "none" });
+				});
+			});
+			const bucket = cached || new Map();
+			bucket.set(cacheKey, pending);
+			try { dirProbeCache.set(ctx, bucket); } catch { /* ignore */ }
+			return pending;
+		}
+
+		function DirStatusDot(props) {
+			const [kind, setKind] = React.useState("checking");
+			React.useEffect(() => {
+				let cancelled = false;
+				probeDirectory(props.ctx, props.dir, props.sessionId).then((result) => {
+					if (!cancelled) setKind(result.kind);
+				});
+				return () => { cancelled = true; };
+			}, [props.ctx, props.dir, props.sessionId]);
+			if (kind === "none") return null;
+			if (kind === "ok") return h("span", { title: "目录可读", style: { color: "#2e7d32", fontSize: "14px", lineHeight: 1 } }, "●");
+			if (kind === "bad") return h("span", null,
+				h("span", { title: "目录不可读或不存在", style: { color: "#d33", fontSize: "14px", lineHeight: 1 } }, "●"),
+				h("span", { style: { color: "#d33", fontSize: "12px", marginLeft: "4px" } }, "目录不可读或不存在"));
+			return h("span", { title: "检查中…", style: { color: "#9e9e9e", fontSize: "14px", lineHeight: 1 } }, "●");
+		}
+
 		function sessionById(map, id) {
 			if (!id || !map) return undefined;
 			return map[id];
@@ -268,6 +356,8 @@ window.__ModuleLoader__.load({
 			const writable = !!controller && snapshot.writable !== false;
 			const map = sessionMap(props && props.ctx);
 			const mapReady = Object.keys(map).length > 0;
+			const dirPicker = directoryPickerOf();
+			const probeSessionId = firstSessionId(props && props.ctx);
 			const syncText = !controller
 				? "当前宿主未提供 configForms，只能查看，不能在界面保存"
 				: snapshot.status === "ready"
@@ -304,6 +394,17 @@ window.__ModuleLoader__.load({
 				setPicker(null);
 				setQuery("");
 				setPickerExpanded(false);
+			};
+
+			const chooseDir = async (i) => {
+				const picker = directoryPickerOf();
+				if (!picker) return;
+				try {
+					const picked = await picker.pick();
+					if (typeof picked === "string" && picked.trim()) patchRow(i, { dir: picked.trim() });
+				} catch {
+					// 取消 / 选择器异常：静默保持原值
+				}
 			};
 
 			const save = async () => {
@@ -407,6 +508,10 @@ window.__ModuleLoader__.load({
 						openPicker: () => { setPicker(i); setQuery(""); setPickerExpanded(false); },
 						invalid: missingSessionText(row, map, mapReady),
 						cwd: (sessionById(map, row.targetSessionId) || {}).cwd || "",
+						ctx: props && props.ctx,
+						dirPicker,
+						probeSessionId,
+						chooseDir: () => chooseDir(i),
 					})),
 				pickerNode,
 				h("div", { style: { display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } },
@@ -424,11 +529,22 @@ window.__ModuleLoader__.load({
 			const regexBad = row.doneKind === "regex" && !!regexProblem(row.done && row.done.regex);
 			const title = row.targetTitle || displayTitleOf(sessionById(opts.map, row.targetSessionId));
 			return h("div", { key: i, style: S.row },
-				h("input", {
-					style: S.input, value: row.dir, disabled: !opts.writable,
-					placeholder: "C:\\path\\to\\watch",
-					onChange: (e) => opts.patchRow(i, { dir: e.target.value }),
-				}),
+				h("div", { style: { display: "flex", gap: "6px", alignItems: "center", minWidth: "0" } },
+					h("input", {
+						style: { ...S.input, flex: "1 1 auto", minWidth: "0" },
+						value: row.dir, disabled: !opts.writable,
+						placeholder: "C:\\path\\to\\watch",
+						onChange: (e) => opts.patchRow(i, { dir: e.target.value }),
+					}),
+					row.dir && row.dir.trim()
+						? h(DirStatusDot, { ctx: opts.ctx, dir: row.dir, sessionId: opts.probeSessionId })
+						: null,
+					opts.dirPicker
+						? h("button", {
+							style: S.btn, disabled: !opts.writable,
+							onClick: () => opts.chooseDir(),
+						}, "选择目录…")
+						: null),
 				h("div", { style: S.target },
 					h("button", {
 						style: S.btn, disabled: !opts.writable,
