@@ -204,7 +204,7 @@ dsh --dump-config --profile desktop
 从 `0.5.0` 起可用：插件会在宿主的插件设置页里贡献一张卡片，可直接增删行、绑定目录与会话。
 运行期的唯一真相仍然是 `cordis.patch.yml` 里的 `watches`。
 
-卡片入口较深：**插件 → 已安装 → dsh-handoff-relay → 打开其 README 页 → 页面最下方「包含的组件」→ 点击 `Handoff Relay`** 即进入设置页。
+卡片入口较深：**插件 → 已安装 → dsh-handoff-relay → 打开其 README 页 → 页面里「包含的组件」一节 → 点击 `Handoff Relay`** 即进入设置页。
 
 - 每条 watch 一行：目录、目标会话（文本输入，保存前校验是否存在）、完成规则、`exact`。
 - 可以新增、编辑、删除行；保存时把整个 `watches` 数组写回 `cordis.patch.yml`，

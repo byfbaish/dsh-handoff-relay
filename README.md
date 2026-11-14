@@ -240,7 +240,7 @@ you can add or remove rows and bind directories and sessions directly.
 `watches` in `cordis.patch.yml` remains the single source of truth at runtime.
 
 The entry is buried: **Plugins → Installed → dsh-handoff-relay → open its
-README page → “Included components” at the bottom → click `Handoff Relay`**
+README page → in the “Components” section → click `Handoff Relay`**
 to open the settings page.
 
 - Each watch is one row: directory, target session (text input, checked for
