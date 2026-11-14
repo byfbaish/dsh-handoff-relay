@@ -2384,9 +2384,9 @@ async function p14WaitFor(cond, label, ms = 3000) {
       throw new Error(`未知 require：${name}`);
     });
   };
-  check('P17 ① client inject 只含 slots（不含 settingsScope / configForms）', () => {
+  check('P17 ① client inject 只含 slots + sessions（不含 settingsScope / configForms）', () => {
     const mod = p17Load([]);
-    assert.deepEqual(Array.from(mod.inject), ['slots']);
+    assert.deepEqual(Array.from(mod.inject), ['slots', 'sessions']);
     assert.equal(mod.inject.includes('settingsScope'), false);
     assert.equal(mod.inject.includes('configForms'), false);
   });
@@ -2802,6 +2802,101 @@ async function p14WaitFor(cond, label, ms = 3000) {
 
 for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
+}
+
+// ---------------------------------------------------------------- P27：客户端补 sessions 依赖
+{
+  const clientJs = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'client.js'), 'utf8');
+  const walkP27 = (node, out = []) => {
+    if (Array.isArray(node)) { for (const c of node) walkP27(c, out); return out; }
+    if (typeof node === 'string') { out.push(node); return out; }
+    if (!node || typeof node !== 'object') return out;
+    out.push(node);
+    for (const c of node.children || []) walkP27(c, out);
+    return out;
+  };
+  const p27Render = (ctx) => {
+    let factory;
+    const sandbox = { window: { __ModuleLoader__: { load: (def) => { factory = def.factory; } } }, console };
+    vm.runInNewContext(clientJs, sandbox, { filename: 'client.js' });
+    if (!factory) throw new Error('未捕获 client factory');
+    const states = [];
+    let hookIndex = 0;
+    let tree;
+    let component;
+    let render = () => {};
+    const React = {
+      useState: (init) => {
+        const i = hookIndex++;
+        if (!(i in states)) states[i] = typeof init === 'function' ? init() : init;
+        return [states[i], (next) => {
+          states[i] = typeof next === 'function' ? next(states[i]) : next;
+          render();
+        }];
+      },
+      useEffect: () => {},
+      createElement: (type, props, ...children) => ({
+        type, props: props || {}, children: children.map((c) => (typeof c === 'function' ? c() : c)),
+      }),
+    };
+    const mod = factory((name) => {
+      if (name === 'react') return React;
+      throw new Error(`未知 require：${name}`);
+    });
+    const controller = {
+      getSnapshot: () => ({
+        status: 'ready', writable: true, revision: 1,
+        value: {
+          watches: [{ dir: 'C:\\watch\\a', targetTitle: '会话 A', exact: true, done: { text: '<!-- DONE -->' } }],
+          stableMs: 5000,
+        },
+      }),
+      subscribe: () => () => {},
+      mutate: async () => true,
+    };
+    let registered = null;
+    mod.apply({
+      get: (name) => (name === 'configForms' ? { get: () => controller } : undefined),
+      slots: {
+        inject: (key, fn) => { if (key === 'plugins.row.config') fn(); },
+        register: (def, comp) => { registered = comp; return comp; },
+      },
+    });
+    assert.equal(typeof registered, 'function', '应注册 plugins.row.config 组件');
+    render = () => { hookIndex = 0; tree = registered({ ctx, controller }); };
+    render();
+    return { mod, getTree: () => tree };
+  };
+
+  check('P27 client inject 恰为 ["slots", "sessions"]', () => {
+    const { mod } = p27Render({});
+    assert.deepEqual(Array.from(mod.inject), ['slots', 'sessions']);
+    assert.equal(mod.inject.length, 2);
+  });
+
+  check('P27 sessions 桩：sessionMap 非空，点「选择会话」后 picker 列出至少一条', () => {
+    const ctx = {
+      sessions: {
+        list: {
+          getSnapshot: () => ({
+            byId: {
+              s1: { id: 's1', displayTitle: '会话 A', cwd: 'C:\\work\\a' },
+              s2: { id: 's2', displayTitle: '会话 B', cwd: 'C:\\work\\b' },
+            },
+          }),
+        },
+      },
+    };
+    const { getTree } = p27Render(ctx);
+    const pick = walkP27(getTree()).find((n) => n && n.type === 'button'
+      && (n.children || []).includes('选择会话'));
+    assert.ok(pick, '应有「选择会话」按钮');
+    pick.props.onClick();
+    const text = walkP27(getTree()).filter((n) => typeof n === 'string').join(' | ');
+    assert.ok(text.includes('会话 A'), `picker 应列出会话 A：${text}`);
+    assert.ok(text.includes('《C:\\work\\a》'), `picker 应展示 cwd 副行：${text}`);
+    assert.equal(text.includes('没有匹配的会话'), false, 'sessions 有数据时不应出现空态');
+  });
 }
 
 console.log('\n===== 自测汇总 =====');

@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
 		const ENTRY_ID = ROW_ID;
 		const ROW_CONFIG_KEY = "dsh-handoff-relay#dsh-handoff-relay";
 		const DEFAULT_DONE_TEXT = "<!-- DONE -->";
-		const inject = ["slots"];
+		const inject = ["slots", "sessions"];
 
 		const S = {
 			wrap: { display: "flex", flexDirection: "column", gap: "12px", padding: "4px 0" },
