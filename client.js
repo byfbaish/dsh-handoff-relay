@@ -240,21 +240,55 @@ window.__ModuleLoader__.load({
 			return pending;
 		}
 
-		function DirStatusDot(props) {
-			const [kind, setKind] = React.useState("checking");
+		function dirFrameStyle(kind) {
+			if (kind === "ok") return { borderColor: "#2e7d32", boxShadow: "0 0 0 1px #2e7d32 inset" };
+			if (kind === "bad") return { borderColor: "#d33", boxShadow: "0 0 0 1px #d33 inset" };
+			if (kind === "checking" || kind === "none") return { borderColor: "#9e9e9e", boxShadow: "0 0 0 1px #9e9e9e inset" };
+			return {};
+		}
+
+		function dirStatusTitle(kind) {
+			if (kind === "ok") return "目录可读";
+			if (kind === "bad") return "目录不可读或不存在";
+			if (kind === "none") return "宿主未提供目录核验";
+			if (kind === "checking") return "检查中…";
+			return "";
+		}
+
+		function DirPathField(props) {
+			const hasDir = !!String(props.dir || "").trim();
+			const [status, setStatus] = React.useState({ dir: hasDir ? props.dir : "", kind: hasDir ? "checking" : "idle" });
 			React.useEffect(() => {
+				if (!hasDir) {
+					setStatus({ dir: "", kind: "idle" });
+					return undefined;
+				}
 				let cancelled = false;
+				setStatus({ dir: props.dir, kind: "checking" });
 				probeDirectory(props.ctx, props.dir, props.sessionId).then((result) => {
-					if (!cancelled) setKind(result.kind);
+					if (!cancelled) setStatus({ dir: props.dir, kind: result.kind });
 				});
 				return () => { cancelled = true; };
-			}, [props.ctx, props.dir, props.sessionId]);
-			if (kind === "none") return null;
-			if (kind === "ok") return h("span", { title: "目录可读", style: { color: "#2e7d32", fontSize: "14px", lineHeight: 1 } }, "●");
-			if (kind === "bad") return h("span", null,
-				h("span", { title: "目录不可读或不存在", style: { color: "#d33", fontSize: "14px", lineHeight: 1 } }, "●"),
-				h("span", { style: { color: "#d33", fontSize: "12px", marginLeft: "4px" } }, "目录不可读或不存在"));
-			return h("span", { title: "检查中…", style: { color: "#9e9e9e", fontSize: "14px", lineHeight: 1 } }, "●");
+			}, [props.ctx, props.dir, props.sessionId, hasDir]);
+			const kind = hasDir ? (status.dir === props.dir ? status.kind : "checking") : "idle";
+			const title = dirStatusTitle(kind);
+			return h("div", { style: { display: "flex", flexDirection: "column", gap: "4px", flex: "1 1 auto", minWidth: "0" } },
+				h("div", { style: { display: "flex", gap: "6px", alignItems: "center", minWidth: "0" } },
+					h("input", {
+						style: { ...S.input, ...dirFrameStyle(kind), flex: "1 1 auto", minWidth: "0" },
+						value: props.dir, disabled: !props.writable,
+						placeholder: "C:\\path\\to\\watch",
+						title: title || undefined,
+						onChange: (e) => props.patchRow(props.index, { dir: e.target.value }),
+					}),
+					props.dirPicker
+						? h("button", {
+							style: S.btn, disabled: !props.writable,
+							onClick: () => props.chooseDir(),
+						}, "选择目录…")
+						: null),
+				kind === "bad" ? h("div", { style: { fontSize: "12px", color: "#d33", lineHeight: 1.6 } }, "目录不可读或不存在") : null,
+				kind === "none" ? h("div", { style: { fontSize: "12px", color: "#9e9e9e", lineHeight: 1.6 } }, "宿主未提供目录核验") : null);
 		}
 
 		function sessionById(map, id) {
@@ -530,21 +564,16 @@ window.__ModuleLoader__.load({
 			const title = row.targetTitle || displayTitleOf(sessionById(opts.map, row.targetSessionId));
 			return h("div", { key: i, style: S.row },
 				h("div", { style: { display: "flex", gap: "6px", alignItems: "center", minWidth: "0" } },
-					h("input", {
-						style: { ...S.input, flex: "1 1 auto", minWidth: "0" },
-						value: row.dir, disabled: !opts.writable,
-						placeholder: "C:\\path\\to\\watch",
-						onChange: (e) => opts.patchRow(i, { dir: e.target.value }),
-					}),
-					row.dir && row.dir.trim()
-						? h(DirStatusDot, { ctx: opts.ctx, dir: row.dir, sessionId: opts.probeSessionId })
-						: null,
-					opts.dirPicker
-						? h("button", {
-							style: S.btn, disabled: !opts.writable,
-							onClick: () => opts.chooseDir(),
-						}, "选择目录…")
-						: null),
+					h(DirPathField, {
+						ctx: opts.ctx,
+						dir: row.dir,
+						sessionId: opts.probeSessionId,
+						writable: opts.writable,
+						index: i,
+						patchRow: opts.patchRow,
+						dirPicker: opts.dirPicker,
+						chooseDir: opts.chooseDir,
+					})),
 				h("div", { style: S.target },
 					h("button", {
 						style: S.btn, disabled: !opts.writable,
