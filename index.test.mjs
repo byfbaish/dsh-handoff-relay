@@ -2583,6 +2583,61 @@ async function p14WaitFor(cond, label, ms = 3000) {
     assert.equal(rows[0].exact, true);
   });
 
+  await checkAsync('P26 加载失败：空 profile 解析不到 schemastery → Config=undefined 且 apply 不抛', async () => {
+    const prevProfile = process.env.DSH_PROFILE_DIR;
+    const emptyProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p26-fail-'));
+    process.env.DSH_PROFILE_DIR = emptyProfile;
+    try {
+      const mod = await import(new URL(`./index.js?p26fail=${Date.now()}`, import.meta.url).href);
+      assert.equal(mod.Config, undefined, '解析失败时 Config 必须 undefined');
+      assert.equal(typeof mod.apply, 'function');
+      assert.doesNotThrow(() => mod.apply({}, {}), '加载失败不应冒泡成 fatal');
+    } finally {
+      if (prevProfile === undefined) delete process.env.DSH_PROFILE_DIR;
+      else process.env.DSH_PROFILE_DIR = prevProfile;
+      fs.rmSync(emptyProfile, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('P26 加载成功：ESM-only schemastery（含顶层 await）可被 import() 加载，Config 含三字段且关键字段 volatile', async () => {
+    const prevProfile = process.env.DSH_PROFILE_DIR;
+    const esmProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p26-esm-'));
+    const pkgDir = path.join(esmProfile, 'node_modules', '@deepseek-ai', 'schemastery');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({
+      name: '@deepseek-ai/schemastery', version: '0.0.0-p26', type: 'module', exports: './index.mjs',
+    }));
+    fs.writeFileSync(path.join(pkgDir, 'index.mjs'), [
+      'const node = (type) => ({ type, meta: {},',
+      '  default(v) { this.meta.default = v; return this; },',
+      '  volatile() { this.meta.volatile = true; return this; } });',
+      'const z = {',
+      '  any: () => node("any"), string: () => node("string"), number: () => node("number"), boolean: () => node("boolean"),',
+      '  array: (inner) => { const n = node("array"); n.inner = inner; return n; },',
+      '  object: (dict) => { const n = node("object"); n.dict = dict; return n; },',
+      '};',
+      'await Promise.resolve();',
+      'export default z;',
+      '',
+    ].join('\n'));
+    process.env.DSH_PROFILE_DIR = esmProfile;
+    try {
+      const mod = await import(new URL(`./index.js?p26esm=${Date.now()}`, import.meta.url).href);
+      assert.ok(mod.Config && typeof mod.Config === 'object', 'ESM-only schemastery 应构建出 Config');
+      assert.equal(mod.Config.type, 'object');
+      const fields = Object.keys(mod.Config.dict || {});
+      assert.ok(fields.includes('watches') && fields.includes('stableMs') && fields.includes('message'), `字段=${fields}`);
+      assert.equal(mod.Config.dict.watches.type, 'array');
+      assert.equal(mod.Config.dict.watches.meta.volatile, true, 'watches 必须 volatile');
+      assert.equal(mod.Config.dict.stableMs.meta.volatile, true, 'stableMs 必须 volatile');
+      assert.equal(mod.Config.dict.message.meta.volatile, undefined);
+    } finally {
+      if (prevProfile === undefined) delete process.env.DSH_PROFILE_DIR;
+      else process.env.DSH_PROFILE_DIR = prevProfile;
+      fs.rmSync(esmProfile, { recursive: true, force: true });
+    }
+  });
+
   const clientCode = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'client.js'), 'utf8');
   const p22bRender = (watches) => {
     let factory;

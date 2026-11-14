@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 export const name = 'dsh-handoff-relay';
 export const inject = ['agents'];
@@ -34,26 +35,26 @@ const MAX_SCAN_WINDOW_MS = 21000;
 export const SETTINGS_NS = 'dsh-handoff-relay';
 
 // P22b：宿主只为带 .volatile() 的 Config 字段出设置表单，也只接受这些路径写回。
-// 解析基线仍是 profile 根；解析不到时导出 undefined，交给宿主按无表单处理，不阻塞 watch。
-function buildConfigSchema() {
-  try {
-    const { z } = loadSchemastery();
-    return z.object({
-      watches: z.array(z.object({
-        dir: z.string().default(''),
-        targetTitle: z.string().default(''),
-        targetSessionId: z.string().default(''),
-        exact: z.boolean().default(true),
-        done: z.any(),
-      })).volatile().default([]),
-      stableMs: z.number().default(DEFAULT_STABLE_MS).volatile(),
-      message: z.string().default(DEFAULT_MESSAGE),
-    });
-  } catch {
-    return undefined;
-  }
+// P26：schemastery 走 ESM import() + 顶层 await，避开 cosmokit 的 ERR_REQUIRE_ESM_RACE_CONDITION；
+// 解析失败仍是 Config=undefined，交给宿主按无表单处理，不阻塞 watch。
+const SCHEMA_PROFILE_ROOT = profileRootDir();
+const SCHEMA_LOAD = await loadSchemasteryAsync(SCHEMA_PROFILE_ROOT);
+
+function buildConfigSchema(z) {
+  if (!z) return undefined;
+  return z.object({
+    watches: z.array(z.object({
+      dir: z.string().default(''),
+      targetTitle: z.string().default(''),
+      targetSessionId: z.string().default(''),
+      exact: z.boolean().default(true),
+      done: z.any(),
+    })).volatile().default([]),
+    stableMs: z.number().default(DEFAULT_STABLE_MS).volatile(),
+    message: z.string().default(DEFAULT_MESSAGE),
+  });
 }
-export const Config = buildConfigSchema();
+export const Config = buildConfigSchema(SCHEMA_LOAD && SCHEMA_LOAD.z);
 
 /** 逐层拆 volatile box：宿主运行时字段可能是函数或 { get }，读配置前必须先落到普通值。 */
 function unwrapConfigValue(value, depth = 0) {
@@ -91,17 +92,25 @@ function profileRootDir() {
 }
 
 /**
- * P14 追加：schemastery 的解析基线必须是 profile 根，而不是插件真实路径。
+ * P14：schemastery 的解析基线必须是 profile 根，而不是插件真实路径。
  * 宿主把 @deepseek-ai/schemastery 装在 <profile>/node_modules 下；插件路径在别的盘符/工作区，
  * Node 从插件目录往上找永远解析不到。这里用 createRequire(<profile>/package.json) 显式换基线。
- * 不改 package.json、不装依赖；解析不到就抛给调用方，由它 warn 跳过设置卡。
+ * P26：解析入口走 import()（ESM 加载器），不用同步 require；cosmokit 是 ESM，同步 require 会在
+ * 模块求值期抛 ERR_REQUIRE_ESM_RACE_CONDITION，而 3 秒后再解析就正常。
+ * 任何失败都只返回 error，不抛给模块顶层；调用方据此降级为“无表单”。
  */
-function loadSchemastery() {
-  const baseFile = path.join(profileRootDir(), 'package.json');
-  const req = createRequire(baseFile);
-  const resolved = req.resolve('@deepseek-ai/schemastery');
-  const mod = req('@deepseek-ai/schemastery');
-  return { z: mod && (mod.default || mod), resolved };
+async function loadSchemasteryAsync(rootDir = profileRootDir()) {
+  const baseFile = path.join(rootDir, 'package.json');
+  try {
+    const req = createRequire(baseFile);
+    const resolvedPath = req.resolve('@deepseek-ai/schemastery');
+    const mod = await import(pathToFileURL(resolvedPath).href);
+    const z = mod && (mod.default ?? mod);
+    if (!z || typeof z.object !== 'function') throw new Error('schemastery 模块形态不符');
+    return { z, resolved: resolvedPath, error: undefined };
+  } catch (err) {
+    return { z: undefined, resolved: undefined, error: err };
+  }
 }
 
 function isInsideDir(dir, target) {
@@ -754,7 +763,9 @@ async function mountSettingsCard(ctx, configWatches, stateDir) {
   try {
     // 解析基线 = profile 根（宿主把 schemastery 装在 <profile>/node_modules 下），
     // 不是插件真实路径——从插件目录往上找永远到不了 profile。
-    const loaded = loadSchemastery();
+    const currentRoot = profileRootDir();
+    const loaded = currentRoot === SCHEMA_PROFILE_ROOT ? SCHEMA_LOAD : await loadSchemasteryAsync(currentRoot);
+    if (!loaded || !loaded.z) throw (loaded && loaded.error) || new Error('schemastery 未加载');
     z = loaded.z;
     schemaResolved = loaded.resolved;
   } catch (err) {
