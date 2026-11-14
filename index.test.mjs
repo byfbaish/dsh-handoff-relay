@@ -2949,6 +2949,175 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   });
 }
 
+// ---------------------------------------------------------------- P31：投递层物理去重（落盘 dedupe.json）
+{
+  const dedupeFile = () => path.join(suiteProfileRoot, 'dsh-handoff-relay', 'dedupe.json');
+  const relayLogFile = () => path.join(suiteProfileRoot, 'dsh-handoff-relay', 'relay.log');
+  const readDedupe = () => JSON.parse(fs.readFileSync(dedupeFile(), 'utf8'));
+  const readRelayTail = () => {
+    try { return fs.readFileSync(relayLogFile(), 'utf8'); } catch { return ''; }
+  };
+  const body = 'x\n<!-- DONE -->\n';
+  const setWholeSecondMtime = (file, seconds) => fs.utimesSync(file, seconds, seconds);
+
+  // a) 同一 size/mtime 再放一次 ⇒ 不投递，日志有「去重跳过」
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-A' }], stableMs: 120,
+    }));
+    const f = path.join(d, 'same-a.txt');
+    const sec = Math.floor(Date.now() / 1000) - 1;
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, sec);
+    box.cb('change', 'same-a.txt');
+    await sleep(80);
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, sec);
+    box.cb('change', 'same-a.txt');
+    await sleep(60);
+    check('P31 a 同 size/mtime 再放同一文件 → 不重复投递，relay.log 有去重跳过', () => {
+      assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+      assert.ok(readRelayTail().includes('去重跳过') && readRelayTail().includes('原因=重复(size,mtime 相同)'),
+        `缺去重日志：${readRelayTail().slice(-400)}`);
+    });
+    disp();
+  }
+
+  // b) 重新 apply（新 startWatch，内存 delivered 为空）后，落盘表仍挡住
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    const future = Math.floor(Date.now() / 1000) + 60;
+    const f = path.join(d, 'reload-b.txt');
+    const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-B' }], stableMs: 120,
+    }));
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, future);
+    box.cb('change', 'reload-b.txt');
+    await sleep(80);
+    assert.equal(calls.length, 1, `首次投递应 1 条，实际 ${calls.length}`);
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, future);
+    disp();
+
+    const reloadMod = await import(new URL(`./index.js?p31reload=${Date.now()}`, import.meta.url).href);
+    const box2 = capturingWatch();
+    const disp2 = withFs(box2.patch, () => reloadMod.apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-B' }], stableMs: 120,
+    }));
+    await sleep(80);
+    check('P31 b 重新加载后落盘表仍挡住同快照 → 不投递', () => {
+      assert.equal(calls.length, 1, `重载后不应再投，实际 ${calls.length}`);
+      assert.ok(readRelayTail().includes('去重跳过'), `缺去重日志：${readRelayTail().slice(-400)}`);
+    });
+    disp2();
+  }
+
+  // c) 落盘表没有该 dir ⇒ 首次运行不吞，启动照投
+  {
+    const d = tmp();
+    const calls = [];
+    const f = path.join(d, 'first-c.txt');
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, Math.floor(Date.now() / 1000) - 1);
+    const box = capturingWatch();
+    const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-C' }], stableMs: 120,
+    }));
+    check('P31 c 表里没有该 dir → 首次运行全部视为新，启动照投', () => {
+      assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+      assert.ok(readRelayTail().includes('首次运行全部视为新'), `缺首次运行日志：${readRelayTail().slice(-400)}`);
+    });
+    disp();
+  }
+
+  // d) 停机期间写入的文件 mtime > lastDeliveredAt ⇒ 启动后仍投
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    let disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-D' }], stableMs: 120,
+    }));
+    const a = path.join(d, 'before-d.txt');
+    fs.writeFileSync(a, body);
+    setWholeSecondMtime(a, Math.floor(Date.now() / 1000) - 2);
+    box.cb('change', 'before-d.txt');
+    await sleep(80);
+    disp();
+    await sleep(30);
+    const b = path.join(d, 'during-downtime.txt');
+    fs.writeFileSync(b, body);
+    setWholeSecondMtime(b, Math.floor(Date.now() / 1000) + 60);
+    const box2 = capturingWatch();
+    disp = withFs(box2.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-D' }], stableMs: 120,
+    }));
+    await sleep(60);
+    check('P31 d 停机期间写入且 mtime > lastDeliveredAt → 启动后仍投', () => {
+      assert.equal(calls.length, 2, `期望 2，实际 ${calls.length}`);
+    });
+    disp();
+  }
+
+  // e) size/mtime 变了 ⇒ 不在判重范围，照投
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    let disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-E' }], stableMs: 120,
+    }));
+    const f = path.join(d, 'changed-e.txt');
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, Math.floor(Date.now() / 1000) - 2);
+    box.cb('change', 'changed-e.txt');
+    await sleep(80);
+    fs.writeFileSync(f, `${body}tail\n`);
+    setWholeSecondMtime(f, Math.floor(Date.now() / 1000) + 60);
+    const box2 = capturingWatch();
+    disp = withFs(box2.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-E' }], stableMs: 120,
+    }));
+    await sleep(60);
+    check('P31 e size/mtime 变了 → 不判重，照常投递', () => {
+      assert.equal(calls.length, 2, `期望 2，实际 ${calls.length}`);
+    });
+    disp();
+  }
+
+  // f) dedupe.json 写失败只 warn，不阻断投递
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-F' }], stableMs: 120,
+    }));
+    const f = path.join(d, 'writefail-f.txt');
+    fs.writeFileSync(f, body);
+    const nativeRename = fs.renameSync;
+    warnings.length = 0;
+    fs.renameSync = () => { const err = new Error('EACCES: dedupe write blocked'); err.code = 'EACCES'; throw err; };
+    try {
+      box.cb('change', 'writefail-f.txt');
+      await sleep(80);
+    } finally {
+      fs.renameSync = nativeRename;
+    }
+    check('P31 f dedupe.json 写失败 → 只 warn，投递照常', () => {
+      assert.equal(calls.length, 1, `写失败不应阻断投递，实际 ${calls.length}`);
+      assert.ok(warnings.some((m) => m.includes('写 dedupe.json 失败')), JSON.stringify(warnings));
+    });
+    disp();
+  }
+}
+
 console.log('\n===== 自测汇总 =====');
 for (const r of results) console.log(r);
 console.log(`TOTAL: ${results.length - failed}/${results.length} PASS`);

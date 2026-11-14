@@ -23,6 +23,8 @@ const MAX_DELIVERED_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 // P9 止血：delivered 移动失败时重试；失败的 (文件,快照) 记进 failed.json，重载后不再重投。
 const RELAY_STATE_DIRNAME = 'dsh-handoff-relay';
 const FAILED_FILENAME = 'failed.json';
+const DEDUPE_FILENAME = 'dedupe.json';
+const DEDUPE_WINDOW_MS = 30000;
 const RELAY_LOG_FILENAME = 'relay.log';
 const MAX_FAILED_ENTRIES = 200;
 const MAX_LOG_BYTES = 256 * 1024;
@@ -200,6 +202,113 @@ function rememberFailed(ctx, stateDir, record) {
   } catch (err) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] 写 failed.json 失败（不影响本次投递）：${String(err)}（file=${reg.file}）`);
   }
+}
+
+// ---------------------------------------------------------------- P31：投递去重台账
+// stateDir → { dirs: { <dirKey>: { <absPath>: {size,mtimeMs,at} } }, file }；每个 profile 根只读一次。
+const dedupeRegistry = new Map();
+
+function loadDedupeRegistry(ctx, stateDir) {
+  const cached = dedupeRegistry.get(stateDir);
+  if (cached) return cached;
+  const reg = { dirs: {}, file: path.join(stateDir, DEDUPE_FILENAME) };
+  let raw;
+  try {
+    raw = fs.readFileSync(reg.file, 'utf8');
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] 读取 dedupe.json 失败，按空表处理：${String(err)}（file=${reg.file}）`);
+    }
+    dedupeRegistry.set(stateDir, reg);
+    return reg;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('顶层不是对象');
+    for (const [key, bucket] of Object.entries(parsed)) {
+      if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) throw new Error(`dir 桶不是对象：${key}`);
+      for (const [file, entry] of Object.entries(bucket)) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`条目不是对象：${file}`);
+        if (!Number.isFinite(entry.size) || !Number.isFinite(entry.mtimeMs) || typeof entry.at !== 'string') {
+          throw new Error(`条目字段不完整：${file}`);
+        }
+      }
+    }
+    reg.dirs = parsed;
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] dedupe.json 坏档，整表丢弃（会重新记录）：${String(err)}（file=${reg.file}）`);
+    reg.dirs = {};
+  }
+  dedupeRegistry.set(stateDir, reg);
+  return reg;
+}
+
+/** 临时文件 + rename；失败只 warn，绝不阻断本次投递。 */
+function persistDedupeRegistry(ctx, stateDir, reg) {
+  const tmp = `${reg.file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(tmp, `${JSON.stringify(reg.dirs, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, reg.file);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+    log(ctx, 'warn', `[${PLUGIN_NAME}] 写 dedupe.json 失败（不影响本次投递）：${String(err)}（file=${reg.file}）`);
+  }
+}
+
+function rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, state) {
+  const reg = loadDedupeRegistry(ctx, stateDir);
+  const dirKey = dirKeyOf(watchDir);
+  const bucket = reg.dirs[dirKey] || (reg.dirs[dirKey] = {});
+  bucket[path.resolve(watchDir, relName)] = {
+    size: state.size,
+    mtimeMs: state.mtimeMs,
+    at: new Date().toISOString(),
+  };
+  persistDedupeRegistry(ctx, stateDir, reg);
+}
+
+function dirEntriesOf(reg, watchDir) {
+  const bucket = reg.dirs[dirKeyOf(watchDir)];
+  return bucket && Object.keys(bucket).length ? bucket : null;
+}
+
+function lastDeliveredAtMs(bucket) {
+  let last = null;
+  for (const entry of Object.values(bucket || {})) {
+    const at = Date.parse(entry && entry.at);
+    if (Number.isFinite(at) && (last === null || at > last)) last = at;
+  }
+  return last;
+}
+
+/** 同一路径、size 与 mtime 都相同，且落盘时间在 30 秒窗口内 ⇒ 判重。 */
+function isDuplicateSnapshot(ctx, stateDir, watchDir, relName, state, now = Date.now()) {
+  const reg = loadDedupeRegistry(ctx, stateDir);
+  const bucket = dirEntriesOf(reg, watchDir);
+  if (!bucket) return false;
+  const entry = bucket[path.resolve(watchDir, relName)];
+  if (!entry || entry.size !== state.size || entry.mtimeMs !== state.mtimeMs) return false;
+  const at = Date.parse(entry.at);
+  return Number.isFinite(at) && now - at < DEDUPE_WINDOW_MS;
+}
+
+function skipDuplicate(ctx, stateDir, watchDir, relName) {
+  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 去重跳过 ${watchDir} ${relName} 原因=重复(size,mtime 相同)`);
+}
+
+/** 启动扫描基准：mtime 必须晚于该 dir 最后一次成功投递时刻，而不是本次启动时刻。 */
+function isStartupNew(ctx, stateDir, watchDir, relName, state, onFirstRun) {
+  const reg = loadDedupeRegistry(ctx, stateDir);
+  const bucket = dirEntriesOf(reg, watchDir);
+  if (!bucket) {
+    if (onFirstRun) onFirstRun();
+    return true;
+  }
+  const last = lastDeliveredAtMs(bucket);
+  if (last === null || state.mtimeMs > last) return true;
+  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 去重跳过 ${watchDir} ${relName} 原因=启动前旧文件(mtime<=lastDeliveredAt)`);
+  return false;
 }
 
 /** 只写三条路径：启动、移动失败、跳过已失败件；超过 256KB 截断保留末尾一半。 */
@@ -808,7 +917,8 @@ async function mountSettingsCard(ctx, configWatches, stateDir) {
 
 function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deliveredRoot, stateDir) {
   const pending = new Map();   // relName → { size, mtimeMs, sig, timer }；不轮询
-  const delivered = new Set(); // 已投递快照，防止同一 (文件,size,mtimeMs) 重复 followup
+  const startupOld = new Set(); // 启动扫描判为旧文件的 relName|sig，防止同快照后续事件再次投递
+  let firstRunNoted = false;
   let closed = false;
   let watcher;
   let rescans = null;
@@ -876,9 +986,11 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   }
 
   function deliver(relName, state, reason) {
-    const key = `${relName}|${state.sig}`;
-    if (delivered.has(key)) return;
     if (isFailedSnapshot(relName, state)) { skipFailed(relName); return; }
+    if (isDuplicateSnapshot(ctx, stateDir, watchDir, relName, state)) {
+      skipDuplicate(ctx, stateDir, watchDir, relName);
+      return;
+    }
     clearTimeout(state.timer);
     pending.delete(relName);
     const full = path.join(watchDir, relName);
@@ -890,7 +1002,6 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
       relayLog(ctx, stateDir, 'warn', msg);
       return;
     }
-    delivered.add(key);
     const agent = resolved.agent || findAgentById(ctx, resolved.id, warnErr);
     if (!agent) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话 ${resolved.id} 投递时已不可用；文件 ${full} 未投递`);
@@ -899,6 +1010,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const message = buildMessage(relName, full, state, reason, cfg.message);
     try {
       agent.followup(message);
+      rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, state);
       log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${resolved.id}（${label}，文件=${full}，触发=${reason}）`);
       // 移动放在微任务里：同步投递路径（含测试里的 stat 断言）不感知文件尚未移走。
       queueMicrotask(() => takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full, state, stateDir));
@@ -925,7 +1037,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   }
 
   /** fs.watch 事件到达：记 (size, mtimeMs)，重置静默 timer；DONE 则立即投递。 */
-  function consider(relName) {
+  function consider(relName, startup = false) {
     if (closed || !relName) return;
     if (relName === '.gitkeep') return;   // 占位文件永不投递、永不移动
     const full = path.join(watchDir, relName);
@@ -933,8 +1045,21 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     try { st = fs.statSync(full); } catch { return; }   // 删除事件 / 临时文件
     if (!st.isFile()) return;
     const sig = `${st.size}:${st.mtimeMs}`;
-    if (delivered.has(`${relName}|${sig}`)) return;
+    const key = `${relName}|${sig}`;
+    if (startupOld.has(key)) return;
     if (isFailedSnapshot(relName, { mtimeMs: st.mtimeMs, size: st.size })) { skipFailed(relName); return; }
+    if (isDuplicateSnapshot(ctx, stateDir, watchDir, relName, { size: st.size, mtimeMs: st.mtimeMs })) {
+      skipDuplicate(ctx, stateDir, watchDir, relName);
+      return;
+    }
+    if (startup && !isStartupNew(ctx, stateDir, watchDir, relName, { size: st.size, mtimeMs: st.mtimeMs }, () => {
+      if (firstRunNoted) return;
+      firstRunNoted = true;
+      relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 去重表无 ${watchDir} 记录，首次运行全部视为新`);
+    })) {
+      startupOld.add(key);
+      return;
+    }
 
     let state = pending.get(relName);
     // 同一快照的重复事件（Windows 常见）不重复重置 timer，避免稳定后仍被无限推迟。
@@ -956,7 +1081,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   const rescanOnce = () => {
     if (firstEventRescanned) return;
     firstEventRescanned = true;
-    for (const rel of listFiles()) consider(rel);
+    for (const rel of listFiles()) consider(rel, true);
   };
   try {
     watcher = fs.watch(watchDir, { persistent: false, encoding: 'utf8' }, (_event, filename) => {
@@ -970,14 +1095,14 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     dispose();
     return null;
   }
-  // 停机期间留下的文件：启动后扫一遍，保证补发一次；已投过的文件已被移走，不会重放。
-  for (const rel of listFiles()) consider(rel);
+  // 停机期间留下的文件：启动后扫一遍，只捞 mtime 晚于该 dir 最后一次成功投递的文件。
+  for (const rel of listFiles()) consider(rel, true);
   // P11：加载时解析不到 ⇒ 按 RETRY_DELAYS_MS 有限重扫（最多 3 次、21s 窗口内），成功即投。
   if (!atLoad.ok) {
     rescans = scheduleStartupRescans({
       dir: watchDir,
       describeOnce: () => describeTargetNow(ctx, target).ok,
-      rescanOnce: () => { for (const rel of listFiles()) consider(rel); },
+      rescanOnce: () => { for (const rel of listFiles()) consider(rel, true); },
       logOnce: (n, result) => relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] rescan#${n} dir=${watchDir} result=${result}`),
     });
   }
