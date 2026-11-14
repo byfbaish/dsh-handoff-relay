@@ -2897,6 +2897,56 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.ok(text.includes('《C:\\work\\a》'), `picker 应展示 cwd 副行：${text}`);
     assert.equal(text.includes('没有匹配的会话'), false, 'sessions 有数据时不应出现空态');
   });
+  const p28Ctx = () => {
+    const byId = {
+      s1: { id: 's1', displayTitle: '会话 A', cwd: 'C:\\work\\a' },
+    };
+    for (let i = 2; i <= 12; i += 1) {
+      byId[`s${i}`] = { id: `s${i}`, displayTitle: `会话 ${i}`, cwd: `C:\\work\\${i}` };
+    }
+    return { sessions: { list: { getSnapshot: () => ({ byId }) } } };
+  };
+  const p28OpenPicker = (ctx) => {
+    const r = p27Render(ctx);
+    const pick = walkP27(r.getTree()).find((n) => n && n.type === 'button'
+      && (n.children || []).includes('选择会话'));
+    assert.ok(pick, '应有「选择会话」按钮');
+    pick.props.onClick();
+    return r;
+  };
+  const p28List = (tree) => walkP27(tree).find((n) => n && n.type === 'div'
+    && n.props && n.props.style && n.props.style.maxHeight === '320px');
+  const p28Rows = (list) => walkP27(list ? list.children : []).filter((n) => n && n.type === 'button');
+  const p28Text = (tree) => walkP27(tree).filter((n) => typeof n === 'string').join(' | ');
+
+  check('P28 默认只渲染 10 条，且底部出现「查看更多（共 12 条）」', () => {
+    const { getTree } = p28OpenPicker(p28Ctx());
+    const list = p28List(getTree());
+    assert.ok(list, '应有会话列表容器');
+    assert.equal(p28Rows(list).length, 10, '默认应只渲染 10 条');
+    assert.ok(p28Text(getTree()).includes('查看更多（共 12 条）'), '应出现查看更多按钮');
+  });
+
+  check('P28 点「查看更多」后渲染全部 12 条，按钮变「收起」', () => {
+    const { getTree } = p28OpenPicker(p28Ctx());
+    const more = walkP27(getTree()).find((n) => n && n.type === 'button'
+      && (n.children || []).some((c) => typeof c === 'string' && c.includes('查看更多')));
+    assert.ok(more, '应有查看更多按钮');
+    more.props.onClick();
+    const list = p28List(getTree());
+    assert.equal(p28Rows(list).length, 12, '展开后应渲染全部 12 条');
+    const text = p28Text(getTree());
+    assert.ok(text.includes('收起'), '展开后按钮应变为收起');
+    assert.equal(text.includes('查看更多（共 12 条）'), false);
+  });
+
+  check('P28 会话列表容器内联限高：max-height 320px + overflow-y auto', () => {
+    const { getTree } = p28OpenPicker(p28Ctx());
+    const list = p28List(getTree());
+    assert.ok(list, '应有会话列表容器');
+    assert.equal(list.props.style.maxHeight, '320px');
+    assert.equal(list.props.style.overflowY, 'auto');
+  });
 }
 
 console.log('\n===== 自测汇总 =====');

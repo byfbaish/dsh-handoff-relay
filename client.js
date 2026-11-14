@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
 		const ENTRY_ID = ROW_ID;
 		const ROW_CONFIG_KEY = "dsh-handoff-relay#dsh-handoff-relay";
 		const DEFAULT_DONE_TEXT = "<!-- DONE -->";
+		const PICKER_LIMIT = 10;
 		const inject = ["slots", "sessions"];
 
 		const S = {
@@ -249,6 +250,7 @@ window.__ModuleLoader__.load({
 			const [status, setStatus] = React.useState("");
 			const [picker, setPicker] = React.useState(null);
 			const [query, setQuery] = React.useState("");
+			const [pickerExpanded, setPickerExpanded] = React.useState(false);
 
 			React.useEffect(() => {
 				if (!controller || typeof controller.subscribe !== "function") return undefined;
@@ -301,6 +303,7 @@ window.__ModuleLoader__.load({
 				});
 				setPicker(null);
 				setQuery("");
+				setPickerExpanded(false);
 			};
 
 			const save = async () => {
@@ -348,26 +351,36 @@ window.__ModuleLoader__.load({
 				setDirty(false);
 				setPicker(null);
 				setQuery("");
+				setPickerExpanded(false);
 				setStatus("已放弃修改，恢复到最后一次保存值");
 			};
 
+			const pickerList = pickerItems(props && props.ctx, query);
+			const pickerShown = pickerExpanded ? pickerList : pickerList.slice(0, PICKER_LIMIT);
 			const pickerNode = picker === null ? null : h("div", { style: S.picker },
 				h("input", {
 					style: S.input,
 					value: query,
 					placeholder: "搜索会话标题",
-					onChange: (e) => setQuery(e.target.value),
+					onChange: (e) => { setQuery(e.target.value); setPickerExpanded(false); },
 				}),
-				pickerItems(props && props.ctx, query).length === 0
-					? h("div", { style: S.hint }, "没有匹配的会话")
-					: pickerItems(props && props.ctx, query).map((session) => h("button", {
-						key: session.id,
-						style: S.item,
-						onClick: () => chooseSession(picker, session),
-					},
-						h("div", null, session.title),
-						rowCwd(session.cwd))),
-				h("button", { style: S.btn, onClick: () => { setPicker(null); setQuery(""); } }, "取消"));
+				h("div", { style: { maxHeight: "320px", overflowY: "auto" } },
+					pickerList.length === 0
+						? h("div", { style: S.hint }, "没有匹配的会话")
+						: pickerShown.map((session) => h("button", {
+							key: session.id,
+							style: S.item,
+							onClick: () => chooseSession(picker, session),
+						},
+							h("div", null, session.title),
+							rowCwd(session.cwd)))),
+				pickerList.length > PICKER_LIMIT
+					? h("button", {
+						style: S.btn,
+						onClick: () => setPickerExpanded((v) => !v),
+					}, pickerExpanded ? "收起" : `查看更多（共 ${pickerList.length} 条）`)
+					: null,
+				h("button", { style: S.btn, onClick: () => { setPicker(null); setQuery(""); setPickerExpanded(false); } }, "取消"));
 
 			return h("div", { style: S.wrap },
 				h("div", { style: S.hint },
@@ -391,7 +404,7 @@ window.__ModuleLoader__.load({
 					? h("div", { style: S.hint }, "还没有自定义行。点「新增一行」开始。")
 					: rows.map((row, i) => targetRow(i, row, {
 						writable, map, mapReady, patchRow, removeRow,
-						openPicker: () => { setPicker(i); setQuery(""); },
+						openPicker: () => { setPicker(i); setQuery(""); setPickerExpanded(false); },
 						invalid: missingSessionText(row, map, mapReady),
 						cwd: (sessionById(map, row.targetSessionId) || {}).cwd || "",
 					})),
