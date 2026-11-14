@@ -142,8 +142,10 @@ dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
 要固定某个版本就带下面的 tag，但以仓库 Releases 页为准：发版后取那里当前最新的 tag。
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.4.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.5.0
 ```
+
+0.4.0 不可用（设置卡缺入口），请安装 0.5.0 或更高版本。
 
 ### 卸载与查看状态
 
@@ -199,14 +201,22 @@ dsh --dump-config --profile desktop
 
 ## 设置页
 
-从 `0.4.0` 起，插件还会在宿主的插件设置页里贡献一张卡片。卡片**只作编辑通道**：
+从 `0.5.0` 起可用：插件会在宿主的插件设置页里贡献一张卡片，可直接增删行、绑定目录与会话。
 运行期的唯一真相仍然是 `cordis.patch.yml` 里的 `watches`。
+
+卡片入口较深：**插件 → 已安装 → dsh-handoff-relay → 打开其 README 页 → 页面最下方「包含的组件」→ 点击 `Handoff Relay`** 即进入设置页。
 
 - 每条 watch 一行：目录、目标会话（文本输入，保存前校验是否存在）、完成规则、`exact`。
 - 可以新增、编辑、删除行；保存时把整个 `watches` 数组写回 `cordis.patch.yml`，
   文件里的其它内容保持不动。
 - 保存**不会热更新**正在运行的 relay。**重启 DSH 后新的 watches 才生效**——
   本版本不做热更新。
+
+## 目录框沿颜色
+
+绿 = 目录存在且可读；红 = 目录不存在 / 不可读 / 指到了文件；灰 = 宿主未提供目录核验（此态不阻止保存）。
+
+保存时若目录不可读，行内会出现红字提示「目录当前不可读，保存后需确认」，**但不阻止保存**。路径存在性由 `GET /handoff-relay/probe` 在主进程判定，仅读 `stat`/`access`，不列举目录内容。
 
 ## 启动期有限重扫
 

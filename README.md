@@ -165,8 +165,10 @@ append the tag shown below — the repository's Releases page stays authoritativ
 after a new release, use the latest tag listed there.
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.4.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.5.0
 ```
+
+0.4.0 is not usable (its settings card never appears). Install 0.5.0 or later.
 
 ### Uninstall and check status
 
@@ -233,9 +235,13 @@ restart; a `targetTitle` watch needs no re-wiring.**
 
 ## Settings page
 
-From `0.4.0` the plugin also contributes a card to the host's plugin settings
-page. The card is an editor only: `watches` in `cordis.patch.yml` remains the
-single source of truth at runtime.
+From `0.5.0` the plugin contributes a usable card to the host's plugin settings page;
+you can add or remove rows and bind directories and sessions directly.
+`watches` in `cordis.patch.yml` remains the single source of truth at runtime.
+
+The entry is buried: **Plugins → Installed → dsh-handoff-relay → open its
+README page → “Included components” at the bottom → click `Handoff Relay`**
+to open the settings page.
 
 - Each watch is one row: directory, target session (text input, checked for
   existence before saving), completion rule, and `exact`.
@@ -243,6 +249,12 @@ single source of truth at runtime.
   back into `cordis.patch.yml` and leaves the rest of the file untouched.
 - Saving does **not** hot-reload the running relay. **Restart DSH for the new
   watches to take effect** — this release has no live reload.
+
+## Directory field border colors
+
+Green = the directory exists and is readable; red = the directory does not exist, is unreadable, or the path points to a file; gray = the host does not provide directory verification (this state does not block saving).
+
+When saving, an unreadable directory shows the inline red hint “Directory is currently unreadable; confirm after saving”, **but saving is not blocked**. Path existence is checked in the main process by `GET /handoff-relay/probe`, which only calls `stat`/`access` and never lists directory contents.
 
 ## Startup rescan
 
