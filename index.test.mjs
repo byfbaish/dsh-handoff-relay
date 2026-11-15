@@ -3342,6 +3342,129 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     });
     disp();
   }
+
+  // ---------------------------------------------------- P31 v2：内容判重（TC1–TC4）
+  // 事故形态（11-15 10:04–10:05）：同一份内容被拷回 watch，size 不变、mtime 变新，
+  // 旧键 (size,mtimeMs) 与 30s 窗口都认不出 ⇒ 判重主键改成 contentHash(sha256)。
+  const skipLineOf = (name) => readRelayTail()
+    .split('\n')
+    .filter((line) => line.includes('去重跳过') && line.includes(`file=${name} `))
+    .pop() || '';
+  const digestOf = (text) => createHash('sha256').update(Buffer.from(text)).digest('hex').slice(0, 12);
+
+  // TC1 同名同字节的二次投（mtime 变新、size 不变）⇒ 只投一次，跳过走 原因=重复(内容)
+  // 跨重载：投一次 → 卸载 → 同字节再出现 → 用全新模块实例（内存表为空）再 apply；
+  // 只有落盘表 + 内容摘要才挡得住，退回内存 Set 或去掉 contentHash 都会红。
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    let disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-TC1' }], stableMs: 120,
+    }));
+    const f = path.join(d, 'tc1.txt');
+    const base = Math.floor(Date.now() / 1000) - 5;
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, base);
+    box.cb('change', 'tc1.txt');          // 尾带 DONE ⇒ 当拍投递
+    await sleep(90);
+    disp();
+    fs.writeFileSync(f, body);            // 同名、同字节再出现（源文件仍在原路径）
+    setWholeSecondMtime(f, base + 30);    // mtime 变新、size 不变
+    const reloadMod = await import(new URL(`./index.js?p31tc1=${Date.now()}`, import.meta.url).href);
+    const box2 = capturingWatch();
+    disp = withFs(box2.patch, () => reloadMod.apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-TC1' }], stableMs: 120,
+    }));
+    await sleep(110);
+    check('P31 TC1 重载后同名同字节二次投（mtime 变新）→ 不投，日志含 target/file/digest 与 原因=重复(内容)', () => {
+      assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+      const line = skipLineOf('tc1.txt');
+      assert.ok(/去重跳过 target=[0-9a-f]{12} file=tc1\.txt digest=[0-9a-f]{12} 原因=重复\(内容\)$/.test(line),
+        `跳过日志字段不符：${line || '（无）'}`);
+      assert.ok(line.includes(`digest=${digestOf(body)}`), `digest 应为内容 sha256 前 12 位：${line}`);
+    });
+    disp();
+  }
+
+  // TC2 已投件被拷回 watch（同字节、size 不变、mtime 变新）⇒ 不投，走 原因=重复(内容)
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-TC2' }], stableMs: 120,
+    }));
+    const f = path.join(d, 'tc2.txt');
+    const base = Math.floor(Date.now() / 1000) - 5;
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, base);
+    box.cb('change', 'tc2.txt');
+    await sleep(110);
+    const delivered = findDelivered('tc2.txt');
+    fs.copyFileSync(delivered, f);        // 把已投件原样拷回 watch（同字节）
+    setWholeSecondMtime(f, base + 60);    // size 不变、mtime 必然变新
+    box.cb('change', 'tc2.txt');
+    await sleep(90);
+    check('P31 TC2 已投件拷回 watch（size 不变、mtime 变新）→ 不投，走 原因=重复(内容)', () => {
+      assert.ok(delivered, '首次投递应已把文件移进 delivered');
+      assert.equal(calls.length, 1, `拷回不应再投，实际 ${calls.length}`);
+      const line = skipLineOf('tc2.txt');
+      assert.ok(/去重跳过 target=[0-9a-f]{12} file=tc2\.txt digest=[0-9a-f]{12} 原因=重复\(内容\)$/.test(line),
+        `跳过日志字段不符：${line || '（无）'}`);
+    });
+    disp();
+  }
+
+  // TC3 同 size、同 mtime，只改 1 字节 ⇒ 必须放行（内容变不判重）
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-TC3' }], stableMs: 120,
+    }));
+    const f = path.join(d, 'tc3.txt');
+    const before = 'AAAA\n<!-- DONE -->\n';
+    const after = 'AAAB\n<!-- DONE -->\n';   // 只改 1 字节，长度不变
+    const base = Math.floor(Date.now() / 1000) - 5;
+    fs.writeFileSync(f, before);
+    setWholeSecondMtime(f, base);
+    box.cb('change', 'tc3.txt');
+    await sleep(90);
+    fs.writeFileSync(f, after);
+    setWholeSecondMtime(f, base);            // size 与 mtime 都与已投记录一致，只有内容变了
+    box.cb('change', 'tc3.txt');
+    await sleep(90);
+    check('P31 TC3 同 size 同 mtime 但内容改 1 字节 → 必须放行', () => {
+      assert.equal(calls.length, 2, `期望 2，实际 ${calls.length}`);
+      assert.ok(calls[1].content[0].text.includes('tc3.txt'), `第二条应是改字节后的投递：${calls[1].content[0].text}`);
+    });
+    disp();
+  }
+
+  // TC4 同一快照先走 DONE、再走一次事件（本该进入 stable 计时）⇒ 只投一次，跳过有留痕
+  {
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    const disp = withFs(box.patch, () => apply(makeCtx(calls), {
+      watches: [{ dir: d, targetSessionId: 'P31-TC4' }], stableMs: 120,
+    }));
+    const f = path.join(d, 'tc4.txt');
+    fs.writeFileSync(f, body);
+    setWholeSecondMtime(f, Math.floor(Date.now() / 1000) - 5);
+    box.cb('change', 'tc4.txt');    // DONE 通道：当拍投递
+    box.cb('change', 'tc4.txt');    // 同一快照再来一次：本该排队等 stableMs
+    await sleep(240);               // 超过 stableMs，仍不得出现第二次投递
+    check('P31 TC4 DONE 与 stable 对同一快照只投一次，跳过有留痕', () => {
+      assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
+      const line = skipLineOf('tc4.txt');
+      assert.ok(/去重跳过 target=[0-9a-f]{12} file=tc4\.txt digest=[0-9a-f]{12} 原因=/.test(line),
+        `第二次触发必须有留痕（不得静默）：${line || '（无）'}`);
+    });
+    disp();
+  }
 }
 
 // ---------------------------------------------------------------- P44：主进程目录探测路由

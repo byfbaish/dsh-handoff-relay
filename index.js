@@ -360,7 +360,9 @@ function rememberFailed(ctx, stateDir, record) {
 }
 
 // ---------------------------------------------------------------- P31：投递去重台账
-// stateDir → { dirs: { <dirKey>: { <absPath>: {size,mtimeMs,at} } }, file }；每个 profile 根只读一次。
+// stateDir → { dirs: { <dirKey>: { <absPath>: {size,mtimeMs,contentHash,at} } }, file }；每个 profile 根只读一次。
+// P31 v2：判重主键加 contentHash（sha256 十六进制）。同一文件被拷回 watch、size 不变但 mtime 变新时，
+// 旧键 (size,mtimeMs) 认不出，内容摘要认得；内容变逾 1 字节则必须放行。
 const dedupeRegistry = new Map();
 
 function loadDedupeRegistry(ctx, stateDir) {
@@ -411,13 +413,22 @@ function persistDedupeRegistry(ctx, stateDir, reg) {
   }
 }
 
+/** 文件字节的 sha256（十六进制）；读不到返回空串（调用方据此退回 size/mtime 判重）。 */
+function contentHashOfFile(full) {
+  try { return createHash('sha256').update(fs.readFileSync(full)).digest('hex'); } catch { return ''; }
+}
+
 function rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, state) {
   const reg = loadDedupeRegistry(ctx, stateDir);
   const dirKey = dirKeyOf(watchDir);
   const bucket = reg.dirs[dirKey] || (reg.dirs[dirKey] = {});
+  const contentHash = typeof state.contentHash === 'string' && state.contentHash
+    ? state.contentHash
+    : contentHashOfFile(path.join(watchDir, relName));
   bucket[path.resolve(watchDir, relName)] = {
     size: state.size,
     mtimeMs: state.mtimeMs,
+    contentHash,
     at: new Date().toISOString(),
   };
   persistDedupeRegistry(ctx, stateDir, reg);
@@ -437,19 +448,37 @@ function lastDeliveredAtMs(bucket) {
   return last;
 }
 
-/** 同一路径、size 与 mtime 都相同，且落盘时间在 30 秒窗口内 ⇒ 判重。 */
-function isDuplicateSnapshot(ctx, stateDir, watchDir, relName, state, now = Date.now()) {
+/**
+ * 判重：命中返回 { reason, digest }，不命中返回 null（调用方照常投递）。
+ * 主判据是 contentHash：表里有摘要且与当前字节一致 ⇒ 重复；不一致 ⇒ 必须放行（不看 mtime）。
+ * 表里没有摘要（v1 旧条目）或文件读不到 ⇒ 退回「30 秒内同 size/mtime」第二道。
+ */
+function dedupeVerdict(ctx, stateDir, watchDir, relName, state, now = Date.now()) {
   const reg = loadDedupeRegistry(ctx, stateDir);
   const bucket = dirEntriesOf(reg, watchDir);
-  if (!bucket) return false;
+  if (!bucket) return null;
   const entry = bucket[path.resolve(watchDir, relName)];
-  if (!entry || entry.size !== state.size || entry.mtimeMs !== state.mtimeMs) return false;
+  if (!entry) return null;
   const at = Date.parse(entry.at);
-  return Number.isFinite(at) && now - at < DEDUPE_WINDOW_MS;
+  const legacyHit = entry.size === state.size && entry.mtimeMs === state.mtimeMs
+    && Number.isFinite(at) && now - at < DEDUPE_WINDOW_MS;
+  const stored = typeof entry.contentHash === 'string' ? entry.contentHash : '';
+  if (stored) {
+    const current = contentHashOfFile(path.join(watchDir, relName));
+    if (!current) return null;                 // 读不到内容：不判重，交给投递链路自己处理
+    if (current !== stored) return null;       // 内容变逾 1 字节 ⇒ 必须放行
+    // size/mtime 也同时命中且在同窗口内时沿用旧文案：既有回归断言就是这么写的。
+    return { reason: legacyHit ? '重复(size,mtime 相同)' : '重复(内容)', digest: current };
+  }
+  if (!legacyHit) return null;
+  return { reason: '重复(size,mtime 相同)', digest: contentHashOfFile(path.join(watchDir, relName)) || 'unreadable' };
 }
 
-function skipDuplicate(ctx, stateDir, watchDir, relName) {
-  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 去重跳过 ${watchDir} ${relName} 原因=重复(size,mtime 相同)`);
+/** 跳过留痕：target / file / digest 三个字段缺一不可（digest = contentHash 前 12 位）。 */
+function skipDuplicate(ctx, stateDir, watchDir, relName, verdict) {
+  const digest = String((verdict && verdict.digest) || '').slice(0, 12) || 'unreadable';
+  const reason = (verdict && verdict.reason) || '重复(内容)';
+  relayLog(ctx, stateDir, 'info', `去重跳过 target=${dirKeyOf(watchDir)} file=${path.basename(relName)} digest=${digest} 原因=${reason}`);
 }
 
 /** 启动扫描基准：mtime 必须晚于该 dir 最后一次成功投递时刻，而不是本次启动时刻。 */
@@ -462,7 +491,8 @@ function isStartupNew(ctx, stateDir, watchDir, relName, state, onFirstRun) {
   }
   const last = lastDeliveredAtMs(bucket);
   if (last === null || state.mtimeMs > last) return true;
-  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 去重跳过 ${watchDir} ${relName} 原因=启动前旧文件(mtime<=lastDeliveredAt)`);
+  const digest = contentHashOfFile(path.join(watchDir, relName)).slice(0, 12) || 'unreadable';
+  relayLog(ctx, stateDir, 'info', `去重跳过 target=${dirKeyOf(watchDir)} file=${path.basename(relName)} digest=${digest} 原因=启动前旧文件(mtime<=lastDeliveredAt)`);
   return false;
 }
 
@@ -1142,8 +1172,9 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
 
   function deliver(relName, state, reason) {
     if (isFailedSnapshot(relName, state)) { skipFailed(relName); return; }
-    if (isDuplicateSnapshot(ctx, stateDir, watchDir, relName, state)) {
-      skipDuplicate(ctx, stateDir, watchDir, relName);
+    const verdict = dedupeVerdict(ctx, stateDir, watchDir, relName, state);
+    if (verdict) {
+      skipDuplicate(ctx, stateDir, watchDir, relName, verdict);
       return;
     }
     clearTimeout(state.timer);
@@ -1203,8 +1234,9 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const key = `${relName}|${sig}`;
     if (startupOld.has(key)) return;
     if (isFailedSnapshot(relName, { mtimeMs: st.mtimeMs, size: st.size })) { skipFailed(relName); return; }
-    if (isDuplicateSnapshot(ctx, stateDir, watchDir, relName, { size: st.size, mtimeMs: st.mtimeMs })) {
-      skipDuplicate(ctx, stateDir, watchDir, relName);
+    const verdict = dedupeVerdict(ctx, stateDir, watchDir, relName, { size: st.size, mtimeMs: st.mtimeMs });
+    if (verdict) {
+      skipDuplicate(ctx, stateDir, watchDir, relName, verdict);
       return;
     }
     if (startup && !isStartupNew(ctx, stateDir, watchDir, relName, { size: st.size, mtimeMs: st.mtimeMs }, () => {
