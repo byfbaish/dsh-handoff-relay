@@ -51,6 +51,8 @@ function buildConfigSchema(z) {
       targetTitle: z.string().default(''),
       targetSessionId: z.string().default(''),
       exact: z.boolean().default(true),
+      // P54-fix2：可选目录归属标签；写进 schema 才不会被宿主解析时丢掉（缺省空串 = P54 行为）。
+      fromRole: z.string().default(''),
       done: z.any(),
     })).volatile().default([]),
     stableMs: z.number().default(DEFAULT_STABLE_MS).volatile(),
@@ -418,19 +420,33 @@ function contentHashOfFile(full) {
   try { return createHash('sha256').update(fs.readFileSync(full)).digest('hex'); } catch { return ''; }
 }
 
-function rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, state) {
+/**
+ * 记一条已投件快照（判重表）。P54-fix2：额外写入审计字段 `watchDir`（本函数自带）、
+ * `targetSessionId`、`fileHash`（文件字节 sha256 前 12 位，与日志 digest 同口径）、
+ * `injectedHeader`（两行头文本）、以及冲突时的 `fromConflict: true`。
+ * 审计字段只在 meta 给出时写入；缺省条目形状仍是 P54 的 {size,mtimeMs,contentHash,at}。
+ * 读侧只校验 size/mtimeMs/at，旧条目缺这些字段既不会报错也不会被清空。
+ */
+function rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, state, meta) {
   const reg = loadDedupeRegistry(ctx, stateDir);
   const dirKey = dirKeyOf(watchDir);
   const bucket = reg.dirs[dirKey] || (reg.dirs[dirKey] = {});
   const contentHash = typeof state.contentHash === 'string' && state.contentHash
     ? state.contentHash
     : contentHashOfFile(path.join(watchDir, relName));
-  bucket[path.resolve(watchDir, relName)] = {
+  const entry = {
     size: state.size,
     mtimeMs: state.mtimeMs,
     contentHash,
     at: new Date().toISOString(),
   };
+  const m = meta || {};
+  entry.watchDir = path.resolve(watchDir);
+  if (typeof m.targetSessionId === 'string' && m.targetSessionId) entry.targetSessionId = m.targetSessionId;
+  if (typeof m.fileHash === 'string' && m.fileHash) entry.fileHash = m.fileHash;
+  if (typeof m.injectedHeader === 'string' && m.injectedHeader) entry.injectedHeader = m.injectedHeader;
+  if (m.fromConflict === true) entry.fromConflict = true;
+  bucket[path.resolve(watchDir, relName)] = entry;
   persistDedupeRegistry(ctx, stateDir, reg);
 }
 
@@ -825,21 +841,42 @@ function stripIdentityLines(text) {
 }
 
 /**
- * 身份头两行固定在最前，字段分隔用 ` · ` 与 ASCII ` | `：
+ * P54-fix2：From 取值优先级（顺序不可调）——
+ *   桩件正文首条 `From:` ＞ 该 watch 的 `fromRole` ＞ `UNKNOWN`。
+ * `fromRole` 只是「哪个 watch 目录收到了这个文件」的归属标签，**不是身份证明**：
+ * 任何能写 watch 目录的人都能造一份带 From: 的桩件，头只用于核对误投。
+ * 两者同时存在且字符串不等 ⇒ conflict=true；注入仍用正文值（正文更具体）。
+ * @returns {{ fromText: string, conflict: boolean, stubFrom: string, watchFrom: string }}
+ */
+function resolveFromText(stubFrom, watchFrom) {
+  const stub = String(stubFrom || '');
+  const watch = String(watchFrom || '');
+  const fromText = stub || watch || IDENTITY_UNKNOWN;
+  const conflict = stub !== '' && watch !== '' && stub !== watch;
+  return { fromText, conflict, stubFrom: stub, watchFrom: watch };
+}
+
+/**
+ * 身份头两行，字段分隔用 ` · ` 与 ASCII ` | `：
  *   From: <角色> · <群名后缀> | <session前8位>
  *   To: <目标会话标题> | <session前8位> | <主身/群分身>
  * identity = { title, id8, kind, fromText }；任何一项缺失都落到安全兜底值。
+ * 头文本只在这一处生成：注入与 `delivered` 审计字段 `injectedHeader` 同源。
  */
-function buildMessage(relName, fullPath, state, reason, template, identity) {
-  const text = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
-    .replaceAll('{reason}', reason)
-    .replaceAll('{size}', String(state.size)).replaceAll('{mtimeMs}', String(state.mtimeMs));
+function buildIdentityHead(identity) {
   const id = identity || {};
   const fromText = String(id.fromText || '') || IDENTITY_UNKNOWN;
   const title = String(id.title || '') || IDENTITY_FALLBACK_TITLE;
   const id8 = String(id.id8 || '');
   const kind = String(id.kind || '') || '主身';
-  const head = `From: ${fromText}\nTo: ${title} | ${id8} | ${kind}\n`;
+  return `From: ${fromText}\nTo: ${title} | ${id8} | ${kind}\n`;
+}
+
+function buildMessage(relName, fullPath, state, reason, template, identity) {
+  const text = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
+    .replaceAll('{reason}', reason)
+    .replaceAll('{size}', String(state.size)).replaceAll('{mtimeMs}', String(state.mtimeMs));
+  const head = buildIdentityHead(identity);
   return Object.freeze({
     id: randomUUID(),
     role: 'user',
@@ -921,6 +958,10 @@ export function serializeWatchesBlock(watches, indent = '    ') {
       out.push(`${indent}    targetTitle: ${yamlQuote(w.targetTitle)}`);
     }
     if (w && w.exact === true) out.push(`${indent}    exact: true`);
+    // P54-fix2：fromRole 是可选字段；只在有值时写出，缺省时整行省略（与 P54 的块形状一致）。
+    if (w && typeof w.fromRole === 'string' && w.fromRole) {
+      out.push(`${indent}    fromRole: ${yamlQuote(w.fromRole)}`);
+    }
     serializeDoneLines(w && w.done, out);
   }
   return out.join('\n');
@@ -928,7 +969,7 @@ export function serializeWatchesBlock(watches, indent = '    ') {
 
 /**
  * 从 cordis.patch.yml 源码里解析第一条 dsh-handoff-relay 条目的 config.watches。
- * 只支持本插件自己写出的子集（dir/targetSessionId/targetTitle/exact/done.text/done.regex）。
+ * 只支持本插件自己写出的子集（dir/targetSessionId/targetTitle/exact/fromRole/done.text/done.regex）。
  * @returns {Array<object>|null} 找不到条目或 watches 时返回 null。
  */
 export function parseWatchesFromYml(source) {
@@ -989,6 +1030,7 @@ export function parseWatchesFromYml(source) {
       if (name === 'targetSessionId') item.targetSessionId = unquote(raw);
       else if (name === 'targetTitle') item.targetTitle = unquote(raw);
       else if (name === 'exact') item.exact = raw === 'true';
+      else if (name === 'fromRole') item.fromRole = unquote(raw);
       doneOwner = null;
     }
   }
@@ -1142,7 +1184,11 @@ async function mountSettingsCard(ctx, configWatches, stateDir) {
   }
 }
 
-function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deliveredRoot, stateDir) {
+/**
+ * 一条 watch 的运行时。fromRole（P54-fix2，可选）是该 watch 的目录归属标签：
+ * 桩件里没有 `From:` 行时用它兜底，冲突时只上报不覆盖正文值。
+ */
+function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deliveredRoot, stateDir, fromRole = '') {
   const pending = new Map();   // relName → { size, mtimeMs, sig, timer }；不轮询
   const startupOld = new Set(); // 启动扫描判为旧文件的 relName|sig，防止同快照后续事件再次投递
   let firstRunNoted = false;
@@ -1237,18 +1283,39 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     }
     // P54：To 由 relay 生成——标题优先取 resolved.title（resolveNow 已带回），
     // 缺失再 sessionTitleOf(ctx, agent)，都取不到写 (无标题)；id8 取 resolved.id 前 8 位；
-    // 标题含 ` · ` 判群分身，否则主身。From 只认桩件正文首条 `From: `，猜不出就写 UNKNOWN。
+    // 标题含 ` · ` 判群分身，否则主身。
+    // P54-fix2：From 优先级 = 桩件正文首条 `From:` ＞ 该 watch 的 fromRole ＞ UNKNOWN；
+    // 两者并存且不等 ⇒ 仍注入正文值，另写一行 `身份冲突` 并在条目里标 fromConflict。
     const title = resolved.title || sessionTitleOf(ctx, agent) || IDENTITY_FALLBACK_TITLE;
     const id8 = String(resolved.id || '').slice(0, 8);
     const kind = title.includes(' · ') ? '群分身' : '主身';
     const fromLine = readStubFromLine(full);
-    const fromText = fromLine ? fromLine.replace(/^From: /, '') : IDENTITY_UNKNOWN;
-    const message = buildMessage(relName, full, state, reason, cfg.message, { title, id8, kind, fromText });
+    const stubFrom = fromLine ? fromLine.replace(/^From: /, '') : '';
+    const from = resolveFromText(stubFrom, fromRole);
+    const identity = { title, id8, kind, fromText: from.fromText };
+    const message = buildMessage(relName, full, state, reason, cfg.message, identity);
+    // 审计字段 injectedHeader 与注入同源：两行头文本（不带尾换行）。
+    const injectedHeader = buildIdentityHead(identity).replace(/\n$/, '');
+    const fileDigest = typeof state.contentHash === 'string' && state.contentHash
+      ? state.contentHash
+      : contentHashOfFile(full);
     try {
       agent.followup(message);
-      rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, state);
+      rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, {
+        size: state.size,
+        mtimeMs: state.mtimeMs,
+        contentHash: fileDigest,
+      }, {
+        targetSessionId: resolved.id,
+        fileHash: fileDigest.slice(0, 12),
+        injectedHeader,
+        fromConflict: from.conflict,
+      });
       log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${resolved.id}（${label}，文件=${full}，触发=${reason}）`);
-      relayLog(ctx, stateDir, 'info', `注入身份 from=${fromText} to=${id8}|${title}|${kind}`);
+      relayLog(ctx, stateDir, 'info', `注入身份 from=${from.fromText} to=${id8}|${title}|${kind}`);
+      if (from.conflict) {
+        relayLog(ctx, stateDir, 'warn', `身份冲突 relName=${path.basename(relName)} stub=${from.stubFrom} watch=${from.watchFrom}`);
+      }
       // 移动放在微任务里：同步投递路径（含测试里的 stat 断言）不感知文件尚未移走。
       queueMicrotask(() => takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full, state, stateDir));
     } catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] followup 抛错：${String(err)}`); }
@@ -1348,7 +1415,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     ? `解析到 ${atLoad.id}（${atLoad.title}）`
     : '解析不到，投递时会跳过';
   const deliveredText = deliveredDirFor(deliveredRoot, watchDir);
-  log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已加载：dir=${watchDir}，目标=${targetText} → ${resolvedText}，stableMs=${cfg.stableMs}，done=${mode}，delivered=${deliveredText}`);
+  log(ctx, 'info', `[${PLUGIN_NAME}] ${label} 已加载：dir=${watchDir}，目标=${targetText} → ${resolvedText}，stableMs=${cfg.stableMs}，done=${mode}，delivered=${deliveredText}${fromRole ? `，fromRole=${fromRole}（目录归属标签，非身份证明）` : ''}`);
   return dispose;
 }
 
@@ -1424,6 +1491,17 @@ export function apply(ctx, config = {}) {
     if (done.error) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 done 规则未启用，退回只按 stableMs 投递：${done.error}（dir=${dir}）`);
     }
+    // P54-fix2：fromRole 是可选的目录归属标签（字符串）。缺省 ⇒ 行为与 P54 完全一致；
+    // 空串/纯空白等同于没写（schema 默认值就是空串，不能因此告警）；
+    // 非字符串只 warn 并按缺省处理，绝不因此跳过整条 watch。
+    const rawFromRole = w && w.fromRole;
+    let fromRole = '';
+    if (typeof rawFromRole === 'string') {
+      fromRole = rawFromRole.trim();
+    } else if (rawFromRole !== undefined && rawFromRole !== null) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 fromRole 无效，已按缺省处理（只接受非空字符串，当前=${JSON.stringify(rawFromRole)}，类型=${typeof rawFromRole}，dir=${dir}）`);
+      relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] ${label} fromRole 无效已按缺省处理：dir=${dir} ${JSON.stringify(rawFromRole)}（${typeof rawFromRole}）`);
+    }
     const target = hasTitle
       ? { kind: 'title', value: rawTitle.trim(), exact, id: hasId ? rawId.trim() : undefined }
       : { kind: 'id', value: rawId, exact };
@@ -1440,7 +1518,7 @@ export function apply(ctx, config = {}) {
     }
     // 加载期每条 watch 一行解析结果（含 dir 与原样目标标识）：下次解析不到时能定位到是哪条 watch。
     relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] ${label} 加载解析 dir=${dir} 目标=${targetLabel} ${atLoad.status}`);
-    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root, stateDir);
+    const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root, stateDir, fromRole);
     if (d) { disposers.push(d); startedModes.push(done.mode); }
   });
   log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);

@@ -3648,6 +3648,201 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   });
 }
 
+// --------------------------------- P54-fix2：From 目录归属（fromRole）+ 冲突上报 + 审计字段
+// 事故形态：relay 只认识「哪个 watch 目录收到了文件」，不认识发件人；正文缺 From 时全体 UNKNOWN，
+// 目录归属在事后无从回读。契约：正文 From ＞ fromRole ＞ UNKNOWN（顺序不可调）；两者不等只上报、
+// 注入仍用正文值；delivered 条目补四个审计字段，旧条目缺字段照读不报错、不被清空。
+{
+  const stateDir = path.join(suiteProfileRoot, 'dsh-handoff-relay');
+  const dedupeFile = path.join(stateDir, 'dedupe.json');
+  const relayLogFile = path.join(stateDir, 'relay.log');
+  const readDedupeRaw = () => {
+    try { return JSON.parse(fs.readFileSync(dedupeFile, 'utf8')); } catch { return {}; }
+  };
+  const entryOf = (d, name) => {
+    const bucket = readDedupeRaw()[dirKey(d)] || {};
+    return bucket[path.resolve(d, name)] || null;
+  };
+  const relayLinesMatching = (needle) => {
+    try {
+      return fs.readFileSync(relayLogFile, 'utf8').split('\n').filter((line) => line.includes(needle));
+    } catch { return []; }
+  };
+  const conflictLinesOf = (name) => relayLinesMatching(`身份冲突 relName=${name} `);
+  const textOf = (calls) => (calls.length ? calls[0].content[0].text : '');
+  const linesOf = (text) => String(text).split('\n');
+  const countHead = (text, prefix) => linesOf(text).filter((line) => line.startsWith(prefix)).length;
+  const body = 'x\n<!-- DONE -->\n';
+  const digest12 = (text) => createHash('sha256').update(Buffer.from(text)).digest('hex').slice(0, 12);
+  const checkAsync = async (label, fn) => {
+    try {
+      await fn();
+      results.push(`PASS  ${label}`);
+      out(`PASS  ${label}`);
+    } catch (err) {
+      failed += 1;
+      results.push(`FAIL  ${label} :: ${err.message}`);
+      out(`FAIL  ${label} :: ${err.message}`);
+    }
+  };
+
+  const ROLE_A = '豆包联络人 · AI writer项目组 | c12ee7f6';
+  const ROLE_B = '大肥鱼 · AI writer项目组 | a1d48adb';
+
+  // 一条 watch 一次投递：尾带 DONE ⇒ 当拍投递，同步可断言。
+  const f2Run = (opts = {}) => {
+    const d = tmp();
+    const id = opts.id || 'F2TARGET0001';
+    const name = opts.name;
+    const calls = [];
+    const box = capturingWatch();
+    const ctx = makeTitleCtx(calls, [{ id, title: opts.title === undefined ? 'F2 收件箱' : opts.title }]);
+    const watch = { dir: d, targetSessionId: id };
+    if (opts.fromRole !== undefined) watch.fromRole = opts.fromRole;
+    const disp = withFs(box.patch, () => apply(ctx, { watches: [watch], stableMs: 120 }));
+    fs.writeFileSync(path.join(d, name), opts.stub === undefined ? body : opts.stub);
+    box.cb('change', name);
+    disp();
+    return { d, name, id, calls };
+  };
+
+  // T1 只有 fromRole、正文没有 From ⇒ 注入 fromRole 值；无冲突日志、无 fromConflict
+  const t1 = f2Run({ name: 'p54f2-t1.txt', fromRole: ROLE_A });
+  check('P54-fix2 T1 只有 fromRole、正文无 From → 注入 fromRole 值，无冲突日志、无 fromConflict', () => {
+    assert.equal(t1.calls.length, 1, `期望 1 次投递，实际 ${t1.calls.length}`);
+    const lines = linesOf(textOf(t1.calls));
+    assert.equal(lines[0], `From: ${ROLE_A}`, `From 应取 fromRole：${JSON.stringify(lines[0])}`);
+    assert.equal(lines[1], 'To: F2 收件箱 | F2TARGET | 主身', `To 不符：${JSON.stringify(lines[1])}`);
+    const hits = conflictLinesOf(t1.name);
+    assert.equal(hits.length, 0, `只有 fromRole 不应记冲突：${JSON.stringify(hits)}`);
+    const entry = entryOf(t1.d, t1.name);
+    assert.ok(entry, '应写入 dedupe 条目');
+    assert.equal(entry.fromConflict, undefined, '无冲突不得写 fromConflict');
+  });
+
+  // T2 正文 From 与 fromRole 相同 ⇒ 只注入一次；不算冲突
+  const t2 = f2Run({ name: 'p54f2-t2.txt', fromRole: ROLE_A, stub: `From: ${ROLE_A}\nx\n<!-- DONE -->\n` });
+  check('P54-fix2 T2 正文 From 与 fromRole 相同 → 注入一次，无冲突日志、无 fromConflict', () => {
+    assert.equal(t2.calls.length, 1, `期望 1 次投递，实际 ${t2.calls.length}`);
+    const text = textOf(t2.calls);
+    assert.equal(linesOf(text)[0], `From: ${ROLE_A}`, `From 不符：${JSON.stringify(linesOf(text)[0])}`);
+    assert.equal(countHead(text, 'From: '), 1, `From: 应恰好 1 行：${text}`);
+    const hits = conflictLinesOf(t2.name);
+    assert.equal(hits.length, 0, `相等不算冲突：${JSON.stringify(hits)}`);
+    assert.equal(entryOf(t2.d, t2.name).fromConflict, undefined, '相等时不得写 fromConflict');
+  });
+
+  // T3 两者不同 ⇒ 注入正文值 + 一行 `身份冲突 …` + 条目 fromConflict: true
+  const t3 = f2Run({ name: 'p54f2-t3.txt', fromRole: ROLE_A, stub: `From: ${ROLE_B}\nx\n<!-- DONE -->\n` });
+  check('P54-fix2 T3 两者不同 → 注入正文值 ＋ 日志 身份冲突 ＋ 条目 fromConflict: true', () => {
+    assert.equal(t3.calls.length, 1, `期望 1 次投递，实际 ${t3.calls.length}`);
+    assert.equal(linesOf(textOf(t3.calls))[0], `From: ${ROLE_B}`, '冲突时注入仍用正文值');
+    const hits = conflictLinesOf(t3.name);
+    assert.equal(hits.length, 1, `应恰好 1 行冲突日志，实际 ${hits.length}`);
+    assert.ok(hits[0].includes(`身份冲突 relName=${t3.name} stub=${ROLE_B} watch=${ROLE_A}`),
+      `冲突行字段不符：${JSON.stringify(hits[0])}`);
+    const entry = entryOf(t3.d, t3.name);
+    assert.equal(entry.fromConflict, true, `冲突条目必须 fromConflict: true：${JSON.stringify(entry)}`);
+  });
+
+  // T4 两者都没有 ⇒ From: UNKNOWN
+  const t4 = f2Run({ name: 'p54f2-t4.txt' });
+  check('P54-fix2 T4 正文与 fromRole 都没有 → From: UNKNOWN', () => {
+    assert.equal(t4.calls.length, 1, `期望 1 次投递，实际 ${t4.calls.length}`);
+    assert.equal(linesOf(textOf(t4.calls))[0], 'From: UNKNOWN');
+    assert.equal(entryOf(t4.d, t4.name).fromConflict, undefined, '无 fromRole 不得写 fromConflict');
+  });
+
+  // T5 审计四字段齐，且与当次投递一致
+  const t5 = f2Run({ name: 'p54f2-t5.txt', fromRole: ROLE_A });
+  check('P54-fix2 T5 审计四字段齐：watchDir / targetSessionId / fileHash / injectedHeader', () => {
+    assert.equal(t5.calls.length, 1, `期望 1 次投递，实际 ${t5.calls.length}`);
+    const entry = entryOf(t5.d, t5.name);
+    assert.ok(entry, '应写入 dedupe 条目');
+    assert.equal(entry.watchDir, path.resolve(t5.d), `watchDir 应是该 watch 的绝对路径：${entry.watchDir}`);
+    assert.equal(entry.targetSessionId, t5.id, `targetSessionId 应是本次目标：${entry.targetSessionId}`);
+    assert.equal(entry.fileHash, digest12(body), `fileHash 应是文件 sha256 前 12 位：${entry.fileHash}`);
+    const lines = linesOf(textOf(t5.calls));
+    assert.equal(entry.injectedHeader, `${lines[0]}\n${lines[1]}`,
+      `injectedHeader 应是注入的两行头：${JSON.stringify(entry.injectedHeader)}`);
+    assert.equal(typeof entry.contentHash === 'string' && entry.contentHash.length, 64,
+      'contentHash 仍是完整 sha256（判重键未改）');
+  });
+
+  // T6 旧条目（P54 形状：无 contentHash、无审计字段）读取不报错、不被清空
+  await checkAsync('P54-fix2 T6 旧条目（无新字段）读取不报错、不被清空、仍参与判重', async () => {
+    const d = tmp();
+    const legacyName = 'p54f2-legacy.txt';
+    const legacyPath = path.join(d, legacyName);
+    fs.writeFileSync(legacyPath, 'old\n');
+    const legacyStat = fs.statSync(legacyPath);
+    const futureAt = new Date(Date.now() + 60 * 1000).toISOString();
+    const legacyEntry = { size: legacyStat.size, mtimeMs: legacyStat.mtimeMs, at: futureAt };
+    const seeded = readDedupeRaw();
+    seeded[dirKey(d)] = { [path.resolve(legacyPath)]: legacyEntry };
+    fs.writeFileSync(dedupeFile, `${JSON.stringify(seeded, null, 2)}\n`, 'utf8');
+
+    const freshName = 'p54f2-fresh.txt';
+    const freshPath = path.join(d, freshName);
+    fs.writeFileSync(freshPath, body);
+    const futureSec = Math.floor(Date.now() / 1000) + 120;
+    fs.utimesSync(freshPath, futureSec, futureSec);   // mtime 晚于旧条目的 at ⇒ 启动扫描判为新
+
+    warnings.length = 0;
+    const calls = [];
+    const box = capturingWatch();
+    const ctx = makeTitleCtx(calls, [{ id: 'F2LEGACY001', title: 'F2 旧表' }]);
+    // 必须用全新模块实例：本进程内存里的判重表是套件早段载入的，看不到刚播下的旧条目。
+    const reloadMod = await import(new URL(`./index.js?p54f2legacy=${Date.now()}`, import.meta.url).href);
+    const disp = withFs(box.patch, () => reloadMod.apply(ctx, {
+      watches: [{ dir: d, targetSessionId: 'F2LEGACY001' }], stableMs: 120,
+    }));
+    await sleep(60);
+
+    assert.equal(calls.length, 1, `旧条目应让旧文件在启动扫描里被跳过，只投新文件；实际 ${calls.length}`);
+    assert.ok(calls[0].content[0].text.includes(freshName), '投递的应是 mtime 晚于 lastDeliveredAt 的新文件');
+    assert.equal(warnings.some((m) => m.includes('坏档')), false, `旧条目不得被判坏档：${JSON.stringify(warnings)}`);
+    const after = readDedupeRaw();
+    assert.deepEqual((after[dirKey(d)] || {})[path.resolve(legacyPath)], legacyEntry,
+      `旧条目必须原样保留：${JSON.stringify((after[dirKey(d)] || {})[path.resolve(legacyPath)])}`);
+    const freshEntry = (after[dirKey(d)] || {})[path.resolve(freshPath)];
+    assert.ok(freshEntry && freshEntry.watchDir && freshEntry.targetSessionId,
+      `同一次落盘的新条目应带审计字段：${JSON.stringify(freshEntry)}`);
+    disp();
+  });
+
+  // 补充 1：fromRole 非字符串 ⇒ 只 warn 并按缺省处理；空串/纯空白 ⇒ 静默按缺省（schema 默认值就是空串）
+  warnings.length = 0;
+  const t7 = f2Run({ name: 'p54f2-t7.txt', fromRole: 123 });
+  const t8 = f2Run({ name: 'p54f2-t8.txt', fromRole: '   ' });
+  check('P54-fix2 补充 fromRole 非字符串 → 只 warn 并按缺省处理；空白串静默按缺省（不刷 warn）', () => {
+    assert.equal(t7.calls.length, 1, `非法 fromRole 不得跳过整条 watch，实际 ${t7.calls.length}`);
+    assert.equal(linesOf(textOf(t7.calls))[0], 'From: UNKNOWN');
+    assert.equal(t8.calls.length, 1, `空白串不得跳过整条 watch，实际 ${t8.calls.length}`);
+    assert.equal(linesOf(textOf(t8.calls))[0], 'From: UNKNOWN', '空白串等同于没写');
+    const invalid = warnings.filter((m) => m.includes('fromRole 无效'));
+    assert.equal(invalid.length, 1, `只有非字符串才 warn（schema 空串不得刷 warn）：${JSON.stringify(invalid)}`);
+  });
+
+  // 补充 2：fromRole 必须能随 yml 往返（否则设置卡保存会静默吞掉该字段）
+  check('P54-fix2 补充 yml 往返保留 fromRole（设置卡保存不吞字段）', () => {
+    const yml = [
+      '- id: dsh-handoff-relay',
+      '  config:',
+      '    watches:',
+      '',
+      '- id: other-plugin',
+      '',
+    ].join('\n');
+    const watches = [{ dir: 'C:/watch/a', targetTitle: '甲', fromRole: ROLE_A }];
+    const written = replaceWatchesInYml(yml, watches);
+    assert.ok(written.includes("fromRole: '豆包联络人 · AI writer项目组 | c12ee7f6'"),
+      `yml 写回缺 fromRole：${written}`);
+    const parsed = parseWatchesFromYml(written);
+    assert.equal(parsed && parsed[0] && parsed[0].fromRole, ROLE_A, `yml 回读不到 fromRole：${JSON.stringify(parsed)}`);
+  });
+}
+
 console.log('\n===== 自测汇总 =====');
 for (const r of results) console.log(r);
 console.log(`TOTAL: ${results.length - failed}/${results.length} PASS`);
