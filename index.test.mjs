@@ -322,7 +322,9 @@ const infoCtx = (calls, opts) => {
   const st = fs.statSync(f);
   check('自定义 message 模板替换 {file}/{reason}/{size}/{mtimeMs}', () => {
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].content[0].text, `F=tpl.txt|R=DONE|S=${st.size}|M=${st.mtimeMs}`);
+    // P54：注入文本最前面是 relay 前置的 From:/To: 两行身份头，正文仍是模板原样渲染结果。
+    assert.ok(calls[0].content[0].text.endsWith(`F=tpl.txt|R=DONE|S=${st.size}|M=${st.mtimeMs}`),
+      calls[0].content[0].text);
   });
   disp();
 }
@@ -1106,7 +1108,9 @@ function makeTitleCtx(calls, entries, opts = {}) {
   box.cb('change', 'abs.txt');
   check('P6 投递文案含文件绝对路径（默认模板 {path}）', () => {
     assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
-    assert.equal(calls[0].content[0].text, `文件 ${f} 已就绪（触发=DONE），请继续。`);
+    // P54：前置 From:/To: 两行身份头，正文文案不变（仍是默认模板 + 绝对路径）。
+    assert.ok(calls[0].content[0].text.endsWith(`文件 ${f} 已就绪（触发=DONE），请继续。`),
+      calls[0].content[0].text);
     assert.ok(path.isAbsolute(f));
   });
   disp();
@@ -3554,6 +3558,93 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.deepEqual(result, { kind: 'none', absolute: '', reason: 'forbidden' });
     const body = JSON.parse(res.out.body);
     assert.equal(body.error, 'forbidden');
+  });
+}
+
+// ---------------------------------------------------- P54：注入身份头（From / To 前置两行）
+// 事故形态（11-15）：注入消息不写发送者身份，伪造授权被送到错误会话时接收方无从分辨。
+// 契约：正文最前两行固定 From:/To:，由 relay 前置，自定义 message 模板也绕不过；
+//       From 只认桩件首条 `From: `，猜不出写 UNKNOWN；To 由 relay 用 resolved.title 生成。
+{
+  const p54Run = (opts = {}) => {
+    const id = opts.id || 'P54SESS0001';
+    const d = tmp();
+    const calls = [];
+    const box = capturingWatch();
+    const ctx = makeTitleCtx(calls, [{ id, title: opts.title === undefined ? '' : opts.title }]);
+    const cfg = { watches: [{ dir: d, targetSessionId: id }], stableMs: 120 };
+    if (opts.message !== undefined) cfg.message = opts.message;
+    const disp = withFs(box.patch, () => apply(ctx, cfg));
+    fs.writeFileSync(path.join(d, 'p54.txt'), opts.stub === undefined ? 'x\n<!-- DONE -->\n' : opts.stub);
+    box.cb('change', 'p54.txt');           // 尾带 DONE ⇒ 当拍投递，同步可断言
+    disp();
+    return calls;
+  };
+  const textOf = (calls) => (calls.length ? calls[0].content[0].text : '');
+  const linesOf = (text) => String(text).split('\n');
+  const countHead = (text, prefix) => linesOf(text).filter((l) => l.startsWith(prefix)).length;
+
+  // T1 桩件没有 From: 行 ⇒ From: UNKNOWN；To 用标题 / id8 / kind
+  const t1Calls = p54Run();
+  check('P54 T1 桩件无 From: 行 → 头第一行 From: UNKNOWN，第二行 To: <标题> | <id8> | <kind>', () => {
+    assert.equal(t1Calls.length, 1, `期望 1 次投递，实际 ${t1Calls.length}`);
+    const lines = linesOf(textOf(t1Calls));
+    assert.equal(lines[0], 'From: UNKNOWN', `第一行应为 From: UNKNOWN，实际 ${JSON.stringify(lines[0])}`);
+    assert.equal(lines[1], 'To: (无标题) | P54SESS0 | 主身', `第二行 To 不符：${JSON.stringify(lines[1])}`);
+    assert.ok(lines[2].includes('p54.txt'), `第三行起才是正文：${JSON.stringify(lines[2])}`);
+  });
+
+  // T2 桩件首行带 From: ⇒ 原文采用该值，且注入文本里 From: 仍只有一行
+  const t2Calls = p54Run({
+    id: 'P54GRP000001',
+    title: '群分身收件箱 · AI writer项目组',
+    stub: 'From: 豆包联络人 · AI writer项目组 | c12ee7f6\nx\n<!-- DONE -->\n',
+  });
+  check('P54 T2 桩件首行带 From: → 原文采用，不重复插第二行 From:，标题含 · 判群分身', () => {
+    assert.equal(t2Calls.length, 1, `期望 1 次投递，实际 ${t2Calls.length}`);
+    const text = textOf(t2Calls);
+    const lines = linesOf(text);
+    assert.equal(lines[0], 'From: 豆包联络人 · AI writer项目组 | c12ee7f6', `From 应原样：${JSON.stringify(lines[0])}`);
+    assert.equal(lines[1], 'To: 群分身收件箱 · AI writer项目组 | P54GRP00 | 群分身', `To 不符：${JSON.stringify(lines[1])}`);
+    assert.equal(countHead(text, 'From: '), 1, `From: 应恰好 1 行：${text}`);
+  });
+
+  // T3 自定义 message 不含任何占位符 ⇒ 仍然前置两行头（防配置绕过）
+  const t3Calls = p54Run({ id: 'P54TPL000001', title: '模板收件箱', message: '这条模板不含任何占位符。' });
+  check('P54 T3 自定义 message 无占位符 → 仍然有前置两行头（配置不能绕过）', () => {
+    assert.equal(t3Calls.length, 1, `期望 1 次投递，实际 ${t3Calls.length}`);
+    const lines = linesOf(textOf(t3Calls));
+    assert.equal(lines[0], 'From: UNKNOWN', `第一行应为 From: UNKNOWN，实际 ${JSON.stringify(lines[0])}`);
+    assert.equal(lines[1], 'To: 模板收件箱 | P54TPL00 | 主身', `第二行 To 不符：${JSON.stringify(lines[1])}`);
+    assert.equal(lines[2], '这条模板不含任何占位符。', `第三行应是模板正文：${JSON.stringify(lines[2])}`);
+  });
+
+  // T4 目标会话取不到标题 ⇒ To: (无标题) | <id8> | 主身
+  const t4Calls = p54Run({ id: 'P54NOTITLE01', title: '' });
+  check('P54 T4 目标会话取不到标题 → To: (无标题) | <id8> | 主身', () => {
+    assert.equal(t4Calls.length, 1, `期望 1 次投递，实际 ${t4Calls.length}`);
+    assert.equal(linesOf(textOf(t4Calls))[1], 'To: (无标题) | P54NOTIT | 主身',
+      `To 应落 (无标题) 兜底：${JSON.stringify(linesOf(textOf(t4Calls))[1])}`);
+  });
+
+  // T5 任意用例：注入文本里 ^From: 与 ^To: 各恰好 1 行（机检口径）
+  check('P54 T5 所有用例注入文本里 ^From: 与 ^To: 各恰好 1 行', () => {
+    for (const calls of [t1Calls, t2Calls, t3Calls, t4Calls]) {
+      const text = textOf(calls);
+      assert.equal(countHead(text, 'From: '), 1, `From: 行数不符：${text}`);
+      assert.equal(countHead(text, 'To: '), 1, `To: 行数不符：${text}`);
+    }
+  });
+
+  // 补充：注入身份要能被第三方从 relay.log 回读（不依赖内存）
+  check('P54 补充 每次投递在 relay.log 追加 注入身份 from=… to=<id8>|<标题>|<kind>', () => {
+    const logFile = path.join(suiteProfileRoot, 'dsh-handoff-relay', 'relay.log');
+    let log = '';
+    try { log = fs.readFileSync(logFile, 'utf8'); } catch { log = ''; }
+    assert.ok(log.includes('注入身份 from=UNKNOWN to=P54SESS0|(无标题)|主身'),
+      `缺 T1 的注入身份日志：${log.slice(-400)}`);
+    assert.ok(log.includes('注入身份 from=豆包联络人 · AI writer项目组 | c12ee7f6 to=P54GRP00|群分身收件箱 · AI writer项目组|群分身'),
+      `缺 T2 的注入身份日志：${log.slice(-400)}`);
   });
 }
 

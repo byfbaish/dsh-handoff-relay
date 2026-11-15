@@ -794,14 +794,56 @@ function describeTargetNow(ctx, target) {
   return { ok: false, id: '', title: '', count: hits.length, hits, status };
 }
 
-function buildMessage(relName, fullPath, state, reason, template) {
+// P54：注入消息的身份头由 relay 前置，不从配置模板取值（安全规则不能靠用户配置保证）。
+const IDENTITY_UNKNOWN = 'UNKNOWN';
+const IDENTITY_FALLBACK_TITLE = '(无标题)';
+const IDENTITY_LINE_RE = /^(?:From|To): .+$/;
+
+/**
+ * 读桩件头 TAIL_BYTES 字节，取第一条 `From: <值>` 整行；没命中返回 ''（调用方写 UNKNOWN）。
+ * 只认行首 `From: ` + 非空值：空值、缩进、正文中段的同词一律不认，避免按目录/文案猜身份。
+ */
+function readStubFromLine(full) {
+  let fd;
+  try {
+    fd = fs.openSync(full, 'r');
+    const buf = Buffer.allocUnsafe(TAIL_BYTES);
+    const read = fs.readSync(fd, buf, 0, TAIL_BYTES, 0);
+    const head = buf.subarray(0, read).toString('utf8');
+    for (const line of head.split(/\r?\n/)) {
+      if (/^From: .+$/.test(line)) return line;
+    }
+  } catch { /* 读不到就当没写身份 */ } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+  }
+  return '';
+}
+
+/** 正文里的 From:/To: 行让位给前置头：注入文本里两类头各恰好一行（机检口径）。 */
+function stripIdentityLines(text) {
+  return String(text).split(/\r?\n/).filter((line) => !IDENTITY_LINE_RE.test(line)).join('\n');
+}
+
+/**
+ * 身份头两行固定在最前，字段分隔用 ` · ` 与 ASCII ` | `：
+ *   From: <角色> · <群名后缀> | <session前8位>
+ *   To: <目标会话标题> | <session前8位> | <主身/群分身>
+ * identity = { title, id8, kind, fromText }；任何一项缺失都落到安全兜底值。
+ */
+function buildMessage(relName, fullPath, state, reason, template, identity) {
   const text = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
     .replaceAll('{reason}', reason)
     .replaceAll('{size}', String(state.size)).replaceAll('{mtimeMs}', String(state.mtimeMs));
+  const id = identity || {};
+  const fromText = String(id.fromText || '') || IDENTITY_UNKNOWN;
+  const title = String(id.title || '') || IDENTITY_FALLBACK_TITLE;
+  const id8 = String(id.id8 || '');
+  const kind = String(id.kind || '') || '主身';
+  const head = `From: ${fromText}\nTo: ${title} | ${id8} | ${kind}\n`;
   return Object.freeze({
     id: randomUUID(),
     role: 'user',
-    content: Object.freeze([Object.freeze({ type: 'text', text })]),
+    content: Object.freeze([Object.freeze({ type: 'text', text: head + stripIdentityLines(text) })]),
     // v4：source.kind 必须是「生产者自有」标识，非空且不等于 'plugin'。
     source: Object.freeze({ kind: `plugin:${PLUGIN_NAME}` }),
   });
@@ -1193,11 +1235,20 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话 ${resolved.id} 投递时已不可用；文件 ${full} 未投递`);
       return;
     }
-    const message = buildMessage(relName, full, state, reason, cfg.message);
+    // P54：To 由 relay 生成——标题优先取 resolved.title（resolveNow 已带回），
+    // 缺失再 sessionTitleOf(ctx, agent)，都取不到写 (无标题)；id8 取 resolved.id 前 8 位；
+    // 标题含 ` · ` 判群分身，否则主身。From 只认桩件正文首条 `From: `，猜不出就写 UNKNOWN。
+    const title = resolved.title || sessionTitleOf(ctx, agent) || IDENTITY_FALLBACK_TITLE;
+    const id8 = String(resolved.id || '').slice(0, 8);
+    const kind = title.includes(' · ') ? '群分身' : '主身';
+    const fromLine = readStubFromLine(full);
+    const fromText = fromLine ? fromLine.replace(/^From: /, '') : IDENTITY_UNKNOWN;
+    const message = buildMessage(relName, full, state, reason, cfg.message, { title, id8, kind, fromText });
     try {
       agent.followup(message);
       rememberDeliveredSnapshot(ctx, stateDir, watchDir, relName, state);
       log(ctx, 'info', `[${PLUGIN_NAME}] 已投递 → ${resolved.id}（${label}，文件=${full}，触发=${reason}）`);
+      relayLog(ctx, stateDir, 'info', `注入身份 from=${fromText} to=${id8}|${title}|${kind}`);
       // 移动放在微任务里：同步投递路径（含测试里的 stat 断言）不感知文件尚未移走。
       queueMicrotask(() => takeDelivered(ctx, label, deliveredRoot, watchDir, relName, full, state, stateDir));
     } catch (err) { log(ctx, 'warn', `[${PLUGIN_NAME}] followup 抛错：${String(err)}`); }
