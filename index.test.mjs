@@ -3843,6 +3843,90 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   });
 }
 
+// ----------------------- P54-fix3：To 行 id8 剥 session- 前缀 + 标题段不得为空
+// 事故形态（11-15 实测 relay.log）：`注入身份 … to=session-|大肥鱼|主身`，To 第二段恒为字面前缀 `session-`
+// —— 真实会话 id 形如 `session-8ea61110-…`，`slice(0, 8)` 取到的全是前缀。契约：先剥 `session-` 再取 8
+// 位，无此前缀时保持原行为；标题段解析不出时落 `(无标题)` 占位，不得写成 `To:  | …`（空段）。
+{
+  const relayLogFile = path.join(suiteProfileRoot, 'dsh-handoff-relay', 'relay.log');
+  const TO_LINE_RE = /^To: +\S.* \| [0-9a-f]{8} \| (主身|群分身)$/;
+  const textOf = (calls) => (calls.length ? calls[0].content[0].text : '');
+  const linesOf = (text) => String(text).split('\n');
+  const titleSegOf = (line) => String(line).replace(/^To: +/, '').split(' | ')[0];
+  const idSegOf = (line) => String(line).split(' | ')[1];
+  const relayLogText = () => {
+    try { return fs.readFileSync(relayLogFile, 'utf8'); } catch { return ''; }
+  };
+
+  // 一条 watch 一次投递：桩件尾带 DONE ⇒ 当拍投递，同步可断言。
+  const f3Run = (opts = {}) => {
+    const d = tmp();
+    const id = opts.id;
+    const name = opts.name;
+    const calls = [];
+    const box = capturingWatch();
+    const ctx = makeTitleCtx(calls, [{ id, title: opts.title === undefined ? '' : opts.title }]);
+    const disp = withFs(box.patch, () => apply(ctx, { watches: [{ dir: d, targetSessionId: id }], stableMs: 120 }));
+    fs.writeFileSync(path.join(d, name), 'x\n<!-- DONE -->\n');
+    box.cb('change', name);
+    disp();
+    return { d, name, id, calls };
+  };
+
+  // T1 D-TO8（群分身）：真实形状 id ⇒ 第二段是 8 位十六进制，不再是字面 `session-`
+  const t1 = f3Run({
+    id: 'session-8ea61110-4a2b-4c3d-9e8f-0123456789ab',
+    name: 'p54f3-t1.txt',
+    title: '豆包联络人 · AI writer项目组',
+  });
+  check('P54-fix3 T1 真实 id `session-8ea61110-…` → To 第二段为 8ea61110（不再输出字面 session-）', () => {
+    assert.equal(t1.calls.length, 1, `期望 1 次投递，实际 ${t1.calls.length}`);
+    const line = linesOf(textOf(t1.calls))[1];
+    assert.equal(line, 'To: 豆包联络人 · AI writer项目组 | 8ea61110 | 群分身', `To 不符：${JSON.stringify(line)}`);
+    assert.equal(idSegOf(line), '8ea61110', `第二段必须是 8 位十六进制：${JSON.stringify(idSegOf(line))}`);
+    assert.ok(!line.includes('session-'), `To 行不得出现字面前缀 session-：${JSON.stringify(line)}`);
+    assert.ok(TO_LINE_RE.test(line), `不满足机检正则 ${TO_LINE_RE}：${JSON.stringify(line)}`);
+    assert.ok(relayLogText().includes('注入身份 from=UNKNOWN to=8ea61110|豆包联络人 · AI writer项目组|群分身'),
+      `relay.log 的 注入身份 行应带剥前缀后的 id8：${relayLogText().slice(-300)}`);
+  });
+
+  // T2 空标题占位：目标会话取不到标题 ⇒ 标题段写可判占位，不留空段
+  const t2 = f3Run({
+    id: 'session-abcdef12-1111-2222-3333-444455556666',
+    name: 'p54f3-t2.txt',
+    title: '',
+  });
+  check('P54-fix3 T2 目标会话无标题 → To 标题段落 (无标题) 占位，不留空段', () => {
+    assert.equal(t2.calls.length, 1, `期望 1 次投递，实际 ${t2.calls.length}`);
+    const line = linesOf(textOf(t2.calls))[1];
+    assert.equal(line, 'To: (无标题) | abcdef12 | 主身', `To 不符：${JSON.stringify(line)}`);
+    assert.ok(titleSegOf(line).trim().length > 0, `标题段不得为空：${JSON.stringify(line)}`);
+    assert.ok(!/^To: +\|\s/.test(line), `不得写成空段（「To:  | …」）：${JSON.stringify(line)}`);
+    assert.ok(TO_LINE_RE.test(line), `不满足机检正则 ${TO_LINE_RE}：${JSON.stringify(line)}`);
+  });
+
+  // T3 D-TO8（主身）：真实形状 id + 非群标题 ⇒ 第二段仍是 8 位十六进制，kind 判主身
+  const t3 = f3Run({
+    id: 'session-44b1c2a3-7777-8888-9999-aaaabbbbcccc',
+    name: 'p54f3-t3.txt',
+    title: '大肥鱼',
+  });
+  check('P54-fix3 T3 真实 id + 非群标题 → To 第二段 44b1c2a3、kind 主身，机检正则通过', () => {
+    assert.equal(t3.calls.length, 1, `期望 1 次投递，实际 ${t3.calls.length}`);
+    const line = linesOf(textOf(t3.calls))[1];
+    assert.equal(line, 'To: 大肥鱼 | 44b1c2a3 | 主身', `To 不符：${JSON.stringify(line)}`);
+    assert.ok(TO_LINE_RE.test(line), `不满足机检正则 ${TO_LINE_RE}：${JSON.stringify(line)}`);
+  });
+
+  // T4 无 session- 前缀 ⇒ 保持原行为（取前 8 位），且不因本卡改动误伤旧式 id
+  const t4 = f3Run({ id: 'S-A', name: 'p54f3-t4.txt', title: '旧式 id 收件箱' });
+  check('P54-fix3 T4 无 session- 前缀的 id → 保持原行为（取前 8 位）', () => {
+    assert.equal(t4.calls.length, 1, `期望 1 次投递，实际 ${t4.calls.length}`);
+    assert.equal(linesOf(textOf(t4.calls))[1], 'To: 旧式 id 收件箱 | S-A | 主身',
+      `无前缀应保持原行为：${JSON.stringify(linesOf(textOf(t4.calls))[1])}`);
+  });
+}
+
 console.log('\n===== 自测汇总 =====');
 for (const r of results) console.log(r);
 console.log(`TOTAL: ${results.length - failed}/${results.length} PASS`);

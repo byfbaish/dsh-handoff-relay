@@ -814,6 +814,28 @@ function describeTargetNow(ctx, target) {
 const IDENTITY_UNKNOWN = 'UNKNOWN';
 const IDENTITY_FALLBACK_TITLE = '(无标题)';
 const IDENTITY_LINE_RE = /^(?:From|To): .+$/;
+// P54-fix3（D-TO8）：真实会话 id 形如 `session-8ea61110-…`，直接 slice(0, 8) 恒得字面前缀 `session-`。
+// 故 To 第二段先剥该前缀再取 8 位；没有该前缀（测试桩或旧式 id）保持原行为，仍取前 8 位。
+const SESSION_ID_PREFIX = 'session-';
+
+function id8Of(id) {
+  const raw = String(id == null ? '' : id);
+  const body = raw.startsWith(SESSION_ID_PREFIX) ? raw.slice(SESSION_ID_PREFIX.length) : raw;
+  return body.slice(0, 8);
+}
+
+/**
+ * P54-fix3（To 标题段）：标题段必须有可判内容，不得留空段。
+ * 依次取第一个 trim 后非空的候选；全空落 IDENTITY_FALLBACK_TITLE（`(无标题)`）。
+ * 放在身份头唯一取值点再兜一次，防后续新增取值分支时漏兜底写出 `To:  | …`。
+ */
+function headerTitleOf(...candidates) {
+  for (const c of candidates) {
+    const s = String(c == null ? '' : c).trim();
+    if (s) return s;
+  }
+  return IDENTITY_FALLBACK_TITLE;
+}
 
 /**
  * 读桩件头 TAIL_BYTES 字节，取第一条 `From: <值>` 整行；没命中返回 ''（调用方写 UNKNOWN）。
@@ -1286,8 +1308,9 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     // 标题含 ` · ` 判群分身，否则主身。
     // P54-fix2：From 优先级 = 桩件正文首条 `From:` ＞ 该 watch 的 fromRole ＞ UNKNOWN；
     // 两者并存且不等 ⇒ 仍注入正文值，另写一行 `身份冲突` 并在条目里标 fromConflict。
-    const title = resolved.title || sessionTitleOf(ctx, agent) || IDENTITY_FALLBACK_TITLE;
-    const id8 = String(resolved.id || '').slice(0, 8);
+    // P54-fix3：id8 改为「剥 session- 前缀后取 8 位」（D-TO8）；标题段经 headerTitleOf 保证不留空段。
+    const title = headerTitleOf(resolved.title, sessionTitleOf(ctx, agent));
+    const id8 = id8Of(resolved.id);
     const kind = title.includes(' · ') ? '群分身' : '主身';
     const fromLine = readStubFromLine(full);
     const stubFrom = fromLine ? fromLine.replace(/^From: /, '') : '';
