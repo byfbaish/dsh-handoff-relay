@@ -1,3 +1,6 @@
 node_modules/
 inbox/
 reports/
+
+# P1-11 本地打包产物，不入库
+*.tgz
