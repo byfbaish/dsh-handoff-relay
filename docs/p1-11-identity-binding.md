@@ -43,11 +43,18 @@ node --test identity.test.mjs → pass 12 / fail 0 (≈64ms)
 
 ## 5. 安装计划（A 方案，等指令）
 
-1. `npm pack` → 记 tarball sha256；
-2. profile 内 `npm i file:<tarball>` 覆盖 `dsh-handoff-relay`；
-3. 只改 to-owner watch 增加 `targetIdentity`，删掉失效的 `targetSessionId`；
-4. 重启后用真实桥接件跑三条验收，回填本文件 §6；
-5. 失败回退：`npm i dsh-handoff-relay@0.5.0`（tarball sha256 `658180c4…` 已在档）。
+产物已备好，未安装：
+
+```
+C:\develop\workspace\dsh-handoff-relay\dsh-handoff-relay-0.5.0.tgz
+sha256 619d2446892fd0850082773c0f8f1925a45f1917920b1c342b9dd25c6d78008d
+内容 8 个文件，含 identity.js（tar -tzf 已核）
+```
+
+1. profile 内 `npm i file:C:\develop\workspace\dsh-handoff-relay\dsh-handoff-relay-0.5.0.tgz` 覆盖；
+2. 只改 to-owner watch 增加 `targetIdentity`，删掉失效的 `targetSessionId`；
+3. 重启后用真实桥接件跑三条验收，回填本文件 §6；
+4. 失败回退：`npm i dsh-handoff-relay@0.5.0`（原 tarball sha256 `658180c4…` 已在档）。
 
 ## 6. 真机结果
 
