@@ -8,6 +8,8 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
+// P1-11：身份 → 会话解析（<群名>:<Bot> / <Bot>@主身），投递时现读 state.json，换段自动跟随。
+import { resolveAddressNow, describeIdentityError, REASONS as IDENTITY_REASONS } from './identity.js';
 export const name = 'dsh-handoff-relay';
 export const inject = ['agents'];
 const PLUGIN_NAME = 'dsh-handoff-relay';
@@ -50,6 +52,9 @@ function buildConfigSchema(z) {
       dir: z.string().default(''),
       targetTitle: z.string().default(''),
       targetSessionId: z.string().default(''),
+      // P1-11：按身份绑定（`<群名>:<Bot>` 或 `<Bot>@主身`）。给了它就优先于 title/id，
+      // 投递时现解析成当前会话，换段不需要改配置、不需要重启 DSH。
+      targetIdentity: z.string().default(''),
       exact: z.boolean().default(true),
       // P54-fix2：可选目录归属标签；写进 schema 才不会被宿主解析时丢掉（缺省空串 = P54 行为）。
       fromRole: z.string().default(''),
@@ -789,6 +794,17 @@ function hitsText(hits) {
  * resolved=<会话 id> / agent-not-found / title-no-match:<命中数> / title-multiple:<命中数>。
  */
 function describeTargetNow(ctx, target) {
+  // P1-11：按身份绑定的目标——加载期只看「现在能不能解析到」，解析不到只影响日志与 warn。
+  if (target.kind === 'identity') {
+    try {
+      const r = resolveAddressNow(target.value);
+      const s = resolveSession(ctx, r.sessionId);
+      if (!s.found) return { ok: false, id: r.sessionId, title: '', count: 0, hits: [], status: `identity=${r.sessionId} agent-not-loaded` };
+      return { ok: true, id: r.sessionId, title: s.title || '(无标题)', count: 1, hits: [], status: `identity=${r.sessionId} resolved` };
+    } catch (err) {
+      return { ok: false, id: '', title: '', count: 0, hits: [], status: `identity-${describeIdentityError(err)}` };
+    }
+  }
   if (target.kind === 'id') {
     const s = resolveSession(ctx, target.value);
     if (!s.found) return { ok: false, id: '', title: '', count: 0, hits: [], status: 'agent-not-found' };
@@ -979,6 +995,10 @@ export function serializeWatchesBlock(watches, indent = '    ') {
     if (w && typeof w.targetTitle === 'string' && w.targetTitle) {
       out.push(`${indent}    targetTitle: ${yamlQuote(w.targetTitle)}`);
     }
+    // P1-11：targetIdentity 只在有值时写出，形状与 targetTitle 一致，旧字段照旧保留。
+    if (w && typeof w.targetIdentity === 'string' && w.targetIdentity) {
+      out.push(`${indent}    targetIdentity: ${yamlQuote(w.targetIdentity)}`);
+    }
     if (w && w.exact === true) out.push(`${indent}    exact: true`);
     // P54-fix2：fromRole 是可选字段；只在有值时写出，缺省时整行省略（与 P54 的块形状一致）。
     if (w && typeof w.fromRole === 'string' && w.fromRole) {
@@ -1051,6 +1071,7 @@ export function parseWatchesFromYml(source) {
       const raw = field[2].trim();
       if (name === 'targetSessionId') item.targetSessionId = unquote(raw);
       else if (name === 'targetTitle') item.targetTitle = unquote(raw);
+      else if (name === 'targetIdentity') item.targetIdentity = unquote(raw);
       else if (name === 'exact') item.exact = raw === 'true';
       else if (name === 'fromRole') item.fromRole = unquote(raw);
       doneOwner = null;
@@ -1226,7 +1247,9 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     pending.clear();
   }
   const titleText = `targetTitle="${target.value}" exact=${target.exact === true ? 'true' : 'false'}`;
-  const targetText = target.kind === 'title'
+  const targetText = target.kind === 'identity'
+    ? `targetIdentity="${target.value}"（按身份现解析）`
+    : target.kind === 'title'
     ? (target.id ? `${titleText}（targetSessionId=${target.id} 兜底）` : titleText)
     : `targetSessionId=${target.value}`;
   const warnErr = (kind, err) => log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} ${kind}：${String(err)}`);
@@ -1239,6 +1262,29 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
    * reason ∈ agent-not-found / title-no-match / title-multiple（写 relay.log 用）。
    */
   function resolveNow(relName) {
+    // P1-11：按身份绑定。每次投递现读 state.json → 当前会话 id → 校验会话已加载。
+    // 解析失败不缓存（换段/懒写入窗口靠下一次事件自愈），文件保持未投递；
+    // ROOM_SEGMENT 属懒写入窗口，MAIN 重试无用需上报，日志里按 <code>/<reason> 区分。
+    if (target.kind === 'identity') {
+      let r;
+      try {
+        r = resolveAddressNow(target.value);
+      } catch (err) {
+        const tag = describeIdentityError(err);
+        const msg = `[${PLUGIN_NAME}] ${label} 身份解析失败（${tag}）：${target.value}；文件 ${relName} 未投递，保持未投递等下次事件（不缓存失败，dir=${watchDir}）`;
+        log(ctx, 'warn', msg);
+        relayLog(ctx, stateDir, 'warn', `身份解析失败 relName=${path.basename(relName)} 地址=${target.value} ${tag}`);
+        return { ok: false, reason: `identity-${tag}` };
+      }
+      const agent = findAgentById(ctx, r.sessionId, warnErr);
+      if (!agent) {
+        const msg = `[${PLUGIN_NAME}] ${label} 身份解析到会话 ${r.sessionId}（${r.address}），但该会话尚未加载；文件 ${relName} 未投递，等下次事件重试`;
+        log(ctx, 'warn', msg);
+        relayLog(ctx, stateDir, 'warn', `身份目标会话未加载 relName=${path.basename(relName)} 地址=${r.address} sessionId=${r.sessionId}`);
+        return { ok: false, reason: 'agent-not-loaded' };
+      }
+      return { ok: true, id: r.sessionId, title: sessionTitleOf(ctx, agent) || '(无标题)', agent, identity: r };
+    }
     if (target.kind === 'id') {
       const agent = findAgentById(ctx, target.value, warnErr);
       if (!agent) {
@@ -1485,7 +1531,9 @@ export function apply(ctx, config = {}) {
     }
     const hasId = typeof rawId === 'string' && rawId.trim() !== '';
     const hasTitle = typeof rawTitle === 'string' && rawTitle.trim() !== '';
-    if (!hasId && !hasTitle) {
+    const rawIdentity = w && w.targetIdentity;
+    const hasIdentity = typeof rawIdentity === 'string' && rawIdentity.trim() !== '';
+    if (!hasId && !hasTitle && !hasIdentity) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetTitle 或 targetSessionId 至少给一个（当前 targetSessionId=${String(rawId)}，targetTitle=${String(rawTitle)}）`);
       return;
     }
@@ -1525,7 +1573,13 @@ export function apply(ctx, config = {}) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 fromRole 无效，已按缺省处理（只接受非空字符串，当前=${JSON.stringify(rawFromRole)}，类型=${typeof rawFromRole}，dir=${dir}）`);
       relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] ${label} fromRole 无效已按缺省处理：dir=${dir} ${JSON.stringify(rawFromRole)}（${typeof rawFromRole}）`);
     }
-    const target = hasTitle
+    // P1-11：targetIdentity 优先于 title/id。同时写了旧字段时不静默丢弃，warn 一行说明以谁为准。
+    if (hasIdentity && (hasId || hasTitle)) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 同时给了 targetIdentity 与 targetTitle/targetSessionId，按 targetIdentity="${rawIdentity.trim()}" 解析（换段不再需要人工改配置；旧字段保留不生效，dir=${dir}）`);
+    }
+    const target = hasIdentity
+      ? { kind: 'identity', value: rawIdentity.trim(), exact }
+      : hasTitle
       ? { kind: 'title', value: rawTitle.trim(), exact, id: hasId ? rawId.trim() : undefined }
       : { kind: 'id', value: rawId, exact };
     // 启动期校验＝「现在能否解析到」：解析不到只 warn，不阻断加载，也不影响其他 watch。

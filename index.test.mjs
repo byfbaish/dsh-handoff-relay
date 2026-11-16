@@ -3841,6 +3841,29 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     const parsed = parseWatchesFromYml(written);
     assert.equal(parsed && parsed[0] && parsed[0].fromRole, ROLE_A, `yml 回读不到 fromRole：${JSON.stringify(parsed)}`);
   });
+
+  // P1-11：targetIdentity 必须能随 yml 往返（否则设置卡一保存就把身份绑定吞掉，退回旧的 title/id 绑定）
+  check('P1-11 yml 往返保留 targetIdentity，且与旧字段共存不互相吞', () => {
+    const yml = [
+      '- id: dsh-handoff-relay',
+      '  config:',
+      '    watches:',
+      '',
+      '- id: other-plugin',
+      '',
+    ].join('\n');
+    const watches = [
+      { dir: 'C:/watch/id', targetIdentity: '大肥鱼@主身', targetTitle: '大肥鱼' },
+      { dir: 'C:/watch/old', targetTitle: '甲', targetSessionId: 'session-abc12345-x' },
+    ];
+    const written = replaceWatchesInYml(yml, watches);
+    assert.ok(written.includes('targetIdentity:'), `yml 写回缺 targetIdentity：${written}`);
+    const parsed = parseWatchesFromYml(written);
+    assert.equal(parsed && parsed[0] && parsed[0].targetIdentity, '大肥鱼@主身', `yml 回读不到 targetIdentity：${JSON.stringify(parsed)}`);
+    assert.equal(parsed[0].targetTitle, '大肥鱼', '旧字段不得被吞');
+    assert.equal(parsed[1].targetIdentity, undefined, '没写 targetIdentity 的行不得凭空空写出该键');
+    assert.equal(parsed[1].targetTitle, '甲', '旧绑定行原样往返');
+  });
 }
 
 // ----------------------- P54-fix3：To 行 id8 剥 session- 前缀 + 标题段不得为空
