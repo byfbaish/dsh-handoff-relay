@@ -10,7 +10,7 @@
 
 ## 1　6 条写死 `targetSessionId` 的 watch 必须改绑
 
-配置正本：`C:\Users\伯云飞\.dsh\profiles\desktop\cordis.patch.yml` 第 288–328 行。现状：只有 `to-owner` 用 `targetIdentity: 大肥鱼@主身`，其余 6 条全写死 session id，换段即失效。
+配置正本：`C:\Users\<用户名>\.dsh\profiles\desktop\cordis.patch.yml` 第 288–328 行。现状：只有 `to-owner` 用 `targetIdentity: 大肥鱼@主身`，其余 6 条全写死 session id，换段即失效。
 
 改法（逐条，`targetSessionId` 换成 `targetIdentity`，其余键不动）。**下表已用 `identity.js` 的 `resolveAddressNow()` 逐条实测解析过（21:40）**：
 
