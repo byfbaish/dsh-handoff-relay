@@ -11,6 +11,33 @@
 取名 **relay** 是因为它做的正是「把一条已就绪的信号点到点转达到某个会话」；
 刻意避开会让人以为能起构建 / 跑命令的字眼——`trigger` 会被误读成能触发动作。
 
+## 配套关系
+
+本插件是三个配套项目中的一个。
+
+```mermaid
+graph LR
+  ID["dsh-identity-resolve 0.1.0<br/>身份解析 — 唯一真源"]
+  RL["dsh-handoff-relay 0.5.0<br/>目录监听 → 一条通知"]
+  HOST["DS-Bot（上游，第三方）<br/>Bot / 群 / 会话 / 插件注入点"]
+  ID -->|"地址语义<br/>群名:Bot · Bot@主身<br/>E_ADDR_INVALID · E_SESSION_UNRECORDED"| RL
+  HOST --- RL
+  HOST --- ID
+```
+
+- **地址语义**来自 `dsh-identity-resolve`，那是唯一真源。本包在 `identity.js`
+  内置一份副本，因为本包以自包含 tgz 装进宿主 profile，运行期拿不到解析器
+  的检出目录。那份副本是**有意镜像，不是分叉**：文件头写明替换条件——待解析器
+  按正规流程发布后，本文件整体替换为 `import { resolveInSnapshot } …`。在此之前
+  两边逐条对照，`identity.js` 跟随解析器的代码与错误码命名。
+- **宿主**：[DS-Bot](https://github.com/Fei2411/DS-Bot)，第三方上游仓。本插件
+  依赖它的 Bot / 群 / 会话模型与插件注入点（`cordis.patch.yml`）；本仓不改上游
+  代码，也不改宿主安装。
+- **配置**在 `cordis.patch.yml` 的 `watches` 段（字段见后文）。每个 watch 的目标
+  可以写死 `targetSessionId`，也可以写身份地址 `targetIdentity`——例如
+  `大肥鱼@主身`、`DSH 插件组:大肥鱼`——在启动时解析一次、每次投递再解析一次，
+  所以换会话段不需要重启。
+
 ## 「已完成」如何判定
 
 - **静默期**：文件在 `stableMs` 毫秒内（默认 `5000`）不再变化，即判定为已完成。

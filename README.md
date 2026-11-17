@@ -15,6 +15,38 @@ forwarding of a ready signal to a target session. It deliberately avoids any
 wording that suggests builds or commands — a `trigger`-style name would imply
 the plugin can start actions, which it cannot.
 
+## Related projects
+
+This plugin is one of three projects that work together.
+
+```mermaid
+graph LR
+  ID["dsh-identity-resolve 0.1.0<br/>identity resolver — single source of truth"]
+  RL["dsh-handoff-relay 0.5.0<br/>dir watch → one notification"]
+  HOST["DS-Bot (upstream, third party)<br/>bots / rooms / sessions / plugin hook"]
+  ID -->|"address semantics<br/>&lt;Room&gt;:&lt;Bot&gt; · &lt;Bot&gt;@main<br/>E_ADDR_INVALID · E_SESSION_UNRECORDED"| RL
+  HOST --- RL
+  HOST --- ID
+```
+
+- **Address semantics** come from `dsh-identity-resolve`, the single source of
+  truth. This package ships a copy at `identity.js` because it is installed into
+  a host profile as a self-contained tarball and cannot import from the resolver's
+  checkout at runtime. The copy is a **deliberate mirror, not a fork**: its file
+  header states the replacement condition — once the resolver is published
+  through the normal release flow, the file is replaced wholesale by
+  `import { resolveInSnapshot } …`. Until then the two are checked against each
+  other and `identity.js` follows the resolver's code and error names.
+- **Host**: [DS-Bot](https://github.com/Fei2411/DS-Bot) — a third-party upstream
+  project. The plugin depends on its bot / room / session model and on its plugin
+  injection point (`cordis.patch.yml`); this repository does not modify upstream
+  code or the host installation.
+- **Configuration** lives in the `watches` block of `cordis.patch.yml` (fields
+  below). Each watch targets either a fixed `targetSessionId` or an identity
+  address `targetIdentity` — for example `大肥鱼@主身` or `DSH 插件组:大肥鱼` —
+  which is resolved once at startup and again on every delivery, so a session
+  rotation does not need a restart.
+
 ## What "finished" means
 
 - **Quiet period**: a file that has stopped changing for `stableMs`
