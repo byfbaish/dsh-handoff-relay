@@ -834,7 +834,7 @@ function describeTargetNow(ctx, target) {
 // P54：注入消息的身份头由 relay 前置，不从配置模板取值（安全规则不能靠用户配置保证）。
 const IDENTITY_UNKNOWN = 'UNKNOWN';
 const IDENTITY_FALLBACK_TITLE = '(无标题)';
-const IDENTITY_LINE_RE = /^(?:From|To): .+$/;
+const IDENTITY_LINE_RE = /^(?:From|To)\s*[:：]\s*\S.*$/;
 // P54-fix3（D-TO8）：真实会话 id 形如 `session-8ea61110-…`，直接 slice(0, 8) 恒得字面前缀 `session-`。
 // 故 To 第二段先剥该前缀再取 8 位；没有该前缀（测试桩或旧式 id）保持原行为，仍取前 8 位。
 const SESSION_ID_PREFIX = 'session-';
@@ -870,7 +870,7 @@ function readStubFromLine(full) {
     const read = fs.readSync(fd, buf, 0, TAIL_BYTES, 0);
     const head = buf.subarray(0, read).toString('utf8');
     for (const line of head.split(/\r?\n/)) {
-      if (/^From: .+$/.test(line)) return line;
+      if (/^From\s*[:：]\s*\S.*$/.test(line)) return line;
     }
   } catch { /* 读不到就当没写身份 */ } finally {
     if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* ignore */ } }
@@ -1389,7 +1389,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const id8 = id8Of(resolved.id);
     const kind = title.includes(' · ') ? '群分身' : '主身';
     const fromLine = readStubFromLine(full);
-    const stubFrom = fromLine ? fromLine.replace(/^From: /, '') : '';
+    const stubFrom = fromLine ? fromLine.replace(/^From\s*[:：]\s*/, '') : '';
     const from = resolveFromText(stubFrom, fromRole);
     const identity = { title, id8, kind, fromText: from.fromText };
     const message = buildMessage(relName, full, state, reason, cfg.message, identity, cfg.inlineMaxChars);

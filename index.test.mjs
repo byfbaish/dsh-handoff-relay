@@ -3670,9 +3670,25 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
       `To 应落 (无标题) 兜底：${JSON.stringify(linesOf(textOf(t4Calls))[1])}`);
   });
 
+  // T6 本仓投递件实际写法：全角冒号、冒号后不空格（From：【…】）⇒ 仍能取到发件人，不得落 UNKNOWN
+  const t6Calls = p54Run({
+    id: 'P54FW000001',
+    title: '主身收件箱',
+    stub: 'From：【大肥鱼（主身）·大管家】\nTo：大肥鱼@主身\n\n正文一行\n<!-- DONE -->\n',
+  });
+  check('P54 T6 全角冒号 From：【…】→ 取到发件人原值，正文自带 From/To 被剥掉', () => {
+    assert.equal(t6Calls.length, 1, `期望 1 次投递，实际 ${t6Calls.length}`);
+    const text = textOf(t6Calls);
+    const lines = linesOf(text);
+    assert.equal(lines[0], 'From: 【大肥鱼（主身）·大管家】', `From 应取正文原值：${JSON.stringify(lines[0])}`);
+    assert.equal(countHead(text, 'From: '), 1, `From 应恰好 1 行：${text}`);
+    assert.equal(countHead(text, 'To: '), 1, `To 应恰好 1 行：${text}`);
+    assert.ok(!text.includes('From：【'), `正文自带 From 应被剥掉：${text}`);
+  });
+
   // T5 任意用例：注入文本里 ^From: 与 ^To: 各恰好 1 行（机检口径）
   check('P54 T5 所有用例注入文本里 ^From: 与 ^To: 各恰好 1 行', () => {
-    for (const calls of [t1Calls, t2Calls, t3Calls, t4Calls]) {
+    for (const calls of [t1Calls, t2Calls, t3Calls, t4Calls, t6Calls]) {
       const text = textOf(calls);
       assert.equal(countHead(text, 'From: '), 1, `From: 行数不符：${text}`);
       assert.equal(countHead(text, 'To: '), 1, `To: 行数不符：${text}`);
