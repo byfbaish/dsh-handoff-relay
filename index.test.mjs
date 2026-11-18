@@ -2037,6 +2037,8 @@ const p9WithProfile = (root) => {
     },
     logger: { info: (m) => seen.push(m), warn: (m) => warnings.push(m) },
     effect: () => {},
+    // tools 自 stage 2 起已是声明依赖（inject 含 'tools'）：严格 ctx 也必须播种，否则违反「已声明即提供」
+    tools: { register: () => () => {} },
     get: () => undefined,                     // 没有 settings 服务
   };
   const strictCtx = new Proxy(target, {
@@ -4007,6 +4009,156 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.equal(linesOf(textOf(t4.calls))[1], 'To: 旧式 id 收件箱 | S-A | 主身',
       `无前缀应保持原行为：${JSON.stringify(linesOf(textOf(t4.calls))[1])}`);
   });
+}
+
+// ---------------------------------------------------------------- 工具面 relay_deliver（stage 2）
+// 判据：参数即约束（缺参／语义错各一码）、身份解析失败两码、无路由给可用清单、
+// 落盘件只留一行权威头（正文自带的 From:/To: 被剥）、同参数两次调用命中同一路径且第二次 deduped。
+{
+  const {
+    validateRelayToolArgs, createRelayToolHandler, buildRelayToolFile,
+    describeRelayRoutes, registerRelayTool, buildToolRoutes, RELAY_TOOL_NAME,
+  } = await import('./index.js');
+  const { IdentityError } = await import('./identity.js');
+
+  const toolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-'));
+  const toolState = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-state-'));
+  const resolvedStub = Object.freeze({
+    sessionId: 'session-aaaa1111-2222-3333-4444-555566667777',
+    title: '工具测试目标',
+    kind: 'group',
+  });
+  const routes = [{ dir: toolDir, targetIdentity: 'DSH 插件组:QA', targetSessionId: '', targetTitle: '', fromRole: 'tool-test' }];
+  const resolveStub = (addr) => {
+    if (addr === 'DSH 插件组:QA') return resolvedStub;
+    if (addr === 'DSH 插件组:不存在') throw new IdentityError('E_ADDR_INVALID', 'unknown room', { reason: 'UNKNOWN_ROOM' });
+    if (addr === '没落盘@主身') throw new IdentityError('E_SESSION_UNRECORDED', 'not recorded', { reason: 'MAIN' });
+    throw new IdentityError('E_ADDR_INVALID', 'bad address', { reason: 'FORMAT' });
+  };
+  const handler = createRelayToolHandler({ routes, stateDir: toolState, inlineMaxChars: 4000, resolveAddress: resolveStub });
+  const okArgs = {
+    target: 'DSH 插件组:QA',
+    subject: '工具投递 T1',
+    body: 'From: 冒充者\nTo: 冒充目标\n正文第一行\n正文第二行',
+  };
+
+  const r1 = await handler(okArgs);
+  const r2 = await handler(okArgs);
+  check('工具 T1 成功投递：ok / 落盘件在 watch 目录 / 返回 deduped:false、inlined:true', () => {
+    assert.equal(r1.ok, true, `期望 ok，实际 ${JSON.stringify(r1)}`);
+    assert.equal(r1.deduped, false, '首次投递不应 deduped');
+    assert.equal(r1.inlined, true, '短正文应 inlined:true');
+    assert.match(path.basename(r1.delivered), /^relay-[0-9a-f]{8}\.md$/, `文件名不符：${r1.delivered}`);
+    assert.ok(fs.existsSync(r1.delivered), `落盘件不存在：${r1.delivered}`);
+    assert.equal(r1.target, 'aaaa1111', `target(id8) 应剥 session- 前缀：${r1.target}`);
+    assert.equal(r1.targetTitle, '工具测试目标');
+  });
+  check('工具 T1b 落盘件只留一行权威头：调用方自带 From:/To: 被剥、无冒充者', () => {
+    const text = fs.readFileSync(r1.delivered, 'utf8');
+    const lines = text.split('\n');
+    const fromLines = lines.filter((l) => /^From\s*[:：]/.test(l));
+    const toLines = lines.filter((l) => /^To\s*[:：]/.test(l));
+    assert.equal(fromLines.length, 1, `From 头应恰好一行，实际 ${fromLines.length}`);
+    assert.equal(toLines.length, 1, `To 头应恰好一行，实际 ${toLines.length}`);
+    assert.ok(!text.includes('冒充者'), '正文里的冒充 From 行必须被剥掉');
+    assert.ok(!text.includes('冒充目标'), '正文里的冒充 To 行必须被剥掉');
+    assert.ok(text.includes('# 工具投递 T1'), 'subject 应作一级标题');
+    assert.ok(text.endsWith('\n'), '文件应以单个换行结尾');
+  });
+  check('工具 T1c 同参数第二次调用：同一路径、deduped:true、不重复落盘', () => {
+    assert.equal(r2.ok, true, `期望 ok，实际 ${JSON.stringify(r2)}`);
+    assert.equal(r2.deduped, true, '第二次应 deduped:true');
+    assert.equal(r2.delivered, r1.delivered, '两次应命中同一路径');
+    assert.equal(fs.readdirSync(toolDir).filter((n) => n.endsWith('.md')).length, 1, '目录里应只有一个投递件');
+  });
+
+  check('工具 T2 缺参／语义错：subject 缺失、subject 多行、body 为空各回 E_ARGS_INVALID 并指对 field', () => {
+    const a = validateRelayToolArgs({ target: 'DSH 插件组:QA', body: 'x' });
+    assert.equal(a.error.code, 'E_ARGS_INVALID');
+    assert.equal(a.error.field, 'subject');
+    const b = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: 'ok\nsecond', body: 'x' });
+    assert.equal(b.error.code, 'E_ARGS_INVALID');
+    assert.equal(b.error.field, 'subject');
+    const c = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: 'ok', body: '   ' });
+    assert.equal(c.error.code, 'E_ARGS_INVALID');
+    assert.equal(c.error.field, 'body');
+    const d = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: 'ok', body: 'x', kind: 'WHATEVER' });
+    assert.equal(d.error.code, 'E_ARGS_INVALID');
+    assert.equal(d.error.field, 'kind');
+  });
+  check('工具 T2b body 超 1 MiB → E_BODY_TOO_LARGE，且不动目录', () => {
+    const before = fs.readdirSync(toolDir).length;
+    return handler({ target: 'DSH 插件组:QA', subject: '超限', body: 'a'.repeat(1024 * 1024 + 1) }).then((r) => {
+      assert.equal(r.code, 'E_BODY_TOO_LARGE', `期望 E_BODY_TOO_LARGE，实际 ${JSON.stringify(r)}`);
+      assert.equal(fs.readdirSync(toolDir).length, before, '超限不应落盘');
+    });
+  });
+
+  const bad1 = await handler({ target: 'DSH 插件组:不存在', subject: 's', body: 'b' });
+  const bad2 = await handler({ target: '没落盘@主身', subject: 's', body: 'b' });
+  check('工具 T3 目标解析失败：E_ADDR_INVALID + reason，正文不落盘', () => {
+    assert.equal(bad1.ok, false);
+    assert.equal(bad1.code, 'E_ADDR_INVALID');
+    assert.equal(bad1.reason, 'UNKNOWN_ROOM');
+    assert.equal(bad1.field, 'target');
+    assert.ok(bad1.message.includes('群名:Bot'), `文案应指路地址格式：${bad1.message}`);
+  });
+  check('工具 T3b 主身 id 未落盘：E_SESSION_UNRECORDED + reason=MAIN（不误用 E_ARGS_INVALID）', () => {
+    assert.equal(bad2.code, 'E_SESSION_UNRECORDED');
+    assert.equal(bad2.reason, 'MAIN');
+  });
+
+  const noRouteHandler = createRelayToolHandler({ routes: [], stateDir: toolState, resolveAddress: resolveStub });
+  const noRoute = await noRouteHandler({ target: 'DSH 插件组:QA', subject: 's', body: 'b' });
+  check('工具 T4 无路由 → E_NO_ROUTE，文案给可用目标清单（空表也要说清）', () => {
+    assert.equal(noRoute.code, 'E_NO_ROUTE');
+    assert.ok(noRoute.message.includes('当前可用目标'), `文案缺可用清单：${noRoute.message}`);
+    assert.ok(noRoute.message.includes('watches'), `文案应指路加配置：${noRoute.message}`);
+    const list = describeRelayRoutes(routes);
+    assert.deepEqual(list, ['dfw-tool-' + path.basename(toolDir).replace('dfw-tool-', '') + ' → DSH 插件组:QA'].map((x) => x.replace(/^dfw-tool-[^ ]+/, path.basename(toolDir))), '可用清单应是「目录尾段 → 地址」');
+  });
+
+  check('工具 T5 幂等键用剥头后的 body：带不带 From: 行算出同一文件名', () => {
+    const a = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: 'From: x\n正文' });
+    const b = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: '正文' });
+    assert.equal(a.relName, b.relName, `剥头后应同名：${a.relName} vs ${b.relName}`);
+    const c = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: '正文改一个字' });
+    assert.notEqual(a.relName, c.relName, '正文变化应换文件名');
+  });
+
+  const registered = [];
+  let disposed = 0;
+  const toolCtx = { agents: { get: () => undefined, roots: () => [] }, tools: { register: (d) => { registered.push(d); return () => { disposed += 1; }; } }, logger: { info: () => {}, warn: (m) => warnings.push(m) } };
+  const disposeTool = registerRelayTool(toolCtx, { routes, stateDir: toolState });
+  check('工具 T6 注册：名字＝relay_deliver、required＝target/subject/body、output.render 可用', () => {
+    assert.equal(registered.length, 1, '应注册恰好一个工具');
+    const def = registered[0];
+    assert.equal(def.name, RELAY_TOOL_NAME);
+    assert.deepEqual(def.parameters.required, ['target', 'subject', 'body']);
+    assert.deepEqual(def.parameters.properties.kind.enum, ['ASK', 'NOTICE', 'REPORT', 'OK', 'RED']);
+    assert.equal(typeof def.execute, 'function');
+    const okText = def.output.render({}, { ok: true, delivered: 'X', deduped: false, inlined: true });
+    assert.ok(okText[0].text.includes('delivered'), `render 文案不符：${JSON.stringify(okText)}`);
+    const errText = def.output.render({}, { ok: false, code: 'E_NO_ROUTE', reason: '', message: '加 watch' });
+    assert.ok(errText[0].text.includes('E_NO_ROUTE'), `render 错误文案不符：${JSON.stringify(errText)}`);
+  });
+  disposeTool();
+  check('工具 T6b dispose 生效', () => assert.equal(disposed, 1));
+
+  const applyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-apply-'));
+  const applyRegs = [];
+  const applyCtx = {
+    agents: { get: () => undefined, roots: () => [] },
+    tools: { register: (d) => { applyRegs.push(d); return () => {}; } },
+    logger: { info: () => {}, warn: (m) => warnings.push(m) },
+  };
+  const disposeApply = apply(applyCtx, { watches: [{ dir: applyDir, targetIdentity: 'DSH 插件组:QA' }] });
+  check('工具 T7 apply 会把 relay_deliver 一并注册（watches 非空时）', () => {
+    assert.ok(applyRegs.some((d) => d.name === RELAY_TOOL_NAME), `apply 未注册工具：${applyRegs.map((d) => d.name).join(',')}`);
+    assert.equal(buildToolRoutes([{ dir: 'relative', targetIdentity: 'x' }]).length, 0, '相对路径 dir 不该进路由表');
+    assert.equal(buildToolRoutes([{ dir: applyDir, targetIdentity: 'x' }]).length, 1);
+  });
+  disposeApply();
 }
 
 console.log('\n===== 自测汇总 =====');
