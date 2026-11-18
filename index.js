@@ -17,7 +17,10 @@ const DEFAULT_DONE_TEXT = '<!-- DONE -->';
 const TAIL_BYTES = 4096;
 const MAX_REGEX_LENGTH = 200;
 const DEFAULT_STABLE_MS = 5000;
-const DEFAULT_MESSAGE = '文件 {path} 已就绪（触发={reason}），请继续。';
+// P55：默认把正文一起内联投递——主身会话说到底是一次整上下文请求，
+// 只给路径再读一次等于多付一整轮；小文本直接塞进消息，大文件回落到只给路径。
+const DEFAULT_MESSAGE = '文件 {path} 已就绪（触发={reason}）。\n\n{body}';
+const DEFAULT_INLINE_MAX_CHARS = 4000;
 const DELIVERED_DIRNAME = 'dsh-handoff-relay';
 const DELIVERED_SUBDIR = 'delivered';
 const MAX_DELIVERED_FILES = 1000;
@@ -62,6 +65,8 @@ function buildConfigSchema(z) {
     })).volatile().default([]),
     stableMs: z.number().default(DEFAULT_STABLE_MS).volatile(),
     message: z.string().default(DEFAULT_MESSAGE),
+    // P55：{body} 内联上限（字符）。0 或省略＝默认 4000。
+    inlineMaxChars: z.number().default(DEFAULT_INLINE_MAX_CHARS),
   });
 }
 export const Config = buildConfigSchema(SCHEMA_LOAD && SCHEMA_LOAD.z);
@@ -910,10 +915,35 @@ function buildIdentityHead(identity) {
   return `From: ${fromText}\nTo: ${title} | ${id8} | ${kind}\n`;
 }
 
-function buildMessage(relName, fullPath, state, reason, template, identity) {
-  const text = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
+/**
+ * P55：把投递件正文内联进注入消息（模板含 `{body}` 时）。
+ * 目的是省掉「先给路径、再让目标会话读一次」那一整轮上下文——
+ * 小文本直接内联；超限、读失败或疑似二进制则回落到一句说明，仍保留原路径。
+ * 正文里自带的 From:/To: 头与结尾 `<!-- DONE -->` 一并剥掉（头由 relay 重建成权威的两行）。
+ */
+function inlineBodyOf(fullPath, state, cap) {
+  let raw;
+  try {
+    raw = fs.readFileSync(fullPath, 'utf8');
+  } catch (err) {
+    return `（正文读取失败：${(err && err.code) || String(err)}；请读上方路径）`;
+  }
+  if (raw.includes('\u0000')) return `（正文疑似二进制 ${state.size} 字节，未内联；请读上方路径）`;
+  const body = stripIdentityLines(raw.replace(/<!--\s*DONE\s*-->\s*$/i, '')).trim();
+  if (body.length > cap) {
+    return `（正文 ${state.size} 字节，超过内联上限 ${cap} 字符，未内联；请读上方路径）`;
+  }
+  return body;
+}
+
+function buildMessage(relName, fullPath, state, reason, template, identity, inlineMaxChars) {
+  const cap = Number.isFinite(inlineMaxChars) && inlineMaxChars > 0 ? inlineMaxChars : DEFAULT_INLINE_MAX_CHARS;
+  const withBody = String(template).includes('{body}');
+  let rendered = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
     .replaceAll('{reason}', reason)
     .replaceAll('{size}', String(state.size)).replaceAll('{mtimeMs}', String(state.mtimeMs));
+  if (withBody) rendered = rendered.replaceAll('{body}', inlineBodyOf(fullPath, state, cap));
+  const text = rendered;
   const head = buildIdentityHead(identity);
   return Object.freeze({
     id: randomUUID(),
@@ -1362,7 +1392,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const stubFrom = fromLine ? fromLine.replace(/^From: /, '') : '';
     const from = resolveFromText(stubFrom, fromRole);
     const identity = { title, id8, kind, fromText: from.fromText };
-    const message = buildMessage(relName, full, state, reason, cfg.message, identity);
+    const message = buildMessage(relName, full, state, reason, cfg.message, identity, cfg.inlineMaxChars);
     // 审计字段 injectedHeader 与注入同源：两行头文本（不带尾换行）。
     const injectedHeader = buildIdentityHead(identity).replace(/\n$/, '');
     const fileDigest = typeof state.contentHash === 'string' && state.contentHash
@@ -1493,6 +1523,7 @@ export function apply(ctx, config = {}) {
   const cfg = {
     stableMs: Number.isFinite(config && config.stableMs) && config.stableMs > 0 ? config.stableMs : DEFAULT_STABLE_MS,
     message: config && typeof config.message === 'string' && config.message ? config.message : DEFAULT_MESSAGE,
+    inlineMaxChars: Number.isFinite(config && config.inlineMaxChars) && config.inlineMaxChars > 0 ? config.inlineMaxChars : DEFAULT_INLINE_MAX_CHARS,
   };
   const disposers = [];
   const startedModes = [];

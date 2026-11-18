@@ -1109,13 +1109,56 @@ function makeTitleCtx(calls, entries, opts = {}) {
   check('P6 投递文案含文件绝对路径（默认模板 {path}）', () => {
     assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
     // P54：前置 From:/To: 两行身份头，正文文案不变（仍是默认模板 + 绝对路径）。
-    assert.ok(calls[0].content[0].text.endsWith(`文件 ${f} 已就绪（触发=DONE），请继续。`),
+    // P55：默认模板内联正文（此处文件内容为 x），不再只给路径。
+    assert.ok(calls[0].content[0].text.endsWith(`文件 ${f} 已就绪（触发=DONE）。
+
+x`),
       calls[0].content[0].text);
     assert.ok(path.isAbsolute(f));
   });
   disp();
 }
+// P55：{body} 内联正文；正文自带的 From:/To: 与 DONE 被剥掉，头仍只由 relay 生成两行
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const ctx = makeTitleCtx(calls, [{ id: 'P55-A', title: '收件箱' }]);
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetTitle: '收件箱' }], stableMs: 120,
+  }));
+  fs.writeFileSync(path.join(d, 'small.md'), 'From: 某人 · 群分身\nTo: 主身\n\n正文两行\n<!-- DONE -->\n');
+  box.cb('change', 'small.md');
+  check('P55 {body} 内联正文并剥掉自带的 From:/To: 与 DONE', () => {
+    const text = calls[calls.length - 1].content[0].text;
+    assert.ok(text.includes('正文两行'), text);
+    assert.ok(!text.includes('<!-- DONE -->'), text);
+    assert.equal((text.match(/^From: /gm) || []).length, 1, text);
+    assert.equal((text.match(/^To: /gm) || []).length, 1, text);
+  });
+  disp();
+}
 
+// P55：正文超过内联上限 → 回落成一句说明并保留绝对路径
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const ctx = makeTitleCtx(calls, [{ id: 'P55-B', title: '收件箱' }]);
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetTitle: '收件箱' }], stableMs: 120, inlineMaxChars: 10,
+  }));
+  const big = path.join(d, 'big.md');
+  fs.writeFileSync(big, 'y'.repeat(60) + '\n<!-- DONE -->\n');
+  box.cb('change', 'big.md');
+  check('P55 超限正文回落为路径说明', () => {
+    const text = calls[calls.length - 1].content[0].text;
+    assert.ok(text.includes('超过内联上限 10 字符'), text);
+    assert.ok(text.includes(big), text);
+    assert.ok(!text.includes('yyyy'), text);
+  });
+  disp();
+}
 // 加载期每条 watch 一行解析日志（解析到 / 解析不到）
 {
   const dOk = tmp();

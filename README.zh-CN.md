@@ -271,7 +271,8 @@ rescan#2 dir=<dir> result=resolved
 | `watches[].targetTitle` | 目标会话标题的一部分（包含匹配，区分大小写）；每次投递前重新解析；命中 0 条或多条都不投递。与 `targetSessionId` 二选一，必选其一。 |
 | `watches[].exact` | 标题匹配开关，布尔值。省略/`false` = 包含匹配；`true` = 标题完全相等；非布尔值报错并跳过整条 watch。 |
 | `stableMs` | 静默窗口，单位毫秒，所有监控项共用。默认 `5000`。 |
-| `message` | 可选消息模板；支持 `{path}`（被投递文件的绝对路径）、`{file}`（文件名）、`{reason}`、`{size}`、`{mtimeMs}`。 |
+| `message` | 可选消息模板；支持 `{path}`（被投递文件的绝对路径）、`{file}`（文件名）、`{reason}`、`{size}`、`{mtimeMs}`、`{body}`（文件正文，内联）。默认模板内联正文，收方不必再读一次。 |
+| `inlineMaxChars` | `{body}` 内联字符上限，默认 `4000`；超限时正文换成一句说明并保留绝对路径。 |
 | `watches[].done` | 每条 watch 的完成规则：省略=默认文本，`{ text }`、`{ regex }` 或 `null`（关闭）。 |
 
 ## 测试

@@ -364,7 +364,8 @@ rescans, and a normal delivery still writes nothing to `relay.log`.
 | `watches[].exact` | Boolean title-matching switch. Omitted/`false` = substring match; `true` = whole title must be equal; a non-boolean value is an error that skips the whole watch. |
 | `watches[].fromRole` | Optional `From:` label (a directory-ownership label, not an identity) used only when the handoff file has no `From:` line; a non-string value is ignored with a warning. |
 | `stableMs` | Silence window in ms, shared by all watches. Default `5000`. |
-| `message` | Optional template; supports `{path}` (absolute path of the delivered file), `{file}` (file name), `{reason}`, `{size}`, `{mtimeMs}`. |
+| `message` | Optional template; supports `{path}` (absolute path of the delivered file), `{file}` (file name), `{reason}`, `{size}`, `{mtimeMs}`, and `{body}` (the file body, inlined). Default inlines the body so the receiving session does not need a second read. |
+| `inlineMaxChars` | Cap for `{body}` in characters; default `4000`. A larger body is replaced by a one-line note and the absolute path. |
 | `watches[].done` | Per-watch completion rule: omitted = default text, `{ text }`, `{ regex }`, or `null` (off). |
 
 ## Test
