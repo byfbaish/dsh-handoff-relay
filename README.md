@@ -158,13 +158,13 @@ A single hand-off is now also a tool: instead of dropping a file into a watched 
 
 It returns `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`; `delivered` is the absolute path inside the watch directory and `deduped: true` means the same arguments were delivered before. Expected failures are returned, not thrown (`E_ADDR_INVALID`, `E_SESSION_UNRECORDED`, `E_ARGS_INVALID`, `E_BODY_TOO_LARGE`, `E_NO_ROUTE`, `E_DELIVER_FAILED`).
 
-Copy-paste arguments:
+Copy-paste arguments (the `target` below is an address that already has a `watches` entry on this machine; a target without one returns `E_NO_ROUTE` — add a `watches` entry first, the tool never invents a directory):
 
 ```json
 {
-  "target": "DSH 插件组:QA",
+  "target": "DSH 插件组:大肥鱼",
   "subject": "Review request: relay 0.6.1 live delivery",
-  "body": "0.6.1 is installed and the host restarted; run step 1 of docs/stage3-install-and-verify.md and return the relay.log line verbatim.",
+  "body": "0.6.1 is installed (hot-loaded, no restart needed); run step 1 of docs/stage3-install-and-verify.md and return the relay.log line verbatim.",
   "kind": "ASK"
 }
 ```
