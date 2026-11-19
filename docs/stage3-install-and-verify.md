@@ -30,7 +30,7 @@ sha256sum dsh-handoff-relay-0.6.1.tgz
 
 ```text
 dsh-handoff-relay-0.6.1.tgz   58,535 B
-sha256  4e39c858ac80a46fcfc651cba1a6fa0985bb2369be46f7ce8d8b89e9f2e446e3
+sha256  50e06afea6f4b9dfb73c71fe2c42c62c56d96fa0c321438214ac449b4be2a6b3
 npm shasum                      222324bc40b12417912fdedc7285281746bded0e
 包内 8 个文件：LICENSE / README.md / README.zh-CN.md / client.js / cordis.patch.yml / identity.js / index.js / package.json
 ```
