@@ -406,3 +406,9 @@ case to report `PASS` and the summary to end with `RESULT: PASS`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Branch policy (owner ruling, 2026-11-20)
+
+Local branches only: **do not push to any remote, do not merge upstream** ("不合不推").
+Work stays in this working copy until the owner says otherwise. Ruling recorded in
+`dsh-plugins-project/docs/ledger/discipline-remote-writes-20261118.md`.
