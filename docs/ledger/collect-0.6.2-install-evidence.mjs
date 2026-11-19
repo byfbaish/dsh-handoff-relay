@@ -69,6 +69,38 @@ if (!dir) {
       console.log(`  ${st.mtime.toISOString()}  ${st.size} B  ${n}`);
     }
   };
-  list('当前');
-  console.log('（要查四件事：原文件仍在原处／同名 .rejected.md 已生成／其内容与文案一致／无新增 relay-*.md 投递件）');
+  // 前/后对照：--record 记快照（存到 stateDir，不写被 watch 的目录），--diff 与快照比
+  const mode = process.argv[3] || '';
+  const snapPath = path.join(home, '.dsh', 'profiles', 'desktop', 'dsh-handoff-relay', 'evidence-dir-snapshot.json');
+  const current = fs.readdirSync(abs).sort().map((n) => {
+    const st = fs.statSync(path.join(abs, n));
+    return { name: n, size: st.size, mtime: st.mtime.toISOString() };
+  });
+  if (mode === '--record') {
+    fs.writeFileSync(snapPath, JSON.stringify({ dir: abs, at: new Date().toISOString(), files: current }, null, 2));
+    list('已记录快照（前）');
+    console.log(`快照落在：${snapPath.replace(home, '<用户名>')}（不写被 watch 的目录，避免自触发）`);
+  } else if (mode === '--diff') {
+    if (!fs.existsSync(snapPath)) {
+      console.log('没有快照可对比：先跑一次 `--record`');
+    } else {
+      const before = JSON.parse(fs.readFileSync(snapPath, 'utf8'));
+      const beforeNames = new Set(before.files.map((f) => f.name));
+      const afterNames = new Set(current.map((f) => f.name));
+      const added = current.filter((f) => !beforeNames.has(f.name));
+      const removed = before.files.filter((f) => !afterNames.has(f.name));
+      list('当前（后）');
+      console.log(`\n-- 四件事 --`);
+      console.log(`① 原文件仍在原处：${removed.length === 0 ? '待逐名核（下方 removed 为空）' : '否，removed=' + removed.map((f) => f.name).join(',')}`);
+      console.log(`② 同名 .rejected.md 已生成：${added.filter((f) => f.name.endsWith('.rejected.md')).map((f) => f.name).join(',') || '否'}`);
+      console.log(`④ 目录无新增投递件（relay-*.md）：${added.filter((f) => /^relay-[0-9a-f]{8}\.md$/.test(f.name)).map((f) => f.name).join(',') || '无'}`);
+      console.log(`新增：${added.map((f) => f.name).join(', ') || '无'}`);
+      console.log(`消失：${removed.map((f) => f.name).join(', ') || '无'}`);
+      console.log(`③ 内容与文案一致：人工看 .rejected.md（脚本不判文案）`);
+    }
+  } else {
+    list('当前');
+    console.log('（要查四件事：原文件仍在原处／同名 .rejected.md 已生成／其内容与文案一致／无新增 relay-*.md 投递件）');
+    console.log('建议：丢件前 `--record`，丢件后 `--diff`，前/后自动对照。');
+  }
 }
