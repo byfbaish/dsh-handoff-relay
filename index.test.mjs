@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest } from './index.js';
+import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest, RELAY_TOOL_NAME, registerRelayTool } from './index.js';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
@@ -90,7 +90,8 @@ let failed = 0;
 
 function check(label, fn) {
   try {
-    fn();
+    const r = fn();
+    if (r && typeof r.then === 'function') throw new Error('check 收到异步断言：先把 await 结果算好再传同步函数');
     results.push(`PASS  ${label}`);
     out(`PASS  ${label}`);
   } catch (err) {
@@ -1109,13 +1110,56 @@ function makeTitleCtx(calls, entries, opts = {}) {
   check('P6 投递文案含文件绝对路径（默认模板 {path}）', () => {
     assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
     // P54：前置 From:/To: 两行身份头，正文文案不变（仍是默认模板 + 绝对路径）。
-    assert.ok(calls[0].content[0].text.endsWith(`文件 ${f} 已就绪（触发=DONE），请继续。`),
+    // P55：默认模板内联正文（此处文件内容为 x），不再只给路径。
+    assert.ok(calls[0].content[0].text.endsWith(`文件 ${f} 已就绪（触发=DONE）。
+
+x`),
       calls[0].content[0].text);
     assert.ok(path.isAbsolute(f));
   });
   disp();
 }
+// P55：{body} 内联正文；正文自带的 From:/To: 与 DONE 被剥掉，头仍只由 relay 生成两行
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const ctx = makeTitleCtx(calls, [{ id: 'P55-A', title: '收件箱' }]);
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetTitle: '收件箱' }], stableMs: 120,
+  }));
+  fs.writeFileSync(path.join(d, 'small.md'), 'From: 某人 · 群分身\nTo: 主身\n\n正文两行\n<!-- DONE -->\n');
+  box.cb('change', 'small.md');
+  check('P55 {body} 内联正文并剥掉自带的 From:/To: 与 DONE', () => {
+    const text = calls[calls.length - 1].content[0].text;
+    assert.ok(text.includes('正文两行'), text);
+    assert.ok(!text.includes('<!-- DONE -->'), text);
+    assert.equal((text.match(/^From: /gm) || []).length, 1, text);
+    assert.equal((text.match(/^To: /gm) || []).length, 1, text);
+  });
+  disp();
+}
 
+// P55：正文超过内联上限 → 回落成一句说明并保留绝对路径
+{
+  const d = tmp();
+  const calls = [];
+  const box = capturingWatch();
+  const ctx = makeTitleCtx(calls, [{ id: 'P55-B', title: '收件箱' }]);
+  const disp = withFs(box.patch, () => apply(ctx, {
+    watches: [{ dir: d, targetTitle: '收件箱' }], stableMs: 120, inlineMaxChars: 10,
+  }));
+  const big = path.join(d, 'big.md');
+  fs.writeFileSync(big, 'y'.repeat(60) + '\n<!-- DONE -->\n');
+  box.cb('change', 'big.md');
+  check('P55 超限正文回落为路径说明', () => {
+    const text = calls[calls.length - 1].content[0].text;
+    assert.ok(text.includes('超过内联上限 10 字符'), text);
+    assert.ok(text.includes(big), text);
+    assert.ok(!text.includes('yyyy'), text);
+  });
+  disp();
+}
 // 加载期每条 watch 一行解析日志（解析到 / 解析不到）
 {
   const dOk = tmp();
@@ -1994,6 +2038,8 @@ const p9WithProfile = (root) => {
     },
     logger: { info: (m) => seen.push(m), warn: (m) => warnings.push(m) },
     effect: () => {},
+    // tools 自 stage 2 起已是声明依赖（inject 含 'tools'）：严格 ctx 也必须播种，否则违反「已声明即提供」
+    tools: { register: () => () => {} },
     get: () => undefined,                     // 没有 settings 服务
   };
   const strictCtx = new Proxy(target, {
@@ -3627,9 +3673,25 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
       `To 应落 (无标题) 兜底：${JSON.stringify(linesOf(textOf(t4Calls))[1])}`);
   });
 
+  // T6 本仓投递件实际写法：全角冒号、冒号后不空格（From：【…】）⇒ 仍能取到发件人，不得落 UNKNOWN
+  const t6Calls = p54Run({
+    id: 'P54FW000001',
+    title: '主身收件箱',
+    stub: 'From：【大肥鱼（主身）·大管家】\nTo：大肥鱼@主身\n\n正文一行\n<!-- DONE -->\n',
+  });
+  check('P54 T6 全角冒号 From：【…】→ 取到发件人原值，正文自带 From/To 被剥掉', () => {
+    assert.equal(t6Calls.length, 1, `期望 1 次投递，实际 ${t6Calls.length}`);
+    const text = textOf(t6Calls);
+    const lines = linesOf(text);
+    assert.equal(lines[0], 'From: 【大肥鱼（主身）·大管家】', `From 应取正文原值：${JSON.stringify(lines[0])}`);
+    assert.equal(countHead(text, 'From: '), 1, `From 应恰好 1 行：${text}`);
+    assert.equal(countHead(text, 'To: '), 1, `To 应恰好 1 行：${text}`);
+    assert.ok(!text.includes('From：【'), `正文自带 From 应被剥掉：${text}`);
+  });
+
   // T5 任意用例：注入文本里 ^From: 与 ^To: 各恰好 1 行（机检口径）
   check('P54 T5 所有用例注入文本里 ^From: 与 ^To: 各恰好 1 行', () => {
-    for (const calls of [t1Calls, t2Calls, t3Calls, t4Calls]) {
+    for (const calls of [t1Calls, t2Calls, t3Calls, t4Calls, t6Calls]) {
       const text = textOf(calls);
       assert.equal(countHead(text, 'From: '), 1, `From: 行数不符：${text}`);
       assert.equal(countHead(text, 'To: '), 1, `To: 行数不符：${text}`);
@@ -3841,6 +3903,29 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     const parsed = parseWatchesFromYml(written);
     assert.equal(parsed && parsed[0] && parsed[0].fromRole, ROLE_A, `yml 回读不到 fromRole：${JSON.stringify(parsed)}`);
   });
+
+  // P1-11：targetIdentity 必须能随 yml 往返（否则设置卡一保存就把身份绑定吞掉，退回旧的 title/id 绑定）
+  check('P1-11 yml 往返保留 targetIdentity，且与旧字段共存不互相吞', () => {
+    const yml = [
+      '- id: dsh-handoff-relay',
+      '  config:',
+      '    watches:',
+      '',
+      '- id: other-plugin',
+      '',
+    ].join('\n');
+    const watches = [
+      { dir: 'C:/watch/id', targetIdentity: '大肥鱼@主身', targetTitle: '大肥鱼' },
+      { dir: 'C:/watch/old', targetTitle: '甲', targetSessionId: 'session-abc12345-x' },
+    ];
+    const written = replaceWatchesInYml(yml, watches);
+    assert.ok(written.includes('targetIdentity:'), `yml 写回缺 targetIdentity：${written}`);
+    const parsed = parseWatchesFromYml(written);
+    assert.equal(parsed && parsed[0] && parsed[0].targetIdentity, '大肥鱼@主身', `yml 回读不到 targetIdentity：${JSON.stringify(parsed)}`);
+    assert.equal(parsed[0].targetTitle, '大肥鱼', '旧字段不得被吞');
+    assert.equal(parsed[1].targetIdentity, undefined, '没写 targetIdentity 的行不得凭空空写出该键');
+    assert.equal(parsed[1].targetTitle, '甲', '旧绑定行原样往返');
+  });
 }
 
 // ----------------------- P54-fix3：To 行 id8 剥 session- 前缀 + 标题段不得为空
@@ -3925,6 +4010,261 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.equal(linesOf(textOf(t4.calls))[1], 'To: 旧式 id 收件箱 | S-A | 主身',
       `无前缀应保持原行为：${JSON.stringify(linesOf(textOf(t4.calls))[1])}`);
   });
+}
+
+// ---------------------------------------------------------------- 工具面 relay_deliver（stage 2）
+// 判据：参数即约束（缺参／语义错各一码）、身份解析失败两码、无路由给可用清单、
+// 落盘件只留一行权威头（正文自带的 From:/To: 被剥）、同参数两次调用命中同一路径且第二次 deduped。
+{
+  const {
+    validateRelayToolArgs, createRelayToolHandler, buildRelayToolFile,
+    describeRelayRoutes, registerRelayTool, buildToolRoutes, RELAY_TOOL_NAME,
+  } = await import('./index.js');
+  const { IdentityError } = await import('./identity.js');
+
+  const toolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-'));
+  const toolState = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-state-'));
+  const resolvedStub = Object.freeze({
+    sessionId: 'session-aaaa1111-2222-3333-4444-555566667777',
+    title: '工具测试目标',
+    kind: 'group',
+  });
+  const routes = [{ dir: toolDir, targetIdentity: 'DSH 插件组:QA', targetSessionId: '', targetTitle: '', fromRole: 'tool-test' }];
+  const resolveStub = (addr) => {
+    if (addr === 'DSH 插件组:QA') return resolvedStub;
+    if (addr === 'DSH 插件组:不存在') throw new IdentityError('E_ADDR_INVALID', 'unknown room', { reason: 'UNKNOWN_ROOM' });
+    if (addr === '没落盘@主身') throw new IdentityError('E_SESSION_UNRECORDED', 'not recorded', { reason: 'MAIN' });
+    throw new IdentityError('E_ADDR_INVALID', 'bad address', { reason: 'FORMAT' });
+  };
+  const handler = createRelayToolHandler({ routes, stateDir: toolState, inlineMaxChars: 4000, resolveAddress: resolveStub });
+  const okArgs = {
+    target: 'DSH 插件组:QA',
+    subject: '工具投递 T1',
+    body: 'From: 冒充者\nTo: 冒充目标\n正文第一行\n正文第二行',
+  };
+
+  const r1 = await handler(okArgs);
+  const r2 = await handler(okArgs);
+  check('工具 T1 成功投递：ok / 落盘件在 watch 目录 / 返回 deduped:false、inlined:true', () => {
+    assert.equal(r1.ok, true, `期望 ok，实际 ${JSON.stringify(r1)}`);
+    assert.equal(r1.deduped, false, '首次投递不应 deduped');
+    assert.equal(r1.inlined, true, '短正文应 inlined:true');
+    assert.match(path.basename(r1.delivered), /^relay-[0-9a-f]{8}\.md$/, `文件名不符：${r1.delivered}`);
+    assert.ok(fs.existsSync(r1.delivered), `落盘件不存在：${r1.delivered}`);
+    assert.equal(r1.target, 'aaaa1111', `target(id8) 应剥 session- 前缀：${r1.target}`);
+    assert.equal(r1.targetTitle, '工具测试目标');
+  });
+  check('工具 T1b 落盘件只留一行权威头：调用方自带 From:/To: 被剥、无冒充者', () => {
+    const text = fs.readFileSync(r1.delivered, 'utf8');
+    const lines = text.split('\n');
+    const fromLines = lines.filter((l) => /^From\s*[:：]/.test(l));
+    const toLines = lines.filter((l) => /^To\s*[:：]/.test(l));
+    assert.equal(fromLines.length, 1, `From 头应恰好一行，实际 ${fromLines.length}`);
+    assert.equal(toLines.length, 1, `To 头应恰好一行，实际 ${toLines.length}`);
+    assert.ok(!text.includes('冒充者'), '正文里的冒充 From 行必须被剥掉');
+    assert.ok(!text.includes('冒充目标'), '正文里的冒充 To 行必须被剥掉');
+    assert.ok(text.includes('# 工具投递 T1'), 'subject 应作一级标题');
+    assert.ok(text.endsWith('\n'), '文件应以单个换行结尾');
+  });
+  check('工具 T1c 同参数第二次调用：同一路径、deduped:true、不重复落盘', () => {
+    assert.equal(r2.ok, true, `期望 ok，实际 ${JSON.stringify(r2)}`);
+    assert.equal(r2.deduped, true, '第二次应 deduped:true');
+    assert.equal(r2.delivered, r1.delivered, '两次应命中同一路径');
+    assert.equal(fs.readdirSync(toolDir).filter((n) => n.endsWith('.md')).length, 1, '目录里应只有一个投递件');
+  });
+
+  check('工具 T2 缺参／语义错：subject 缺失、subject 多行、body 为空各回 E_ARGS_INVALID 并指对 field', () => {
+    const a = validateRelayToolArgs({ target: 'DSH 插件组:QA', body: 'x' });
+    assert.equal(a.error.code, 'E_ARGS_INVALID');
+    assert.equal(a.error.field, 'subject');
+    const b = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: 'ok\nsecond', body: 'x' });
+    assert.equal(b.error.code, 'E_ARGS_INVALID');
+    assert.equal(b.error.field, 'subject');
+    const c = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: 'ok', body: '   ' });
+    assert.equal(c.error.code, 'E_ARGS_INVALID');
+    assert.equal(c.error.field, 'body');
+    const d = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: 'ok', body: 'x', kind: 'WHATEVER' });
+    assert.equal(d.error.code, 'E_ARGS_INVALID');
+    assert.equal(d.error.field, 'kind');
+  });
+  const beforeTooLarge = fs.readdirSync(toolDir).length;
+  const tooLarge = await handler({ target: 'DSH 插件组:QA', subject: '超限', body: 'a'.repeat(1024 * 1024 + 1) });
+  check('工具 T2b body 超 1 MiB → E_BODY_TOO_LARGE，且不动目录', () => {
+    assert.equal(tooLarge.code, 'E_BODY_TOO_LARGE', `期望 E_BODY_TOO_LARGE，实际 ${JSON.stringify(tooLarge)}`);
+    assert.equal(fs.readdirSync(toolDir).length, beforeTooLarge, '超限不应落盘');
+  });
+
+  const beforeNul = fs.readdirSync(toolDir).length;
+  const nulCall = await handler({ target: 'DSH 插件组:QA', subject: '含NUL', body: '正文\u0000尾巴' });
+  check('工具 T2c body 含 NUL → E_ARGS_INVALID/field=body（走既有码）、不落盘、不新增码', () => {
+    const r = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: '含NUL', body: '正文\u0000尾巴' });
+    assert.ok(r.error, `应校验失败，实际 ${JSON.stringify(r)}`);
+    assert.equal(r.error.code, 'E_ARGS_INVALID', `NUL 应走既有 E_ARGS_INVALID，实际 ${r.error.code}`);
+    assert.equal(r.error.field, 'body');
+    assert.ok(r.error.message.includes('NUL'), `文案应指明 NUL：${r.error.message}`);
+    assert.equal(nulCall.code, 'E_ARGS_INVALID', `handler 也应回 E_ARGS_INVALID，实际 ${nulCall.code}`);
+    assert.equal(nulCall.field, 'body');
+    assert.equal(fs.readdirSync(toolDir).length, beforeNul, 'NUL 不应落盘');
+  });
+
+  const bad1 = await handler({ target: 'DSH 插件组:不存在', subject: 's', body: 'b' });
+  const bad2 = await handler({ target: '没落盘@主身', subject: 's', body: 'b' });
+  check('工具 T3 目标解析失败：E_ADDR_INVALID + reason，正文不落盘', () => {
+    assert.equal(bad1.ok, false);
+    assert.equal(bad1.code, 'E_ADDR_INVALID');
+    assert.equal(bad1.reason, 'UNKNOWN_ROOM');
+    assert.equal(bad1.field, 'target');
+    assert.ok(bad1.message.includes('群名:Bot'), `文案应指路地址格式：${bad1.message}`);
+  });
+  check('工具 T3b 主身 id 未落盘：E_SESSION_UNRECORDED + reason=MAIN（不误用 E_ARGS_INVALID）', () => {
+    assert.equal(bad2.code, 'E_SESSION_UNRECORDED');
+    assert.equal(bad2.reason, 'MAIN');
+  });
+
+  const noRouteHandler = createRelayToolHandler({ routes: [], stateDir: toolState, resolveAddress: resolveStub });
+  const noRoute = await noRouteHandler({ target: 'DSH 插件组:QA', subject: 's', body: 'b' });
+  check('工具 T4 无路由 → E_NO_ROUTE，文案给可用目标清单（空表也要说清）', () => {
+    assert.equal(noRoute.code, 'E_NO_ROUTE');
+    assert.ok(noRoute.message.includes('当前可用目标'), `文案缺可用清单：${noRoute.message}`);
+    assert.ok(noRoute.message.includes('watches'), `文案应指路加配置：${noRoute.message}`);
+    const list = describeRelayRoutes(routes);
+    assert.deepEqual(list, ['dfw-tool-' + path.basename(toolDir).replace('dfw-tool-', '') + ' → DSH 插件组:QA'].map((x) => x.replace(/^dfw-tool-[^ ]+/, path.basename(toolDir))), '可用清单应是「目录尾段 → 地址」');
+  });
+
+  const stripDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-strip-'));
+  const stripHandler = createRelayToolHandler({
+    routes: [{ dir: stripDir, targetIdentity: 'DSH 插件组:QA', targetSessionId: '', targetTitle: '', fromRole: 'tool-test' }],
+    stateDir: toolState,
+    resolveAddress: resolveStub,
+  });
+  const s1 = await stripHandler({ target: 'DSH 插件组:QA', subject: '同题幂等', body: 'From: x\n正文' });
+  const s2 = await stripHandler({ target: 'DSH 插件组:QA', subject: '同题幂等', body: '正文' });
+  check('工具 T5 同一 body 带/不带 From: → 两次调用命中同一路径，第二次 deduped:true', () => {
+    const a = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: 'From: x\n正文' });
+    const b = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: '正文' });
+    assert.equal(a.relName, b.relName, `剥头后应同名：${a.relName} vs ${b.relName}`);
+    const c = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: '正文改一个字' });
+    assert.notEqual(a.relName, c.relName, '正文变化应换文件名');
+    assert.equal(s1.ok, true, `首次应成功：${JSON.stringify(s1)}`);
+    assert.equal(s1.deduped, false, '首次不应 deduped');
+    assert.equal(s2.ok, true, `第二次应成功：${JSON.stringify(s2)}`);
+    assert.equal(s2.delivered, s1.delivered, `带不带 From: 应命中同一路径：${s1.delivered} vs ${s2.delivered}`);
+    assert.equal(s2.deduped, true, '第二次应 deduped:true');
+    assert.equal(fs.readdirSync(stripDir).filter((n) => n.endsWith('.md')).length, 1, '目录里应只有一个投递件');
+  });
+
+  const registered = [];
+  let disposed = 0;
+  const toolCtx = { agents: { get: () => undefined, roots: () => [] }, tools: { register: (d) => { registered.push(d); return () => { disposed += 1; }; } }, logger: { info: () => {}, warn: (m) => warnings.push(m) } };
+  const disposeTool = registerRelayTool(toolCtx, { routes, stateDir: toolState });
+  check('工具 T6 注册：名字＝relay_deliver、required＝target/subject/body、output.render 可用', () => {
+    assert.equal(registered.length, 1, '应注册恰好一个工具');
+    const def = registered[0];
+    assert.equal(def.name, RELAY_TOOL_NAME);
+    assert.deepEqual(def.parameters.required, ['target', 'subject', 'body']);
+    assert.deepEqual(def.parameters.properties.kind.enum, ['ASK', 'NOTICE', 'REPORT', 'OK', 'RED']);
+    assert.equal(typeof def.execute, 'function');
+    const okText = def.output.render({}, { ok: true, delivered: 'X', deduped: false, inlined: true });
+    assert.ok(okText[0].text.includes('delivered'), `render 文案不符：${JSON.stringify(okText)}`);
+    const errText = def.output.render({}, { ok: false, code: 'E_NO_ROUTE', reason: '', message: '加 watch' });
+    assert.ok(errText[0].text.includes('E_NO_ROUTE'), `render 错误文案不符：${JSON.stringify(errText)}`);
+  });
+  disposeTool();
+  check('工具 T6b dispose 生效', () => assert.equal(disposed, 1));
+
+  const applyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-apply-'));
+  const applyRegs = [];
+  const applyCtx = {
+    agents: { get: () => undefined, roots: () => [] },
+    tools: { register: (d) => { applyRegs.push(d); return () => {}; } },
+    logger: { info: () => {}, warn: (m) => warnings.push(m) },
+  };
+  const disposeApply = apply(applyCtx, { watches: [{ dir: applyDir, targetIdentity: 'DSH 插件组:QA' }] });
+  check('工具 T7 apply 会把 relay_deliver 一并注册（watches 非空时）', () => {
+    assert.ok(applyRegs.some((d) => d.name === RELAY_TOOL_NAME), `apply 未注册工具：${applyRegs.map((d) => d.name).join(',')}`);
+    assert.equal(buildToolRoutes([{ dir: 'relative', targetIdentity: 'x' }]).length, 0, '相对路径 dir 不该进路由表');
+    assert.equal(buildToolRoutes([{ dir: applyDir, targetIdentity: 'x' }]).length, 1);
+  });
+  disposeApply();
+}
+
+// ---------------------------------------------------------------- P56：启动行的分子只数 watch
+// 现场事故形态：装上 0.6.0 后启动行写「启动 10/9 个 watch」，而配置只有 9 条 - dir:。
+// 成因：工具面 relay_deliver 的注销器被塞进同一个 disposers 数组，而启动行原先用 disposers.length 当分子。
+// 判据：两条 watch 都启动 → 恰好 2/2；工具面已注册不影响分子。
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p56-'));
+  const restoreProfile = p9WithProfile(root);
+  const d1 = tmp();
+  const d2 = tmp();
+  const box = capturingWatch();
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx([]), {
+      watches: [
+        { dir: d1, targetSessionId: 'P56-A' },
+        { dir: d2, targetSessionId: 'P56-B' },
+      ],
+      stableMs: 120,
+    }));
+    const logFile = path.join(p9StateDir(root), 'relay.log');
+    const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
+    check('P56 启动行分子只数 watch：两条 watch → 启动 2/2（工具面不占分子）', () => {
+      const line = text.split('\n').find((l) => l.includes('启动') && l.includes('个 watch')) || '';
+      assert.ok(line, `relay.log 应有启动行，实际：${text.slice(-400)}`);
+      assert.ok(line.includes('启动 2/2 个 watch'), `期望「启动 2/2 个 watch」，实际：${line}`);
+    });
+    check('P56 工具面仍注册（分子修正不牵连注册路径）', () => {
+      assert.ok(typeof RELAY_TOOL_NAME === 'string' && RELAY_TOOL_NAME, 'RELAY_TOOL_NAME 应导出');
+      assert.ok(typeof registerRelayTool === 'function', 'registerRelayTool 应导出');
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
+// ---------------------------------------------------------------- G-4：日志标签按 kind 分支
+// 事故形态：用 targetIdentity 配的 watch，启动行写成「目标=targetSessionId=DSH 插件组:xxx」，
+// 值对、标签错，排查时会被当成用 id 配的 watch。
+// 判据：identity → targetIdentity=；title → targetTitle=；id → targetSessionId=。
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-g4-'));
+  const restoreProfile = p9WithProfile(root);
+  const dIdA = tmp();
+  const dIdB = tmp();
+  const dTitle = tmp();
+  const box = capturingWatch();
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx([]), {
+      watches: [
+        { dir: dIdA, targetIdentity: '不存在的群:不存在的Bot' },
+        { dir: dIdB, targetIdentity: 'DSH 插件组:不存在的人' },
+        { dir: dTitle, targetTitle: '某个标题' },
+      ],
+      stableMs: 120,
+    }));
+    const logFile = path.join(p9StateDir(root), 'relay.log');
+    const lines = (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '')
+      .split('\n').filter((l) => l.includes('加载解析'));
+    check('G-4 identity 目标的日志标签是 targetIdentity=，不再印成 targetSessionId=', () => {
+      const hit = lines.filter((l) => l.includes('不存在的群:不存在的Bot') || l.includes('DSH 插件组:不存在的人'));
+      assert.equal(hit.length, 2, `应有 2 行 identity 目标的加载解析，实际 ${hit.length}：${lines.join(' | ')}`);
+      for (const l of hit) {
+        assert.ok(l.includes('目标=targetIdentity='), `identity 目标应打 targetIdentity=：${l}`);
+        assert.ok(!l.includes('目标=targetSessionId='), `identity 目标不应打 targetSessionId=：${l}`);
+      }
+    });
+    check('G-4 title 目标仍打 targetTitle=（两支不牵连）', () => {
+      const hit = lines.filter((l) => l.includes('某个标题'));
+      assert.equal(hit.length, 1, `应有 1 行 title 目标，实际 ${hit.length}`);
+      assert.ok(hit[0].includes('目标=targetTitle="某个标题"'), `title 目标应打 targetTitle=：${hit[0]}`);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
 }
 
 console.log('\n===== 自测汇总 =====');

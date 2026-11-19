@@ -11,6 +11,33 @@
 取名 **relay** 是因为它做的正是「把一条已就绪的信号点到点转达到某个会话」；
 刻意避开会让人以为能起构建 / 跑命令的字眼——`trigger` 会被误读成能触发动作。
 
+## 配套关系
+
+本插件是三个配套项目中的一个。
+
+```mermaid
+graph LR
+  ID["dsh-identity-resolve 0.1.0<br/>身份解析 — 唯一真源"]
+  RL["dsh-handoff-relay 0.5.0<br/>目录监听 → 一条通知"]
+  HOST["DS-Bot（上游，第三方）<br/>Bot / 群 / 会话 / 插件注入点"]
+  ID -->|"地址语义<br/>群名:Bot · Bot@主身<br/>E_ADDR_INVALID · E_SESSION_UNRECORDED"| RL
+  HOST --- RL
+  HOST --- ID
+```
+
+- **地址语义**来自 `dsh-identity-resolve`，那是唯一真源。本包在 `identity.js`
+  内置一份副本，因为本包以自包含 tgz 装进宿主 profile，运行期拿不到解析器
+  的检出目录。那份副本是**有意镜像，不是分叉**：文件头写明替换条件——待解析器
+  按正规流程发布后，本文件整体替换为 `import { resolveInSnapshot } …`。在此之前
+  两边逐条对照，`identity.js` 跟随解析器的代码与错误码命名。
+- **宿主**：[DS-Bot](https://github.com/Fei2411/DS-Bot)，第三方上游仓。本插件
+  依赖它的 Bot / 群 / 会话模型与插件注入点（`cordis.patch.yml`）；本仓不改上游
+  代码，也不改宿主安装。
+- **配置**在 `cordis.patch.yml` 的 `watches` 段（字段见后文）。每个 watch 的目标
+  可以写死 `targetSessionId`，也可以写身份地址 `targetIdentity`——例如
+  `大肥鱼@主身`、`DSH 插件组:大肥鱼`——在启动时解析一次、每次投递再解析一次，
+  所以换会话段不需要重启。
+
 ## 「已完成」如何判定
 
 - **静默期**：文件在 `stableMs` 毫秒内（默认 `5000`）不再变化，即判定为已完成。
@@ -58,6 +85,40 @@ watch、找的是什么标题、命中几条（有歧义时列出候选）。**�
 通知是一条用户消息，默认文本形如
 `文件 <绝对路径> 已就绪（触发=stable|DONE），请继续。`，收件方可以按该路径直接读文件。
 如果目标会话尚未加载，则写一条警告日志，不发送任何消息。
+
+## 工具：relay_deliver（0.6.0 起）
+
+一条投递现在也是工具：不必先往目录里放文件再等 watch，调用时直接给「目标地址 + 标题 + 正文」。文件方式仍然保留，两者共用同一套落盘、身份头、去重与归档逻辑。
+
+| 参数 | 必填 | 约束 |
+| --- | --- | --- |
+| `target` | 是 | `<群名>:<Bot>` 或 `<Bot>@主身`，原样匹配、不 trim、不做模糊补全 |
+| `subject` | 是 | 单行标题，≤120 字符；同一目标下它参与幂等键 |
+| `body` | 是 | 要交的正文，无字符上限，护栏 1 MiB（1,048,576 字节），禁 NUL |
+| `kind` | 否 | `ASK`／`NOTICE`／`REPORT`／`OK`／`RED`，缺省 `REPORT` |
+
+返回 `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`：`delivered` 是落到 watch 目录的绝对路径，`deduped: true` 表示同参数重复调用、没有再次投递。预期失败不抛异常，直接回 `code`（`E_ADDR_INVALID`／`E_SESSION_UNRECORDED`／`E_ARGS_INVALID`／`E_BODY_TOO_LARGE`／`E_NO_ROUTE`／`E_DELIVER_FAILED`）。
+
+**可直接复制的调用参数**（交给任意 Bot，或直接在工具面板里粘贴）：
+
+> 示例里的 `target` 是本机**已配置 watch** 的地址：它绑了两条 watch（`…\.batch\night\bridge\to-plugin-group`、`…\dsh-plugins-project\bridge\to-group`），命中配置里靠前的一条。换成没配置的目标会回 `E_NO_ROUTE`，此时先给该目标加一条 `watches` 再用——工具不会自己造目录。
+
+```json
+{
+  "target": "DSH 插件组:大肥鱼",
+  "subject": "复核请求：relay 0.6.1 实机投递",
+  "body": "已装 0.6.1（热加载，无需重启），请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。",
+  "kind": "ASK"
+}
+```
+
+**一句话版本**（发给你正在对话的 Bot）：
+
+```text
+用 relay_deliver 给「DSH 插件组:大肥鱼」发一条 ASK：subject 写「复核请求：relay 0.6.1 实机投递」，body 写「已装 0.6.1（热加载，无需重启），请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。」
+```
+
+目标没在 `watches` 里配置过时，工具不会自己造目录，而是回 `E_NO_ROUTE` 并列出最多 5 个可用目标（形如 `目录尾段 → 地址`）；把该目标加进 `watches` 后即可投递。成功投递会在 `relay.log` 写一行 `dsh-handoff-relay tool-deliver target=relay-xxxxxxx.md dir=… deduped=false`。
 
 ## 为什么叫 relay
 
@@ -244,7 +305,8 @@ rescan#2 dir=<dir> result=resolved
 | `watches[].targetTitle` | 目标会话标题的一部分（包含匹配，区分大小写）；每次投递前重新解析；命中 0 条或多条都不投递。与 `targetSessionId` 二选一，必选其一。 |
 | `watches[].exact` | 标题匹配开关，布尔值。省略/`false` = 包含匹配；`true` = 标题完全相等；非布尔值报错并跳过整条 watch。 |
 | `stableMs` | 静默窗口，单位毫秒，所有监控项共用。默认 `5000`。 |
-| `message` | 可选消息模板；支持 `{path}`（被投递文件的绝对路径）、`{file}`（文件名）、`{reason}`、`{size}`、`{mtimeMs}`。 |
+| `message` | 可选消息模板；支持 `{path}`（被投递文件的绝对路径）、`{file}`（文件名）、`{reason}`、`{size}`、`{mtimeMs}`、`{body}`（文件正文，内联）。默认模板内联正文，收方不必再读一次。 |
+| `inlineMaxChars` | `{body}` 内联字符上限，默认 `4000`；超限时正文换成一句说明并保留绝对路径。 |
 | `watches[].done` | 每条 watch 的完成规则：省略=默认文本，`{ text }`、`{ regex }` 或 `null`（关闭）。 |
 
 ## 测试

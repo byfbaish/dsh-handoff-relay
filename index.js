@@ -8,14 +8,19 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
+// P1-11：身份 → 会话解析（<群名>:<Bot> / <Bot>@主身），投递时现读 state.json，换段自动跟随。
+import { resolveAddressNow, describeIdentityError, REASONS as IDENTITY_REASONS } from './identity.js';
 export const name = 'dsh-handoff-relay';
-export const inject = ['agents'];
+export const inject = ['agents', 'tools'];
 const PLUGIN_NAME = 'dsh-handoff-relay';
 const DEFAULT_DONE_TEXT = '<!-- DONE -->';
 const TAIL_BYTES = 4096;
 const MAX_REGEX_LENGTH = 200;
 const DEFAULT_STABLE_MS = 5000;
-const DEFAULT_MESSAGE = '文件 {path} 已就绪（触发={reason}），请继续。';
+// P55：默认把正文一起内联投递——主身会话说到底是一次整上下文请求，
+// 只给路径再读一次等于多付一整轮；小文本直接塞进消息，大文件回落到只给路径。
+const DEFAULT_MESSAGE = '文件 {path} 已就绪（触发={reason}）。\n\n{body}';
+const DEFAULT_INLINE_MAX_CHARS = 4000;
 const DELIVERED_DIRNAME = 'dsh-handoff-relay';
 const DELIVERED_SUBDIR = 'delivered';
 const MAX_DELIVERED_FILES = 1000;
@@ -50,6 +55,9 @@ function buildConfigSchema(z) {
       dir: z.string().default(''),
       targetTitle: z.string().default(''),
       targetSessionId: z.string().default(''),
+      // P1-11：按身份绑定（`<群名>:<Bot>` 或 `<Bot>@主身`）。给了它就优先于 title/id，
+      // 投递时现解析成当前会话，换段不需要改配置、不需要重启 DSH。
+      targetIdentity: z.string().default(''),
       exact: z.boolean().default(true),
       // P54-fix2：可选目录归属标签；写进 schema 才不会被宿主解析时丢掉（缺省空串 = P54 行为）。
       fromRole: z.string().default(''),
@@ -57,6 +65,8 @@ function buildConfigSchema(z) {
     })).volatile().default([]),
     stableMs: z.number().default(DEFAULT_STABLE_MS).volatile(),
     message: z.string().default(DEFAULT_MESSAGE),
+    // P55：{body} 内联上限（字符）。0 或省略＝默认 4000。
+    inlineMaxChars: z.number().default(DEFAULT_INLINE_MAX_CHARS),
   });
 }
 export const Config = buildConfigSchema(SCHEMA_LOAD && SCHEMA_LOAD.z);
@@ -789,6 +799,17 @@ function hitsText(hits) {
  * resolved=<会话 id> / agent-not-found / title-no-match:<命中数> / title-multiple:<命中数>。
  */
 function describeTargetNow(ctx, target) {
+  // P1-11：按身份绑定的目标——加载期只看「现在能不能解析到」，解析不到只影响日志与 warn。
+  if (target.kind === 'identity') {
+    try {
+      const r = resolveAddressNow(target.value);
+      const s = resolveSession(ctx, r.sessionId);
+      if (!s.found) return { ok: false, id: r.sessionId, title: '', count: 0, hits: [], status: `identity=${r.sessionId} agent-not-loaded` };
+      return { ok: true, id: r.sessionId, title: s.title || '(无标题)', count: 1, hits: [], status: `identity=${r.sessionId} resolved` };
+    } catch (err) {
+      return { ok: false, id: '', title: '', count: 0, hits: [], status: `identity-${describeIdentityError(err)}` };
+    }
+  }
   if (target.kind === 'id') {
     const s = resolveSession(ctx, target.value);
     if (!s.found) return { ok: false, id: '', title: '', count: 0, hits: [], status: 'agent-not-found' };
@@ -813,7 +834,7 @@ function describeTargetNow(ctx, target) {
 // P54：注入消息的身份头由 relay 前置，不从配置模板取值（安全规则不能靠用户配置保证）。
 const IDENTITY_UNKNOWN = 'UNKNOWN';
 const IDENTITY_FALLBACK_TITLE = '(无标题)';
-const IDENTITY_LINE_RE = /^(?:From|To): .+$/;
+const IDENTITY_LINE_RE = /^(?:From|To)\s*[:：]\s*\S.*$/;
 // P54-fix3（D-TO8）：真实会话 id 形如 `session-8ea61110-…`，直接 slice(0, 8) 恒得字面前缀 `session-`。
 // 故 To 第二段先剥该前缀再取 8 位；没有该前缀（测试桩或旧式 id）保持原行为，仍取前 8 位。
 const SESSION_ID_PREFIX = 'session-';
@@ -849,7 +870,7 @@ function readStubFromLine(full) {
     const read = fs.readSync(fd, buf, 0, TAIL_BYTES, 0);
     const head = buf.subarray(0, read).toString('utf8');
     for (const line of head.split(/\r?\n/)) {
-      if (/^From: .+$/.test(line)) return line;
+      if (/^From\s*[:：]\s*\S.*$/.test(line)) return line;
     }
   } catch { /* 读不到就当没写身份 */ } finally {
     if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* ignore */ } }
@@ -894,10 +915,35 @@ function buildIdentityHead(identity) {
   return `From: ${fromText}\nTo: ${title} | ${id8} | ${kind}\n`;
 }
 
-function buildMessage(relName, fullPath, state, reason, template, identity) {
-  const text = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
+/**
+ * P55：把投递件正文内联进注入消息（模板含 `{body}` 时）。
+ * 目的是省掉「先给路径、再让目标会话读一次」那一整轮上下文——
+ * 小文本直接内联；超限、读失败或疑似二进制则回落到一句说明，仍保留原路径。
+ * 正文里自带的 From:/To: 头与结尾 `<!-- DONE -->` 一并剥掉（头由 relay 重建成权威的两行）。
+ */
+function inlineBodyOf(fullPath, state, cap) {
+  let raw;
+  try {
+    raw = fs.readFileSync(fullPath, 'utf8');
+  } catch (err) {
+    return `（正文读取失败：${(err && err.code) || String(err)}；请读上方路径）`;
+  }
+  if (raw.includes('\u0000')) return `（正文疑似二进制 ${state.size} 字节，未内联；请读上方路径）`;
+  const body = stripIdentityLines(raw.replace(/<!--\s*DONE\s*-->\s*$/i, '')).trim();
+  if (body.length > cap) {
+    return `（正文 ${state.size} 字节，超过内联上限 ${cap} 字符，未内联；请读上方路径）`;
+  }
+  return body;
+}
+
+function buildMessage(relName, fullPath, state, reason, template, identity, inlineMaxChars) {
+  const cap = Number.isFinite(inlineMaxChars) && inlineMaxChars > 0 ? inlineMaxChars : DEFAULT_INLINE_MAX_CHARS;
+  const withBody = String(template).includes('{body}');
+  let rendered = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
     .replaceAll('{reason}', reason)
     .replaceAll('{size}', String(state.size)).replaceAll('{mtimeMs}', String(state.mtimeMs));
+  if (withBody) rendered = rendered.replaceAll('{body}', inlineBodyOf(fullPath, state, cap));
+  const text = rendered;
   const head = buildIdentityHead(identity);
   return Object.freeze({
     id: randomUUID(),
@@ -979,6 +1025,10 @@ export function serializeWatchesBlock(watches, indent = '    ') {
     if (w && typeof w.targetTitle === 'string' && w.targetTitle) {
       out.push(`${indent}    targetTitle: ${yamlQuote(w.targetTitle)}`);
     }
+    // P1-11：targetIdentity 只在有值时写出，形状与 targetTitle 一致，旧字段照旧保留。
+    if (w && typeof w.targetIdentity === 'string' && w.targetIdentity) {
+      out.push(`${indent}    targetIdentity: ${yamlQuote(w.targetIdentity)}`);
+    }
     if (w && w.exact === true) out.push(`${indent}    exact: true`);
     // P54-fix2：fromRole 是可选字段；只在有值时写出，缺省时整行省略（与 P54 的块形状一致）。
     if (w && typeof w.fromRole === 'string' && w.fromRole) {
@@ -1051,6 +1101,7 @@ export function parseWatchesFromYml(source) {
       const raw = field[2].trim();
       if (name === 'targetSessionId') item.targetSessionId = unquote(raw);
       else if (name === 'targetTitle') item.targetTitle = unquote(raw);
+      else if (name === 'targetIdentity') item.targetIdentity = unquote(raw);
       else if (name === 'exact') item.exact = raw === 'true';
       else if (name === 'fromRole') item.fromRole = unquote(raw);
       doneOwner = null;
@@ -1226,7 +1277,9 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     pending.clear();
   }
   const titleText = `targetTitle="${target.value}" exact=${target.exact === true ? 'true' : 'false'}`;
-  const targetText = target.kind === 'title'
+  const targetText = target.kind === 'identity'
+    ? `targetIdentity="${target.value}"（按身份现解析）`
+    : target.kind === 'title'
     ? (target.id ? `${titleText}（targetSessionId=${target.id} 兜底）` : titleText)
     : `targetSessionId=${target.value}`;
   const warnErr = (kind, err) => log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} ${kind}：${String(err)}`);
@@ -1239,6 +1292,29 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
    * reason ∈ agent-not-found / title-no-match / title-multiple（写 relay.log 用）。
    */
   function resolveNow(relName) {
+    // P1-11：按身份绑定。每次投递现读 state.json → 当前会话 id → 校验会话已加载。
+    // 解析失败不缓存（换段/懒写入窗口靠下一次事件自愈），文件保持未投递；
+    // ROOM_SEGMENT 属懒写入窗口，MAIN 重试无用需上报，日志里按 <code>/<reason> 区分。
+    if (target.kind === 'identity') {
+      let r;
+      try {
+        r = resolveAddressNow(target.value);
+      } catch (err) {
+        const tag = describeIdentityError(err);
+        const msg = `[${PLUGIN_NAME}] ${label} 身份解析失败（${tag}）：${target.value}；文件 ${relName} 未投递，保持未投递等下次事件（不缓存失败，dir=${watchDir}）`;
+        log(ctx, 'warn', msg);
+        relayLog(ctx, stateDir, 'warn', `身份解析失败 relName=${path.basename(relName)} 地址=${target.value} ${tag}`);
+        return { ok: false, reason: `identity-${tag}` };
+      }
+      const agent = findAgentById(ctx, r.sessionId, warnErr);
+      if (!agent) {
+        const msg = `[${PLUGIN_NAME}] ${label} 身份解析到会话 ${r.sessionId}（${r.address}），但该会话尚未加载；文件 ${relName} 未投递，等下次事件重试`;
+        log(ctx, 'warn', msg);
+        relayLog(ctx, stateDir, 'warn', `身份目标会话未加载 relName=${path.basename(relName)} 地址=${r.address} sessionId=${r.sessionId}`);
+        return { ok: false, reason: 'agent-not-loaded' };
+      }
+      return { ok: true, id: r.sessionId, title: sessionTitleOf(ctx, agent) || '(无标题)', agent, identity: r };
+    }
     if (target.kind === 'id') {
       const agent = findAgentById(ctx, target.value, warnErr);
       if (!agent) {
@@ -1313,10 +1389,10 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const id8 = id8Of(resolved.id);
     const kind = title.includes(' · ') ? '群分身' : '主身';
     const fromLine = readStubFromLine(full);
-    const stubFrom = fromLine ? fromLine.replace(/^From: /, '') : '';
+    const stubFrom = fromLine ? fromLine.replace(/^From\s*[:：]\s*/, '') : '';
     const from = resolveFromText(stubFrom, fromRole);
     const identity = { title, id8, kind, fromText: from.fromText };
-    const message = buildMessage(relName, full, state, reason, cfg.message, identity);
+    const message = buildMessage(relName, full, state, reason, cfg.message, identity, cfg.inlineMaxChars);
     // 审计字段 injectedHeader 与注入同源：两行头文本（不带尾换行）。
     const injectedHeader = buildIdentityHead(identity).replace(/\n$/, '');
     const fileDigest = typeof state.contentHash === 'string' && state.contentHash
@@ -1442,17 +1518,305 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   return dispose;
 }
 
+// ---------------------------------------------------------------- 工具面：relay_deliver
+// 规格与签名见 docs/relay-tool-interface.md（stage 1 定稿）。工具与目录 watch 共用一套落盘与去重：
+// 工具只负责按参数写出 `relay-<hash8>.md`，投递仍由该目录对应的 watch 完成，审计链不变。
+export const RELAY_TOOL_NAME = 'relay_deliver';
+const TOOL_SUBJECT_MAX_CHARS = 120;
+const TOOL_BODY_MAX_BYTES = 1024 * 1024;
+const TOOL_KINDS = Object.freeze(['ASK', 'NOTICE', 'REPORT', 'OK', 'RED']);
+const TOOL_DEFAULT_KIND = 'REPORT';
+const TOOL_NO_ROUTE_LIMIT = 5;
+const TOOL_STAGING_DIRNAME = 'tool-staging';
+
+const TOOL_PARAMETERS = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  required: ['target', 'subject', 'body'],
+  properties: {
+    target: {
+      type: 'string',
+      description: '目标地址，只接受「<群名>:<Bot>」或「<Bot>@主身」；不 trim、不做模糊匹配、不带群名一律不解析。',
+    },
+    subject: {
+      type: 'string',
+      description: '单行标题，非空，≤120 字符。标题进幂等键：同一正文换标题＝换文件名，故不要为省事复制别条标题。',
+    },
+    body: {
+      type: 'string',
+      description: '正文，非空，UTF-8 ≤ 1 MiB（1,048,576 字节）。不要自带 From:／To: 行（落盘前会被剥掉）。',
+    },
+    kind: {
+      type: 'string',
+      enum: Array.from(TOOL_KINDS),
+      description: '消息性质，缺省 REPORT。',
+    },
+  },
+});
+
+const TOOL_OUTPUT_SCHEMA = Object.freeze({ type: 'object', additionalProperties: true });
+
+function toolFail(code, reason, field, message) {
+  return { ok: false, code, reason: reason || '', field: field || '', message };
+}
+
+/**
+ * 纯参数校验：只看入参，不碰 fs、不解析身份（宿主 schema 已拦缺参，这里管语义）。
+ * @returns {{ value?: {target:string, subject:string, kind:string, body:string}, error?: object }}
+ */
+export function validateRelayToolArgs(args) {
+  const a = args && typeof args === 'object' && !Array.isArray(args) ? args : {};
+  const target = typeof a.target === 'string' ? a.target : '';
+  const subject = typeof a.subject === 'string' ? a.subject : '';
+  const body = typeof a.body === 'string' ? a.body : '';
+  const rawKind = a.kind === undefined || a.kind === null || a.kind === '' ? TOOL_DEFAULT_KIND : a.kind;
+  const kind = typeof rawKind === 'string' ? rawKind : '';
+  if (!TOOL_KINDS.includes(kind)) {
+    return { error: toolFail('E_ARGS_INVALID', '', 'kind', `kind 只能是 ${TOOL_KINDS.join('／')}：改成其中之一再调用`) };
+  }
+  if (target === '') {
+    return { error: toolFail('E_ADDR_INVALID', 'FORMAT', 'target', '缺 target：地址只接受「群名:Bot」或「Bot@主身」，不带群名不解析') };
+  }
+  if (subject.trim() === '') {
+    return { error: toolFail('E_ARGS_INVALID', '', 'subject', 'subject 不能为空：写一行标题再调用（人扫件用，回执也要一句主题）') };
+  }
+  if (/[\r\n]/.test(subject)) {
+    return { error: toolFail('E_ARGS_INVALID', '', 'subject', 'subject 必须是单行：把换行与正文移到 body，标题只留一行') };
+  }
+  const subjectLen = Array.from(subject).length;
+  if (subjectLen > TOOL_SUBJECT_MAX_CHARS) {
+    return { error: toolFail('E_ARGS_INVALID', '', 'subject', `subject 共 ${subjectLen} 字符，超过 ${TOOL_SUBJECT_MAX_CHARS}：压缩成一行标题`) };
+  }
+  if (body.trim() === '') {
+    return { error: toolFail('E_ARGS_INVALID', '', 'body', 'body 为空：把要交的内容写进正文再调用') };
+  }
+  if (body.includes('\u0000')) {
+    return { error: toolFail('E_ARGS_INVALID', '', 'body', 'body 含 NUL 字节：二进制内容不要塞正文，落成文件后在 body 里写路径与摘要') };
+  }
+  const bodyBytes = Buffer.byteLength(body, 'utf8');
+  if (bodyBytes > TOOL_BODY_MAX_BYTES) {
+    return { error: toolFail('E_BODY_TOO_LARGE', '', 'body', `body 共 ${bodyBytes} 字节，超过 1 MiB 上限：把正文落到文件，body 只写一段短摘要＋路径`) };
+  }
+  return { value: { target, subject, kind, body } };
+}
+
+/** 路由：先按 targetIdentity 现解析到的 session 相等，再按 targetSessionId 相等；多命中取靠前，全不中 null。 */
+export function routeRelayTarget(routes, sessionId, resolveAddress = resolveAddressNow) {
+  const list = Array.isArray(routes) ? routes : [];
+  for (const r of list) {
+    if (!r || typeof r.targetIdentity !== 'string' || r.targetIdentity === '') continue;
+    try {
+      if (resolveAddress(r.targetIdentity).sessionId === sessionId) return r;
+    } catch { /* 该条绑定现在解析不到，不算命中 */ }
+  }
+  for (const r of list) {
+    if (r && typeof r.targetSessionId === 'string' && r.targetSessionId !== '' && r.targetSessionId === sessionId) return r;
+  }
+  return null;
+}
+
+/** `E_NO_ROUTE` 文案里的可用目标清单：`<watch 目录尾段> → <地址或 id8>`，最多 5 条。 */
+export function describeRelayRoutes(routes, limit = TOOL_NO_ROUTE_LIMIT) {
+  const list = (Array.isArray(routes) ? routes : []).slice(0, limit);
+  return list.map((r) => {
+    const dir = String((r && r.dir) || '');
+    const tail = dir ? path.basename(dir) : '';
+    const who = r && typeof r.targetIdentity === 'string' && r.targetIdentity !== ''
+      ? r.targetIdentity
+      : (r && typeof r.targetSessionId === 'string' && r.targetSessionId !== '' ? id8Of(r.targetSessionId) : String((r && r.targetTitle) || ''));
+    return `${tail || dir} → ${who}`;
+  });
+}
+
+/**
+ * 生成落盘件：文件名与内容都由参数确定，同参数恒同路径（跨重启幂等）。
+ * hash 覆盖「实际写进文件的内容」：先剥掉调用方自带的 From:／To: 行再 trim。
+ */
+export function buildRelayToolFile(input) {
+  const it = input || {};
+  const target = String(it.target || '');
+  const subject = String(it.subject || '');
+  const kind = String(it.kind || TOOL_DEFAULT_KIND);
+  const cleanBody = stripIdentityLines(String(it.body || '')).trim();
+  const hash8 = createHash('sha256')
+    .update(`${target}\n${subject}\n${cleanBody}\n${kind}`)
+    .digest('hex')
+    .slice(0, 8);
+  const relName = `relay-${hash8}.md`;
+  const identity = {
+    fromText: it.fromText || IDENTITY_UNKNOWN,
+    title: it.targetTitle || IDENTITY_FALLBACK_TITLE,
+    id8: id8Of(it.targetSessionId),
+    kind: it.sessionKind || '主身',
+  };
+  const content = `${buildIdentityHead(identity)}# ${subject}\n\n${cleanBody}\n`;
+  return { relName, content, cleanBody, hash8 };
+}
+
+function identityToolMessage(code, reason) {
+  if (code === 'E_SESSION_UNRECORDED') {
+    return `目标会话 id 未落盘（${reason}）：重试无用，让管理员先发一条消息把 id 写进台账，或等其换段自愈`;
+  }
+  return `地址无法解析（${reason}）：target 只能是「群名:Bot」或「Bot@主身」，不要带空格、不要省略群名`;
+}
+
+/**
+ * 工具执行体：参数校验 → 身份解析 → 路由 → 原子落盘 → 去重判定。
+ * 预期失败不 throw，返回 { ok:false, code, reason, field, message }（每码一种下一步动作）。
+ * @param {{routes:Array, stateDir:string, inlineMaxChars?:number, resolveAddress?:Function, fsImpl?:object}} options
+ */
+export function createRelayToolHandler(options) {
+  const opt = options || {};
+  const routes = Array.isArray(opt.routes) ? opt.routes : [];
+  const stateDir = String(opt.stateDir || relayStateDir());
+  const inlineMaxChars = Number.isFinite(opt.inlineMaxChars) && opt.inlineMaxChars > 0 ? opt.inlineMaxChars : DEFAULT_INLINE_MAX_CHARS;
+  const resolveAddress = typeof opt.resolveAddress === 'function' ? opt.resolveAddress : resolveAddressNow;
+  const io = opt.fsImpl || fs;
+
+  return async function relayToolExecute(args) {
+    const checked = validateRelayToolArgs(args);
+    if (checked.error) return checked.error;
+    const { target, subject, kind, body } = checked.value;
+
+    let resolved;
+    try {
+      resolved = resolveAddress(target);
+    } catch (err) {
+      const desc = describeIdentityError(err);
+      const cut = desc.indexOf('/');
+      const code = cut === -1 ? desc : desc.slice(0, cut);
+      const reason = cut === -1 ? '' : desc.slice(cut + 1);
+      if (code === 'E_ADDR_INVALID' || code === 'E_SESSION_UNRECORDED') {
+        return toolFail(code, reason, 'target', identityToolMessage(code, reason));
+      }
+      return toolFail('E_DELIVER_FAILED', 'STATE_UNREADABLE', 'target', `身份台账读不出来（${desc}）：本机配置问题，重试无用，让管理员查 state.json`);
+    }
+
+    const route = routeRelayTarget(routes, resolved.sessionId, resolveAddress);
+    if (!route) {
+      const avail = describeRelayRoutes(routes);
+      return toolFail('E_NO_ROUTE', '', 'target', `解析到 ${resolved.title || IDENTITY_FALLBACK_TITLE} | ${id8Of(resolved.sessionId)} 但本机没有绑定它的 watch。当前可用目标：${avail.length > 0 ? avail.join('；') : '（无）'}；要投新目标请在 profile 的 dsh-handoff-relay 配置里加一条 watches（targetIdentity="${target}"）并重启`);
+    }
+
+    const built = buildRelayToolFile({
+      target,
+      subject,
+      kind,
+      body,
+      fromText: route.fromRole || IDENTITY_UNKNOWN,
+      targetTitle: resolved.title,
+      targetSessionId: resolved.sessionId,
+      sessionKind: resolved.kind === 'group' ? '群分身' : '主身',
+    });
+    const full = path.join(route.dir, built.relName);
+
+    let deduped = false;
+    try {
+      deduped = io.readFileSync(full, 'utf8') === built.content;
+    } catch { /* 没有同名件，按新投递处理 */ }
+
+    if (!deduped) {
+      try {
+        const stagingDir = path.join(stateDir, TOOL_STAGING_DIRNAME);
+        io.mkdirSync(stagingDir, { recursive: true });
+        const tmp = path.join(stagingDir, `${built.relName}.${process.pid}.${Date.now()}`);
+        io.writeFileSync(tmp, built.content, 'utf8');
+        try {
+          io.renameSync(tmp, full);
+        } catch (err) {
+          try { io.unlinkSync(tmp); } catch { /* ignore */ }
+          if (err && err.code === 'EXDEV') {
+            io.writeFileSync(full, built.content, 'utf8');
+            relayLog(opt.ctx || null, stateDir, 'warn', `${PLUGIN_NAME} tool-write fallback=direct target=${built.relName} dir=${route.dir}`);
+          } else {
+            throw err;
+          }
+        }
+      } catch (err) {
+        return toolFail('E_DELIVER_FAILED', 'WRITE_FAILED', '', `落盘失败（WRITE_FAILED）：watch 目录不可写，检查 ${route.dir} 权限；本条未投递（原因=${String((err && err.code) || err)}）`);
+      }
+    }
+
+    const inlined = built.cleanBody.length <= inlineMaxChars;
+    relayLog(opt.ctx || null, stateDir, 'info', `${PLUGIN_NAME} tool-deliver target=${built.relName} dir=${route.dir} deduped=${deduped}`);
+    return {
+      ok: true,
+      code: '',
+      reason: '',
+      field: '',
+      message: deduped ? `已存在同内容投递件（去重）：${built.relName}` : `已投递：${built.relName} → ${resolved.title || IDENTITY_FALLBACK_TITLE}`,
+      delivered: full,
+      target: id8Of(resolved.sessionId),
+      targetTitle: resolved.title || IDENTITY_FALLBACK_TITLE,
+      deduped,
+      inlined,
+    };
+  };
+}
+
+function renderRelayToolValue(value) {
+  const v = value && typeof value === 'object' ? value : {};
+  if (v.ok === true) {
+    const tail = v.inlined === false ? '（正文超过内联上限，目标读到路径后再读）' : '';
+    return `relay_deliver ${v.deduped === true ? 'deduped' : 'delivered'}: ${String(v.delivered || '')}${tail}`;
+  }
+  const code = String(v.code || 'E_DELIVER_FAILED');
+  const reason = v.reason ? `/${String(v.reason)}` : '';
+  return `${code}${reason}: ${String(v.message || '')}`;
+}
+
+/** 把 config.watches 收敛成工具路由表：只保留 dir 为绝对路径的条目。 */
+export function buildToolRoutes(watches) {
+  return (Array.isArray(watches) ? watches : [])
+    .map((w) => ({
+      dir: w && typeof w.dir === 'string' ? w.dir : '',
+      targetIdentity: w && typeof w.targetIdentity === 'string' ? w.targetIdentity : '',
+      targetSessionId: w && typeof w.targetSessionId === 'string' ? w.targetSessionId : '',
+      targetTitle: w && typeof w.targetTitle === 'string' ? w.targetTitle : '',
+      fromRole: w && typeof w.fromRole === 'string' ? w.fromRole : '',
+    }))
+    .filter((r) => r.dir !== '' && path.isAbsolute(r.dir));
+}
+
+/** 注册 relay_deliver；宿主没有 tools 服务时只留一行 warn，不影响目录 watch。 */
+export function registerRelayTool(ctx, options) {
+  const opt = options || {};
+  const tools = ctx && ctx.tools;
+  if (!tools || typeof tools.register !== 'function') {
+    relayLog(ctx, opt.stateDir, 'warn', `${PLUGIN_NAME} relay_deliver 未注册：ctx.tools 不可用（宿主版本无工具运行时）`);
+    return () => {};
+  }
+  const handler = createRelayToolHandler({ ...opt, ctx });
+  return tools.register({
+    name: RELAY_TOOL_NAME,
+    description: '把一条消息投递给本机已绑定 watch 的目标 Bot／主身。参数即约束：target 只接受「<群名>:<Bot>」或「<Bot>@主身」（不 trim、不模糊匹配）；subject 单行 ≤120 字符并进幂等键；body 非空、UTF-8 ≤1 MiB；kind 缺省 REPORT。预期失败不抛异常，返回 { ok:false, code, reason, message }，按 code 决定下一步：E_ADDR_INVALID／E_SESSION_UNRECORDED 改地址或等台账、E_ARGS_INVALID 改入参、E_BODY_TOO_LARGE 改写法（摘要＋路径）、E_NO_ROUTE 加 watch 配置并重启、E_DELIVER_FAILED 查目录权限。',
+    parameters: TOOL_PARAMETERS,
+    output: {
+      schema: TOOL_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: 'text', text: renderRelayToolValue(value) }],
+    },
+    execute: (args) => handler(args),
+  });
+}
+
 export function apply(ctx, config = {}) {
   config = unwrapConfigValue(config) || {};
   const cfg = {
     stableMs: Number.isFinite(config && config.stableMs) && config.stableMs > 0 ? config.stableMs : DEFAULT_STABLE_MS,
     message: config && typeof config.message === 'string' && config.message ? config.message : DEFAULT_MESSAGE,
+    inlineMaxChars: Number.isFinite(config && config.inlineMaxChars) && config.inlineMaxChars > 0 ? config.inlineMaxChars : DEFAULT_INLINE_MAX_CHARS,
   };
   const disposers = [];
+  // 只数真正启动的 watch：disposers 里还含工具面（relay_deliver）的注销器，
+  // 用它当分子会把工具算成第 10 条 watch（现场 10/9 的成因）。
+  let startedWatches = 0;
   const startedModes = [];
   const dispose = () => { for (const d of disposers) { try { d(); } catch { /* ignore */ } } };
   // P44：探测路由必须在 watches 早退之前注册，否则空 watches 时设置卡仍拿不到目录核验。
   registerProbeRoute(ctx);
+  // 工具面先于 watches 早退注册：watches 为空时 relay_deliver 仍可用，报 E_NO_ROUTE 并列出可用目标。
+  const toolRoutes = buildToolRoutes(config && Array.isArray(config.watches) ? config.watches : []);
+  disposers.push(registerRelayTool(ctx, { routes: toolRoutes, stateDir: relayStateDir(), inlineMaxChars: cfg.inlineMaxChars }));
   const watches = config && Array.isArray(config.watches) ? config.watches : [];
   if (watches.length === 0) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] 未启动：watches 必须是长度 ≥1 的数组`);
@@ -1485,7 +1849,9 @@ export function apply(ctx, config = {}) {
     }
     const hasId = typeof rawId === 'string' && rawId.trim() !== '';
     const hasTitle = typeof rawTitle === 'string' && rawTitle.trim() !== '';
-    if (!hasId && !hasTitle) {
+    const rawIdentity = w && w.targetIdentity;
+    const hasIdentity = typeof rawIdentity === 'string' && rawIdentity.trim() !== '';
+    if (!hasId && !hasTitle && !hasIdentity) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] 跳过 ${label}：targetTitle 或 targetSessionId 至少给一个（当前 targetSessionId=${String(rawId)}，targetTitle=${String(rawTitle)}）`);
       return;
     }
@@ -1525,27 +1891,37 @@ export function apply(ctx, config = {}) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 的 fromRole 无效，已按缺省处理（只接受非空字符串，当前=${JSON.stringify(rawFromRole)}，类型=${typeof rawFromRole}，dir=${dir}）`);
       relayLog(ctx, stateDir, 'warn', `[${PLUGIN_NAME}] ${label} fromRole 无效已按缺省处理：dir=${dir} ${JSON.stringify(rawFromRole)}（${typeof rawFromRole}）`);
     }
-    const target = hasTitle
+    // P1-11：targetIdentity 优先于 title/id。同时写了旧字段时不静默丢弃，warn 一行说明以谁为准。
+    if (hasIdentity && (hasId || hasTitle)) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 同时给了 targetIdentity 与 targetTitle/targetSessionId，按 targetIdentity="${rawIdentity.trim()}" 解析（换段不再需要人工改配置；旧字段保留不生效，dir=${dir}）`);
+    }
+    const target = hasIdentity
+      ? { kind: 'identity', value: rawIdentity.trim(), exact }
+      : hasTitle
       ? { kind: 'title', value: rawTitle.trim(), exact, id: hasId ? rawId.trim() : undefined }
       : { kind: 'id', value: rawId, exact };
     // 启动期校验＝「现在能否解析到」：解析不到只 warn，不阻断加载，也不影响其他 watch。
     const atLoad = describeTargetNow(ctx, target);
-    const targetLabel = target.kind === 'title'
+    // G-4：标签必须按 kind 分支。identity 以前掉进 else 支，把身份地址印在 `targetSessionId=` 后面
+    // （值是对的，标签名错），排查时会被当成「用 id 配的 watch」。
+    const targetLabel = target.kind === 'identity'
+      ? `targetIdentity=${target.value}`
+      : target.kind === 'title'
       ? `targetTitle="${target.value}" exact=${target.exact === true ? 'true' : 'false'}${target.id ? `（targetSessionId=${target.id} 兜底）` : ''}`
       : `targetSessionId=${target.value}`;
     if (!atLoad.ok) {
       const which = target.kind === 'title'
         ? `${targetLabel} 标题命中 ${atLoad.count} 条${atLoad.count ? `，候选：${hitsText(atLoad.hits)}` : ''}`
-        : `targetSessionId=${target.value}`;
+        : targetLabel;
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
     // 加载期每条 watch 一行解析结果（含 dir 与原样目标标识）：下次解析不到时能定位到是哪条 watch。
     relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] ${label} 加载解析 dir=${dir} 目标=${targetLabel} ${atLoad.status}`);
     const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root, stateDir, fromRole);
-    if (d) { disposers.push(d); startedModes.push(done.mode); }
+    if (d) { disposers.push(d); startedWatches += 1; startedModes.push(done.mode); }
   });
-  log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
-  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
+  log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${startedWatches}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
+  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${startedWatches}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
   // P11 A / P14：设置 namespace 必须在 settings 服务就绪后挂载。
   // `ctx.inject(['settings'], cb)` 等价于开一个子 plugin fiber：settings 先到（回调立即执行）
   // 或后到（服务 provide 时再执行）都只触发一次；该 fiber 是 thenable（await 会等加载结束），

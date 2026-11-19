@@ -15,6 +15,38 @@ forwarding of a ready signal to a target session. It deliberately avoids any
 wording that suggests builds or commands — a `trigger`-style name would imply
 the plugin can start actions, which it cannot.
 
+## Related projects
+
+This plugin is one of three projects that work together.
+
+```mermaid
+graph LR
+  ID["dsh-identity-resolve 0.1.0<br/>identity resolver — single source of truth"]
+  RL["dsh-handoff-relay 0.5.0<br/>dir watch → one notification"]
+  HOST["DS-Bot (upstream, third party)<br/>bots / rooms / sessions / plugin hook"]
+  ID -->|"address semantics<br/>&lt;Room&gt;:&lt;Bot&gt; · &lt;Bot&gt;@main<br/>E_ADDR_INVALID · E_SESSION_UNRECORDED"| RL
+  HOST --- RL
+  HOST --- ID
+```
+
+- **Address semantics** come from `dsh-identity-resolve`, the single source of
+  truth. This package ships a copy at `identity.js` because it is installed into
+  a host profile as a self-contained tarball and cannot import from the resolver's
+  checkout at runtime. The copy is a **deliberate mirror, not a fork**: its file
+  header states the replacement condition — once the resolver is published
+  through the normal release flow, the file is replaced wholesale by
+  `import { resolveInSnapshot } …`. Until then the two are checked against each
+  other and `identity.js` follows the resolver's code and error names.
+- **Host**: [DS-Bot](https://github.com/Fei2411/DS-Bot) — a third-party upstream
+  project. The plugin depends on its bot / room / session model and on its plugin
+  injection point (`cordis.patch.yml`); this repository does not modify upstream
+  code or the host installation.
+- **Configuration** lives in the `watches` block of `cordis.patch.yml` (fields
+  below). Each watch targets either a fixed `targetSessionId` or an identity
+  address `targetIdentity` — for example `大肥鱼@主身` or `DSH 插件组:大肥鱼` —
+  which is resolved once at startup and again on every delivery, so a session
+  rotation does not need a restart.
+
 ## What "finished" means
 
 - **Quiet period**: a file that has stopped changing for `stableMs`
@@ -112,6 +144,32 @@ Behind those two lines the body is the default text
 `文件 <absolute path> 已就绪（触发=stable|DONE），请继续。`, so the receiver can
 open the file straight from that path. If the target session is not loaded, a
 warning is written and nothing is sent.
+
+## Tool: relay_deliver (since 0.6.0)
+
+A single hand-off is now also a tool: instead of dropping a file into a watched directory and waiting, pass the target address, a subject and the body directly. The directory watch still works; both paths share the same write, identity-header, dedupe and archive logic.
+
+| Parameter | Required | Constraint |
+| --- | --- | --- |
+| `target` | yes | `<room>:<Bot>` or `<Bot>@main`, matched verbatim: no trimming, no fuzzy resolution |
+| `subject` | yes | single-line title, ≤120 chars; part of the idempotency key |
+| `body` | yes | the content, no character cap, 1 MiB (1,048,576 bytes) guard, NUL forbidden |
+| `kind` | no | `ASK` / `NOTICE` / `REPORT` / `OK` / `RED`, defaults to `REPORT` |
+
+It returns `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`; `delivered` is the absolute path inside the watch directory and `deduped: true` means the same arguments were delivered before. Expected failures are returned, not thrown (`E_ADDR_INVALID`, `E_SESSION_UNRECORDED`, `E_ARGS_INVALID`, `E_BODY_TOO_LARGE`, `E_NO_ROUTE`, `E_DELIVER_FAILED`).
+
+Copy-paste arguments (the `target` below is an address that already has a `watches` entry on this machine; a target without one returns `E_NO_ROUTE` — add a `watches` entry first, the tool never invents a directory):
+
+```json
+{
+  "target": "DSH 插件组:大肥鱼",
+  "subject": "Review request: relay 0.6.1 live delivery",
+  "body": "0.6.1 is installed (hot-loaded, no restart needed); run step 1 of docs/stage3-install-and-verify.md and return the relay.log line verbatim.",
+  "kind": "ASK"
+}
+```
+
+If the target has no `watches` entry yet, the tool refuses to invent a directory: it returns `E_NO_ROUTE` with up to five available targets (`dir tail → address`). A successful delivery writes one `relay.log` line: `dsh-handoff-relay tool-deliver target=relay-xxxxxxx.md dir=… deduped=false`.
 
 ## Why "relay"
 
@@ -332,7 +390,8 @@ rescans, and a normal delivery still writes nothing to `relay.log`.
 | `watches[].exact` | Boolean title-matching switch. Omitted/`false` = substring match; `true` = whole title must be equal; a non-boolean value is an error that skips the whole watch. |
 | `watches[].fromRole` | Optional `From:` label (a directory-ownership label, not an identity) used only when the handoff file has no `From:` line; a non-string value is ignored with a warning. |
 | `stableMs` | Silence window in ms, shared by all watches. Default `5000`. |
-| `message` | Optional template; supports `{path}` (absolute path of the delivered file), `{file}` (file name), `{reason}`, `{size}`, `{mtimeMs}`. |
+| `message` | Optional template; supports `{path}` (absolute path of the delivered file), `{file}` (file name), `{reason}`, `{size}`, `{mtimeMs}`, and `{body}` (the file body, inlined). Default inlines the body so the receiving session does not need a second read. |
+| `inlineMaxChars` | Cap for `{body}` in characters; default `4000`. A larger body is replaced by a one-line note and the absolute path. |
 | `watches[].done` | Per-watch completion rule: omitted = default text, `{ text }`, `{ regex }`, or `null` (off). |
 
 ## Test
