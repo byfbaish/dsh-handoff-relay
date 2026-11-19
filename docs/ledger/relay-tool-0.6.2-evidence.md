@@ -94,7 +94,19 @@ node docs/ledger/gen-0.6.2-evidence.mjs
 | ④ to-group 无 @ 件四件事 | 单测 `工具 M5`／`M5b`（原文见 `npm test` 输出）；真机装完后按 §3 补目录 `ls` 前后对照 |
 | ⑤ ≥4 新单测＋全绿 | `npm test` → `TOTAL: 205/205 PASS` / `RESULT: PASS`；新增 M1／M2／M3／M4／M5／M5b 共 6 条 |
 
-## 3 待装包后补的两条（本阶段未装、未推送）
+## 3 装完当场取证（脚本已就位，未跑）
+
+装完 0.6.2 后，仓库根执行下面两条即可产出 §2 里 ②④ 两格；脚本只读，不投递、不唤醒：
+
+```
+node docs/ledger/collect-0.6.2-install-evidence.mjs "<to-group watch 目录>"
+```
+
+输出会覆盖：本地 ISO 带时区采样时间、`state.json` sha256＋字节数＋`DSH 插件组` 逐名名单（含 `(未开分身)`）、装好副本／包内／仓内三份 `index.js` sha256 与两个相等布尔、装好副本 `version`、`relay.log` 最近 20 行（含新一轮 `启动 N/M 个 watch`）、以及指定目录的清单（查 ④ 四件事）。
+
+装前预跑（2026-11-20T00:58+08:00，用于证明脚本判得出来）：装好副本 `0f06c346…`（94,714 B，version `0.6.1`）≠ 包内 `de1b7238…` → 两格显示 `false`；装机后应为 `装好副本 == 包内：true`、`包内 == 仓内：true`、`version：0.6.2`。
+
+## 3.1 待装包后补的两条（本阶段未装、未推送）
 
 1. 装好副本 `node_modules/dsh-handoff-relay/index.js` 的 sha256 必须与 tgz 包内 `package/index.js` 同值（装完当场取）。
 2. 真机 `to-group` 目录 `ls` 前后对照（原文件仍在、`.rejected.md` 新增、无新投递件）。
