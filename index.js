@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 // P1-11：身份 → 会话解析（<群名>:<Bot> / <Bot>@主身），投递时现读 state.json，换段自动跟随。
-import { resolveAddressNow, describeIdentityError, readStateFile, defaultStatePath, listRoomMembers, REASONS as IDENTITY_REASONS } from './identity.js';
+import { resolveAddressNow, parseAddress, describeIdentityError, readStateFile, defaultStatePath, listRoomMembers, REASONS as IDENTITY_REASONS } from './identity.js';
 export const name = 'dsh-handoff-relay';
 export const inject = ['agents', 'tools'];
 const PLUGIN_NAME = 'dsh-handoff-relay';
@@ -1422,20 +1422,46 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     return channelGroup === true;
   }
 
+  let channelRoom = null;
+  /** 该 watch 对应的房间名（只在 targetIdentity 指向群时可解析）；解析不到返回空串。 */
+  function channelRoomName() {
+    if (channelRoom === null) {
+      channelRoom = '';
+      if (target.kind === 'identity') {
+        try {
+          const parsed = parseAddress(target.value);
+          if (parsed.kind === 'group') channelRoom = parsed.roomName;
+        } catch { channelRoom = ''; }
+      }
+    }
+    return channelRoom;
+  }
+
   function isRejectedSnapshot(relName, st) {
     const reg = loadRejectedRegistry(ctx, stateDir);
     return reg.fingers.has(fingerOf(watchDir, relName, st.mtimeMs, st.size));
   }
 
   /** 群投递无 @：原文留原地、写同名 `.rejected.md`、记台账（否则同快照每轮 rescan 反复判）。 */
-  function rejectNoMention(relName, state) {
+  function rejectNoMention(relName, state, reasonCode = 'NO_MENTION', roomName = '') {
     const full = path.join(watchDir, relName);
-    const text = [
-      '群投递被拒：正文里没有可识别的 @。',
-      '可能一：地址解析成主身，文件却落在 to-group → 改投 to-owner 目录，或在正文首行 @ 目标人。',
-      '可能二：目标是群，但正文没写 @ → 在正文首行补 "@QA 请…"（半角 @）后重新放入本目录。',
-      '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
-    ].join('\n') + '\n';
+    const where = roomName ? `房间「${roomName}」` : '目标群';
+    const text = (reasonCode === 'ROOM_UNRESOLVED'
+      ? [
+        '群投递被拒：这条 watch 的目标是群，但没解析出房间名，无法核对成员名单。',
+        '改法一：把 watch 的 targetIdentity 写成 "<群名>:<Bot>" 形式后重载。',
+        '改法二：正文首行写 "@所有人"（全群调用，不核名单）。',
+        '也可能：地址解析成主身（<Bot>@主身），文件却落在 to-group → 改投 to-owner 目录。',
+        '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
+      ]
+      : [
+        `群投递被拒：正文里没有可识别的 @（${where}）。`,
+        '可用写法：正文首行写 "@所有人"（全群调用，慎用、会唤醒全群），或 "@<成员名> 请…"（半角 @）。',
+        '可能一：地址解析成主身，文件却落在 to-group → 改投 to-owner 目录，或在正文首行 @ 目标人。',
+        '可能二：目标是群，但正文没写 @ → 在正文首行补 "@QA 请…" 后重新放入本目录。',
+        '说明：正文里的 @ 都未匹配到该房间成员名（或 @ 后紧跟标点，如「@，」），一律不算。',
+        '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
+      ]).join('\n') + '\n';
     try {
       fs.writeFileSync(`${full}${REJECTED_SUFFIX}`, text, 'utf8');
     } catch (err) {
@@ -1446,9 +1472,9 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
       name: relName,
       dirKey: watchDir,
       at: new Date().toISOString(),
-      reason: 'NO_MENTION',
+      reason: reasonCode,
     });
-    const msg = `${PLUGIN_NAME} watch-reject target=${relName} dir=${watchDir} reason=NO_MENTION`;
+    const msg = `${PLUGIN_NAME} watch-reject target=${relName} dir=${watchDir} reason=${reasonCode}`;
     log(ctx, 'warn', msg);
     relayLog(ctx, stateDir, 'warn', msg);
   }
@@ -1478,10 +1504,18 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
       return;
     }
     // 0.6.2 文件通道闸：目标是群（或目录就叫 to-group）而正文没有可用的半角 @ ⇒ 不投递、原文留原地。
+    // 0.6.3：判据与工具路径同源（checkMentionForRoom）——@所有人 或 @<本房间成员> 才算有 @。
+    // 闸位置不变：所有投递入口（DONE/stable/重扫）都汇流到 deliver()，故 stableMs 分支同样被闸住。
     if (channelRequiresMention()) {
       let rawText = '';
       try { rawText = stripIdentityLines(fs.readFileSync(full, 'utf8')); } catch { rawText = ''; }
-      if (!USABLE_AT_RE.test(rawText)) { rejectNoMention(relName, state); return; }
+      const room = channelRoomName();
+      if (!room) { rejectNoMention(relName, state, 'ROOM_UNRESOLVED'); return; }
+      let members = [];
+      try { members = listRoomMembers(readStateFile(defaultStatePath()), room).members; }
+      catch { rejectNoMention(relName, state, 'ROOM_UNRESOLVED', room); return; }
+      const mentionVerdict = checkMentionForRoom(rawText, room, members);
+      if (!mentionVerdict.ok) { rejectNoMention(relName, state, 'NO_MENTION', room); return; }
     }
     // P54：To 由 relay 生成——标题优先取 resolved.title（resolveNow 已带回），
     // 缺失再 sessionTitleOf(ctx, agent)，都取不到写 (无标题)；id8 取 resolved.id 前 8 位；
@@ -1645,7 +1679,8 @@ const TOOL_STAGING_DIRNAME = 'tool-staging';
 // 防止 `@QA` 误命中 `@QA测试`（不折叠大小写、不 trim）。
 const MENTION_BOUNDARY_RE = /[\s,.;:!?、。，；：！？|)\]}>）】」』"]/;
 const FULLWIDTH_AT = '\uFF20';
-const USABLE_AT_RE = /@[^\s@]/;
+// 0.6.3：不再用「任意 @ + 非空白」这类粗判据（0.6.2 真机缺陷：正文「无 @，」也会通过）。
+// 文件通道与工具路径统一走 checkMentionForRoom。
 
 function normalizeMention(raw) {
   const text = typeof raw === 'string' ? raw : '';
@@ -1665,6 +1700,23 @@ export function hasMentionInText(text, name) {
     if (next === '' || next === '\n' || next === '\r' || MENTION_BOUNDARY_RE.test(next)) return true;
     from = at + 1;
   }
+}
+
+/**
+ * 0.6.3：唯一的 mention 判据，工具路径与文件通道共用。
+ * ① `@所有人` 直接通过（全群调用，不核成员名单）；② `@<名字>` 必须精确命中本房间成员；
+ * `@所有`/`@大家`/`@all` 一律不算。
+ * 返回 { ok, how:'all'|'name', name } 或 { ok:false, code }。
+ */
+export function checkMentionForRoom(text, roomName, members) {
+  const body = String(text || '');
+  if (hasMentionInText(body, '所有人')) return { ok: true, how: 'all', name: '所有人' };
+  const list = Array.isArray(members) ? members : [];
+  for (const m of list) {
+    const botName = m && typeof m.botName === 'string' ? m.botName : '';
+    if (botName && hasMentionInText(body, botName)) return { ok: true, how: 'name', name: botName };
+  }
+  return { ok: false, code: 'NO_MENTION', roomName: roomName || '' };
 }
 
 /** 正文里实际点到的人（用于 E_MENTION_NOT_IN_BODY 文案：列已点到的名字）。 */

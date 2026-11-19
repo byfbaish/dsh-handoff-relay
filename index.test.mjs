@@ -4259,7 +4259,8 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.equal(mainCalls.length, 0, '工具路径不直接唤醒，只落盘');
   });
 
-  // 文件通道：目录尾段 to-group（目标只给 sessionId，故按目录判群）
+  // 文件通道：目录尾段 to-group（目标只给 sessionId）。0.6.3 起：解析不出房间名 ⇒ ROOM_UNRESOLVED
+  // （精确的「无 @ / @ 不匹配成员」判定在 M6–M12，那里用假 home 的 state.json 走真成员表）。
   const rejParent = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-rej-'));
   const rejDir = path.join(rejParent, 'to-group');
   fs.mkdirSync(rejDir, { recursive: true });
@@ -4270,16 +4271,16 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   await sleep(1400);
   const notePath = `${plain}.rejected.md`;
   const rejLedger = path.join(suiteProfileRoot, 'dsh-handoff-relay', 'rejected.json');
-  check('工具 M5 群 watch 收无 @ 文件：原文留原地、同名 .rejected.md 生成、不投递、台账记 NO_MENTION', () => {
+  check('工具 M5 群 watch 收无 @ 文件（房间名不可解析）：原文留原地、同名 .rejected.md 生成、不投递、台账记 ROOM_UNRESOLVED', () => {
     assert.ok(fs.existsSync(plain), '原文件必须留在原地');
     assert.ok(fs.existsSync(notePath), `拒绝件应生成：${notePath}`);
     const note = fs.readFileSync(notePath, 'utf8');
     assert.ok(note.includes('群投递被拒'), `拒绝件文案不符：${note}`);
-    assert.ok(note.includes('可能一') && note.includes('可能二'), '文案要写两种可能');
+    assert.ok(note.includes('改投 to-owner'), `房间名不可解析时应给改投提示：${note}`);
     assert.equal(rejCalls.length, 0, `不应投递，实际 ${rejCalls.length}`);
     assert.equal(fs.readdirSync(rejDir).filter((n) => n.endsWith('.md') && !n.endsWith('.rejected.md')).length, 1, '目录里只应有原文件');
     const entries = JSON.parse(fs.readFileSync(rejLedger, 'utf8'));
-    assert.ok(entries.some((e) => e.name === 'plain-note.md' && e.reason === 'NO_MENTION'), `台账应记 NO_MENTION：${JSON.stringify(entries)}`);
+    assert.ok(entries.some((e) => e.name === 'plain-note.md' && e.reason === 'ROOM_UNRESOLVED'), `台账应记 ROOM_UNRESOLVED：${JSON.stringify(entries)}`);
   });
   const beforeRetry = fs.readFileSync(notePath, 'utf8');
   const beforeMtime = fs.statSync(notePath).mtimeMs;
@@ -4372,6 +4373,146 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     if (disp) disp();
     restoreProfile();
   }
+}
+
+// ------------------------------------------- 0.6.3：文件通道 mention 判据与工具路径同源
+// 事故形态（0.6.2 真机）：正文「本件无任何 @，按守卫应被拒绝」被判成「有 @」——旧判据是
+// USABLE_AT_RE=/@[^\s@]/，全角逗号跟在后头也算命中。契约：两路只用 checkMentionForRoom——
+// @所有人 直接通过；@<名字> 必须精确命中本房间成员；@所有/@大家/@all、@ 后紧跟标点一律不算。
+{
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-m63-home-'));
+  fs.mkdirSync(path.join(fakeHome, '.dsh', 'bot'), { recursive: true });
+  const fakeState = {
+    version: 1,
+    bots: {
+      b1: { id: 'b1', name: 'QA', sessionId: 'session-1111aaaa-0000-0000-0000-000000000001' },
+      b2: { id: 'b2', name: '产品经理' },
+      b3: { id: 'b3', name: 'developer' },
+      b4: { id: 'b4', name: '主管家', sessionId: 'session-4444dddd-0000-0000-0000-000000000004' },
+    },
+    rooms: {
+      r1: {
+        id: 'r1',
+        name: 'DSH 插件组',
+        members: ['b1', 'b2', 'b3'],
+        sessions: {
+          b1: 'session-1111aaaa-0000-0000-0000-000000000001',
+          b3: 'session-3333cccc-0000-0000-0000-000000000003',
+        },
+      },
+    },
+  };
+  fs.writeFileSync(path.join(fakeHome, '.dsh', 'bot', 'state.json'), `${JSON.stringify(fakeState, null, 2)}\n`);
+  const nativeHomedir = os.homedir;
+  os.homedir = () => fakeHome;
+  const ledgerFile = path.join(suiteProfileRoot, 'dsh-handoff-relay', 'rejected.json');
+  const ledgerOf = (name) => {
+    try { return JSON.parse(fs.readFileSync(ledgerFile, 'utf8')).filter((e) => e.name === name); } catch { return []; }
+  };
+  const runOne = async (name, text, opts = {}) => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-m63-'));
+    const dir = path.join(parent, opts.dirName || 'to-group');
+    fs.mkdirSync(dir, { recursive: true });
+    const calls = [];
+    const watch = opts.targetSessionId
+      ? { dir, targetSessionId: opts.targetSessionId }
+      : { dir, targetIdentity: opts.identity || 'DSH 插件组:QA' };
+    const disp = apply(makeCtx(calls), { watches: [watch], stableMs: 200 });
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, text);
+    await sleep(1000);
+    return { res: { dir, file, name, calls, note: `${file}.rejected.md` }, disp };
+  };
+
+  // M6 本次真机缺陷件原文（@ 后紧跟全角逗号）
+  {
+    const bugText = '0.6.2 验证件·本件无任何 @，按守卫应被拒绝，请忽略。\n';
+    const { res, disp } = await runOne('m6-bug-case.md', bugText);
+    const noteText = fs.existsSync(res.note) ? fs.readFileSync(res.note, 'utf8') : '';
+    check('M6 缺陷件原文（「@，」）→ 拒：源件原地、.rejected.md 在、不投递、台账记 NO_MENTION', () => {
+      assert.equal(res.calls.length, 0, `不得投递，实际 ${res.calls.length}`);
+      assert.ok(fs.existsSync(res.file), '源件必须留在原地');
+      assert.ok(fs.existsSync(res.note), `.rejected.md 应生成：${res.note}`);
+      assert.ok(noteText.includes('群投递被拒'), `拒绝件文案不符：${noteText}`);
+      assert.ok(noteText.includes('都未匹配到该房间成员名'), `文案应说明「@ 未匹配成员」：${noteText}`);
+      const hits = ledgerOf('m6-bug-case.md');
+      assert.equal(hits.length, 1, `台账应恰好 1 条：${JSON.stringify(hits)}`);
+      assert.equal(hits[0].reason, 'NO_MENTION');
+    });
+    const beforeStat = fs.statSync(res.file);
+    const beforeNote = fs.readFileSync(res.note, 'utf8');
+    await sleep(1000);
+    check('M12 两个扫描周期后仍稳定：不投递、不生成 .rejected.md.rejected.md、源件 mtime/size 不变', () => {
+      assert.equal(res.calls.length, 0, `不得投递，实际 ${res.calls.length}`);
+      assert.equal(fs.existsSync(`${res.note}.rejected.md`), false, '不得生成 .rejected.md.rejected.md');
+      assert.equal(fs.existsSync(`${res.file}.rejected.md.rejected.md`), false, '不得生成二次拒绝件');
+      const afterStat = fs.statSync(res.file);
+      assert.equal(afterStat.size, beforeStat.size, '源件 size 必须不变');
+      assert.equal(afterStat.mtimeMs, beforeStat.mtimeMs, '源件 mtime 必须不变');
+      assert.equal(fs.readFileSync(res.note, 'utf8'), beforeNote, '.rejected.md 不得被重写');
+    });
+    disp();
+  }
+
+  // M7 @所有人 正例：全群调用，不核成员名单
+  {
+    const { res, disp } = await runOne('m7-all.md', '@所有人 0.6.3 验证：全员通报一件。\n');
+    check('M7 @所有人 → 通过（全群调用），照常投递一次、无拒绝件', () => {
+      assert.equal(res.calls.length, 1, `应投递 1 次，实际 ${res.calls.length}`);
+      assert.equal(fs.existsSync(res.note), false, '不得生成拒绝件');
+      assert.ok(!fs.existsSync(res.file), '投递后源件应被搬走');
+    });
+    disp();
+  }
+
+  // M8 @所有 反例：不算全群调用
+  {
+    const { res, disp } = await runOne('m8-allsh.md', '@所有 全员通报一件。\n');
+    check('M8 @所有 → 不算（不是成员名也不是 @所有人），拒绝且文案给可用写法', () => {
+      assert.equal(res.calls.length, 0, `不得投递，实际 ${res.calls.length}`);
+      assert.ok(fs.existsSync(res.note), '应生成拒绝件');
+      const note = fs.readFileSync(res.note, 'utf8');
+      assert.ok(note.includes('@所有人'), `文案要给出 @所有人 写法：${note}`);
+    });
+    disp();
+  }
+
+  // M9 @<成员名> 正例
+  {
+    const { res, disp } = await runOne('m9-qa.md', '@QA 请复核 0.6.3 文件通道。\n');
+    check('M9 @QA（本房间成员）→ 通过，照常投递', () => {
+      assert.equal(res.calls.length, 1, `应投递 1 次，实际 ${res.calls.length}`);
+      assert.equal(fs.existsSync(res.note), false, '不得生成拒绝件');
+    });
+    disp();
+  }
+
+  // M10 右边界：@QA测试 不得命中 @QA
+  {
+    const { res, disp } = await runOne('m10-qa-test.md', '@QA测试 请复核。\n');
+    check('M10 @QA测试 → 不算命中 @QA（右边界），拒绝', () => {
+      assert.equal(res.calls.length, 0, `不得投递，实际 ${res.calls.length}`);
+      assert.ok(fs.existsSync(res.note), '应生成拒绝件');
+    });
+    disp();
+  }
+
+  // M11 目标解析成主身、文件却落在 to-group → ROOM_UNRESOLVED，并给改投提示
+  {
+    const { res, disp } = await runOne('m11-main-in-group.md', '@QA 这件本该投主身。\n', { identity: '主管家@主身' });
+    check('M11 主身目标落在 to-group → 拒 ROOM_UNRESOLVED，文案给「改投 to-owner」改法', () => {
+      assert.equal(res.calls.length, 0, `不得投递，实际 ${res.calls.length}`);
+      assert.ok(fs.existsSync(res.note), '应生成拒绝件');
+      const note = fs.readFileSync(res.note, 'utf8');
+      assert.ok(note.includes('改投 to-owner'), `文案应给改投提示：${note}`);
+      const hits = ledgerOf('m11-main-in-group.md');
+      assert.equal(hits.length, 1, `台账应恰好 1 条：${JSON.stringify(hits)}`);
+      assert.equal(hits[0].reason, 'ROOM_UNRESOLVED');
+    });
+    disp();
+  }
+
+  os.homedir = nativeHomedir;
 }
 
 console.log('\n===== 自测汇总 =====');

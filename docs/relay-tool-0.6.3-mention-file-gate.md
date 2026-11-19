@@ -53,14 +53,26 @@ node --input-type=module -e "const R=/@[^\\s@]/; console.log(R.test('0.6.2 验�
 
 | 编号 | 输入 | 期望 |
 |---|---|---|
-| M6 | 正文 `本件无 @，应被拒` | 拒绝，写 `.rejected.md`，不投递（本次真机缺陷用例） |
-| M7 | 正文 `见 someone@example.com` | 拒绝 |
-| M8 | 正文 `@QA 请` | 通过 |
-| M9 | 正文 `@QA测试 请` | 拒绝（右边界） |
-| M10 | 正文 `@所有人` | 按第 3 条裁定执行；不裁则拒绝 |
-| M11 | 成员表解析失败（房间名不存在） | 拒绝且 reason=`ROOM_UNRESOLVED`，不投递 |
+| M6 | 正文 `0.6.2 验证件·本件无任何 @，按守卫应被拒绝，请忽略。`（本次真机缺陷原文） | 拒绝，写 `.rejected.md`，不投递 |
+| M7 | 正文 `@所有人 …` | 通过（全群调用，不核名单） |
+| M8 | 正文 `@所有 …` | 拒绝（不是成员名，也不是 `@所有人`） |
+| M9 | 正文 `@QA …`（本房间成员） | 通过 |
+| M10 | 正文 `@QA测试 …` | 拒绝（右边界：不得命中 `@QA`） |
+| M11 | 目标解析成主身、文件落在 `to-group` | 拒绝，reason=`ROOM_UNRESOLVED`，文案给「改投 to-owner」 |
+| M12 | 拒绝后等两个扫描周期 | 不投递、不生成 `.rejected.md.rejected.md`、源件 mtime/size 不变 |
 
-回归：`npm test` 应 ≥ 205 + 6 = 211 例全绿。
+M6–M12 用假 home 的 `state.json`（临时目录 + `os.homedir` 桩）跑真成员表，不依赖本机台账。
+既有 M5/M5b 的 watch 只给 `targetSessionId`，解析不出房间名 ⇒ 按新语义归 `ROOM_UNRESOLVED`（断言已同步）。
+
+实测：`npm test` → `TOTAL: 212/212 PASS` / `RESULT: PASS`（0.6.2 的 205 例 + 7 条新例）。
+
+## 3.1 实现落点（0.6.3 实测行号）
+
+- `index.js:1711` `export function checkMentionForRoom(text, roomName, members)`：`@所有人` → `{ok:true, how:'all'}`；逐成员 `hasMentionInText` 精确命中 → `{ok:true, how:'name'}`；否则 `{ok:false, code:'NO_MENTION'}`。工具路径与文件通道共用，不再有第二套判据（`USABLE_AT_RE` 已删）。
+- `index.js:1427` `channelRoomName()`：只从 `targetIdentity` 解析 `<群名>:<Bot>` 得到房间名并缓存；解析不到返回空串。
+- `index.js:1446` `rejectNoMention(relName, state, reasonCode, roomName)`：`NO_MENTION` 与 `ROOM_UNRESOLVED` 两套文案（都写清改法），只写 `.rejected.md` + `rejected.json`，不碰源件。
+- `index.js:1505-1519` 闸体（在 `deliver()` 内、`resolveNow`/`agent` 判空之后、`buildMessage`/`followup` 之前）：现读 `state.json` 取成员表 → `checkMentionForRoom` → 不通过即 `rejectNoMention` 并 `return`，不再走 `agent.followup`。
+- 工具侧四码未动：`@所有人` 原本就能过（`hasMentionInText(body,'所有人')`），与文件通道行为一致。
 
 ## 4 交付与边界
 
