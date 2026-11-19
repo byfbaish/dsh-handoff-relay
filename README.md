@@ -163,8 +163,8 @@ Copy-paste arguments:
 ```json
 {
   "target": "DSH 插件组:QA",
-  "subject": "Review request: relay 0.6.0 live delivery",
-  "body": "0.6.0 is installed and the host restarted; run step 1 of docs/stage3-install-and-verify.md and return the relay.log line verbatim.",
+  "subject": "Review request: relay 0.6.1 live delivery",
+  "body": "0.6.1 is installed and the host restarted; run step 1 of docs/stage3-install-and-verify.md and return the relay.log line verbatim.",
   "kind": "ASK"
 }
 ```

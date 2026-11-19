@@ -1,4 +1,4 @@
-# relay 0.6.0：打包、安装与实机验收命令
+# relay 0.6.1：打包、安装与实机验收命令
 
 > 状态：**装包与生效均未执行**。宿主启动期间安装会让依赖树与运行中的插件不一致，生效又必须重启 DSH——重启时机不在我们手里（已上报主身）。本文所有命令都是「拿到许可后照抄执行」的原文，执行顺序即章节顺序。
 >
@@ -14,7 +14,7 @@
 | 同上 `client.js` | sha256 `836df07fd554926f9f577da3ac8c01c0241ede8231077536b0278148a6c11a36` |
 | 同上 `cordis.patch.yml` | sha256 `f519dc8d7397125198b90ec314bd71298ee0ef9710281e85dafc348adfc2cb88` |
 | 同上 `package.json` | sha256 `bdf4c54a6f3fb6e52733676e3d9a6fcb1ea2aa5d1ed38c4bb20df6cdbdb88f4e` |
-| 运行中的 watch 条数 | 9（上次启动日志 `启动 9/9 个 watch`） |
+| 运行中的 watch 条数 | 9（**0.6.1 的启动日志应为 `启动 9/9 个 watch`**；0.6.0 因启动行分子把工具注销器也数进去，打成了 `10/9`，0.6.1 已修） |
 
 **关键事实**：运行中的 `index.js`（80,013 B / `ed7cef8c…`）**不等于** `dsh-handoff-relay-0.5.0.tgz` 里的那份（`f699cf1a…` / 78,090 B），它等于本仓 `528adf8` 的源码；旁边还有一份 `index.js.bak-20261119-0404`（正是 tgz 原版）——说明现网代码当初是手工贴进 `node_modules` 的。所以回滚不能只「重装 0.5.0 tgz」，那样会丢掉现网已经有的 P55 内联与身份冒号修复。
 
@@ -23,14 +23,14 @@
 ```bash
 cd C:/develop/workspace/dsh-handoff-relay
 npm pack
-sha256sum dsh-handoff-relay-0.6.0.tgz
+sha256sum dsh-handoff-relay-0.6.1.tgz
 ```
 
 实测：
 
 ```text
-dsh-handoff-relay-0.6.0.tgz   56,784 B
-sha256  f1b399f2e8519254bc1875c339da0817a831b7d962d7697122252e3054ff1825
+dsh-handoff-relay-0.6.1.tgz   58,535 B
+sha256  4e39c858ac80a46fcfc651cba1a6fa0985bb2369be46f7ce8d8b89e9f2e446e3
 npm shasum                      222324bc40b12417912fdedc7285281746bded0e
 包内 8 个文件：LICENSE / README.md / README.zh-CN.md / client.js / cordis.patch.yml / identity.js / index.js / package.json
 ```
@@ -51,15 +51,15 @@ sha256sum "$R/node_modules-dsh-handoff-relay/index.js"   # 必须是 ed7cef8c…
 ## 3. 安装（宿主停机窗口内执行；与第 4 步同窗口）
 
 ```bash
-dsh plugin --profile desktop add file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.6.0.tgz
+dsh plugin --profile desktop add file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.6.1.tgz
 ```
 
-期望：命令回 `dsh-handoff-relay@0.6.0`；`node_modules/dsh-handoff-relay/index.js` 变成 94,217 B；profile `package.json` 的依赖行改成 `file:...dsh-handoff-relay-0.6.0.tgz`；`pnpm-lock.yaml` 的 specifier/integrity 同步更新。
+期望：命令回 `dsh-handoff-relay@0.6.1`；`node_modules/dsh-handoff-relay/index.js` 变成 94,714 B / `0f06c346…`；profile `package.json` 的依赖行改成 `file:...dsh-handoff-relay-0.6.1.tgz`；`pnpm-lock.yaml` 的 specifier/integrity 同步更新。
 
 ### 3.1 实测：这条 CLI 命令在 desktop profile 上必然失败（2026-11-19 08:39 实测）
 
 ```text
-$ dsh plugin --profile desktop add "file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.6.0.tgz"
+$ dsh plugin --profile desktop add "file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.6.1.tgz"
 error: profile "desktop" is managed exclusively by the Electron application
 ```
 
@@ -79,7 +79,7 @@ error: profile "desktop" is managed exclusively by the Electron application
 node -e "import('$USERPROFILE/.dsh/profiles/desktop/node_modules/dsh-handoff-relay/index.js').then(m=>console.log(m.RELAY_TOOL_NAME, typeof m.registerRelayTool))"
 ```
 
-期望输出 `relay_deliver function`。若报 `SyntaxError` 或 `undefined`，说明装进去的不是 0.6.0，停下回滚，不要重启。
+期望输出 `relay_deliver function`。若报 `SyntaxError` 或 `undefined`，说明装进去的不是 0.6.1，停下回滚，不要重启。
 
 ## 4. 生效（阻塞项：需要重启 DSH）
 
@@ -152,14 +152,14 @@ grep -c "^      - dir:" $USERPROFILE/.dsh/profiles/desktop/cordis.patch.yml   # 
 真投递证据（**需主身批准后**才做，会往 AI writer 的信箱目录写一个探测件）：
 
 ```bash
-printf 'probe 0.6.0 watch-alive\n' > "C:/develop/workspace/AI-writer/develop/scripts/dsh/wakeup-inbox/workbuddy/relay-probe-0.6.0.md"
+printf 'probe 0.6.1 watch-alive\n' > "C:/develop/workspace/AI-writer/develop/scripts/dsh/wakeup-inbox/workbuddy/relay-probe-0.6.1.md"
 ```
 
 随后等 ≥ `stableMs`（5000 ms）再查：
 
 ```bash
-grep -n "relay-probe-0.6.0\|注入身份 from=relay-probe" $USERPROFILE/.dsh/profiles/desktop/dsh-handoff-relay/relay.log | tail -3
-ls $USERPROFILE/.dsh/profiles/desktop/dsh-handoff-relay/delivered/*/relay-probe-0.6.0.md
+grep -n "relay-probe-0.6.1\|注入身份 from=relay-probe" $USERPROFILE/.dsh/profiles/desktop/dsh-handoff-relay/relay.log | tail -3
+ls $USERPROFILE/.dsh/profiles/desktop/dsh-handoff-relay/delivered/*/relay-probe-0.6.1.md
 ```
 
 期望：日志出现该件的投递/注入行，原目录不再有该文件、`delivered/` 下有归档副本。
@@ -181,5 +181,5 @@ sha256sum $USERPROFILE/.dsh/profiles/desktop/node_modules/dsh-handoff-relay/inde
 
 1. 安装会整目录替换 `node_modules/dsh-handoff-relay`，现网那份 `index.js.bak-20261119-0404` 会一并消失——第 2 节的备份是它唯一的去处。
 2. `dsh plugin add` 会改写 profile `package.json` 与 `pnpm-lock.yaml`，这两份已在备份里。
-3. 插件版本 0.5.0→0.6.0，`dsh` 的 `profile.bundles` 列表不变（`package.json:46` 那行本来就有它）。
+3. 插件版本 0.5.0→0.6.1（0.6.0 已于 09:00 由主人装过一次；0.6.1 只多两处修复：启动行 `9/9` 计数、identity 目标日志标签），`dsh` 的 `profile.bundles` 列表不变（`package.json:46` 那行本来就有它）。
 4. 工具面与 watch 共用落盘与去重：同一份内容用工具投一次、再用文件投一次，会被判重复（内容哈希一致），这是设计意图，不是 bug。

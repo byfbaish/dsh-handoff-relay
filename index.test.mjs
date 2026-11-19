@@ -4224,6 +4224,49 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   }
 }
 
+// ---------------------------------------------------------------- G-4：日志标签按 kind 分支
+// 事故形态：用 targetIdentity 配的 watch，启动行写成「目标=targetSessionId=DSH 插件组:xxx」，
+// 值对、标签错，排查时会被当成用 id 配的 watch。
+// 判据：identity → targetIdentity=；title → targetTitle=；id → targetSessionId=。
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-g4-'));
+  const restoreProfile = p9WithProfile(root);
+  const dIdA = tmp();
+  const dIdB = tmp();
+  const dTitle = tmp();
+  const box = capturingWatch();
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx([]), {
+      watches: [
+        { dir: dIdA, targetIdentity: '不存在的群:不存在的Bot' },
+        { dir: dIdB, targetIdentity: 'DSH 插件组:不存在的人' },
+        { dir: dTitle, targetTitle: '某个标题' },
+      ],
+      stableMs: 120,
+    }));
+    const logFile = path.join(p9StateDir(root), 'relay.log');
+    const lines = (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '')
+      .split('\n').filter((l) => l.includes('加载解析'));
+    check('G-4 identity 目标的日志标签是 targetIdentity=，不再印成 targetSessionId=', () => {
+      const hit = lines.filter((l) => l.includes('不存在的群:不存在的Bot') || l.includes('DSH 插件组:不存在的人'));
+      assert.equal(hit.length, 2, `应有 2 行 identity 目标的加载解析，实际 ${hit.length}：${lines.join(' | ')}`);
+      for (const l of hit) {
+        assert.ok(l.includes('目标=targetIdentity='), `identity 目标应打 targetIdentity=：${l}`);
+        assert.ok(!l.includes('目标=targetSessionId='), `identity 目标不应打 targetSessionId=：${l}`);
+      }
+    });
+    check('G-4 title 目标仍打 targetTitle=（两支不牵连）', () => {
+      const hit = lines.filter((l) => l.includes('某个标题'));
+      assert.equal(hit.length, 1, `应有 1 行 title 目标，实际 ${hit.length}`);
+      assert.ok(hit[0].includes('目标=targetTitle="某个标题"'), `title 目标应打 targetTitle=：${hit[0]}`);
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
+}
+
 console.log('\n===== 自测汇总 =====');
 for (const r of results) console.log(r);
 console.log(`TOTAL: ${results.length - failed}/${results.length} PASS`);

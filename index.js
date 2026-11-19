@@ -1902,13 +1902,17 @@ export function apply(ctx, config = {}) {
       : { kind: 'id', value: rawId, exact };
     // 启动期校验＝「现在能否解析到」：解析不到只 warn，不阻断加载，也不影响其他 watch。
     const atLoad = describeTargetNow(ctx, target);
-    const targetLabel = target.kind === 'title'
+    // G-4：标签必须按 kind 分支。identity 以前掉进 else 支，把身份地址印在 `targetSessionId=` 后面
+    // （值是对的，标签名错），排查时会被当成「用 id 配的 watch」。
+    const targetLabel = target.kind === 'identity'
+      ? `targetIdentity=${target.value}`
+      : target.kind === 'title'
       ? `targetTitle="${target.value}" exact=${target.exact === true ? 'true' : 'false'}${target.id ? `（targetSessionId=${target.id} 兜底）` : ''}`
       : `targetSessionId=${target.value}`;
     if (!atLoad.ok) {
       const which = target.kind === 'title'
         ? `${targetLabel} 标题命中 ${atLoad.count} 条${atLoad.count ? `，候选：${hitsText(atLoad.hits)}` : ''}`
-        : `targetSessionId=${target.value}`;
+        : targetLabel;
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 无法解析会话标题：${which}（dir=${dir}），该 watch 仍启动，投递时会跳过`);
     }
     // 加载期每条 watch 一行解析结果（含 dir 与原样目标标识）：下次解析不到时能定位到是哪条 watch。

@@ -104,8 +104,8 @@ watch、找的是什么标题、命中几条（有歧义时列出候选）。**�
 ```json
 {
   "target": "DSH 插件组:QA",
-  "subject": "复核请求：relay 0.6.0 实机投递",
-  "body": "已装 0.6.0 并重启，请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。",
+  "subject": "复核请求：relay 0.6.1 实机投递",
+  "body": "已装 0.6.1 并重启，请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。",
   "kind": "ASK"
 }
 ```
@@ -113,7 +113,7 @@ watch、找的是什么标题、命中几条（有歧义时列出候选）。**�
 **一句话版本**（发给你正在对话的 Bot）：
 
 ```text
-用 relay_deliver 给「DSH 插件组:QA」发一条 ASK：subject 写「复核请求：relay 0.6.0 实机投递」，body 写「已装 0.6.0 并重启，请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。」
+用 relay_deliver 给「DSH 插件组:QA」发一条 ASK：subject 写「复核请求：relay 0.6.1 实机投递」，body 写「已装 0.6.1 并重启，请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。」
 ```
 
 目标没在 `watches` 里配置过时，工具不会自己造目录，而是回 `E_NO_ROUTE` 并列出最多 5 个可用目标（形如 `目录尾段 → 地址`）；把该目标加进 `watches` 后即可投递。成功投递会在 `relay.log` 写一行 `dsh-handoff-relay tool-deliver target=relay-xxxxxxx.md dir=… deduped=false`。
