@@ -34,16 +34,27 @@ node --input-type=module -e "const R=/@[^\\s@]/; console.log(R.test('0.6.2 验�
 
 ## 2.6 闸挂点与覆盖范围（应 admin 的硬要求 ②）
 
-只有一处投递出口：`index.js:1506 agent.followup(message)`，它在 `deliver()`（`:1456`）内部。闸在 `:1481-1485`，位置在 `resolveNow`／`agent` 判空之后、`buildMessage` 与 `followup` 之前。
+**闸与跳过是两处，别混为一谈**（以下是 0.6.3 落盘后的实际行号，`index.js` 112,309 B）：
+
+| 用途 | 位置 | 说明 |
+|---|---|---|
+| **闸**（判「该不该投」） | `:1550-1559`，`deliver()` 内 | 唯一投递出口 `agent.followup` 就在这个函数里；闸位于 `resolveNow`／`agent` 判空之后、`buildMessage` 与 `followup` 之前 |
+| **跳过①**（拒绝件自身不投） | `:1525`（`deliver` 入口）、`:1629`（`consider` 入口） | `relName.endsWith(REJECTED_SUFFIX)` ⇒ 直接 return，拒绝件永远不会被当成新件投出去 |
+| **跳过②**（同快照不重判） | `:1481` `isRejectedSnapshot`，调用点 `:1525`、`:1638` | 按 `fingerOf(watchDir, relName, mtimeMs, size)` 命中 `rejected.json` 即跳过 ⇒ 源件 mtime/size 不会被改写、拒绝件不会每轮重写 |
+| **目录过滤**（拒绝件不进候选） | `:1666` `listFiles()` | `.filter((e) => e.isFile() && !e.name.endsWith(REJECTED_SUFFIX))` |
+
+只有一处投递出口：`agent.followup(message)`，在 `deliver()` 内部。
 
 三个入口全部汇流到 `deliver()`，没有第二条投递路径：
 
-| 入口 | 行号 | 传入 reason |
-|---|---|---|
-| 尾巴命中 DONE（事件） | `:1538` | `DONE` |
-| 尾巴命中 DONE（首扫） | `:1542` | `DONE` |
-| `stableMs` 稳定投递（`checkStable` 的 timer 回调） | `:1543` | `stable` |
-| 重扫补投 | `:1581` | `DONE` |
+| 入口 | 传入 reason |
+|---|---|
+| 尾巴命中 DONE（事件） | `DONE` |
+| 尾巴命中 DONE（首扫） | `DONE` |
+| `stableMs` 稳定投递（`checkStable` 的 timer 回调） | `stable` |
+| 重扫补投 | `DONE` |
+
+（0.6.3 落盘后这些 call site 的行号随插入代码整体下移，故上表只列入口不列行号——行号以「唯一出口在 `deliver()` 内」这条结构事实为准，不靠数字对。）
 
 即 `stableMs` 分支不绕闸：它调的是同一个 `deliver()`。0.6.2 真机漏投不是「闸没挂在这条分支」，而是 `:1484` 的判据通过（§1）。
 
