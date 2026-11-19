@@ -57,7 +57,7 @@
   另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。
   ```
 - **不做**的判断：不校验被 @ 的人是否本群成员、判断 @ 是否有效——那套语义在 ds-bot `groups.js`，避免两处权威打架。
-- 防重投：`listFiles()`（`:1478`）与 `consider` 入口跳过 `*.rejected.md`。
+- 防重投（developer 实测定性，这是最大的坑）：`.rejected.md` 落在同一目录、后缀也是 `.md`，不处理就会每轮 rescan 重写、日志刷屏，且「原文件留在原地」永远在重试。两件事都要做：①文件名以 `.rejected.md` 结尾直接忽略（`listFiles()` 与 `consider` 入口各一道）；②按 `failed.json` 那套加 `rejected.json` 台账，用 `fingerOf(watchDir, relName, mtimeMs, size)` 按 mtime/size 跳过已拒收的件（参照 `index.js:324-378`）。
 
 ## 4 单测（≥4 条新增＋回归，落 `index.test.mjs`）
 
@@ -71,9 +71,10 @@
 | T5 | 群 watch 收无 `@` 文件 | 生成 `.rejected.md`、原文件仍在、`delivered/` 无新增、日志有 `NO_MENTION`、再触发不重投 |
 | T6 | 回归 | 0.6.1 的 199 例全绿；幂等键、去重、`inlined` 三项行为不变 |
 
-## 5 真机验一条（只走错误路径，不新增唤醒噪音）
+## 5 真机验两条（一条只走错误路径，一条必须真投）
 
-对 `DSH 插件组:大肥鱼` 调一次 `relay_deliver`（不给 mention）→ 期望 `E_MENTION_REQUIRED`、文案可逐名对账、`relay.log` 无新增 `tool-deliver` 行。成功路径 0.6.1 已验，本轮不投。
+1. **群地址缺 mention**（不投件、不新增唤醒）：对 `DSH 插件组:大肥鱼` 调 `relay_deliver`（不给 mention）→ 期望 `E_MENTION_REQUIRED`、文案可逐名对账、`relay.log` 无新增 `tool-deliver` 行。选这个地址是因为它绑了两条 watch、命中最靠前 `.batch\night\bridge\to-plugin-group`；`DSH 插件组:QA` 没有 watch，会先回 `E_NO_ROUTE`，测不到。
+2. **`<Bot>@主身` 反向用例：真投一次，接受一次唤醒**（QA §8 ③ 要真机原件，这里说清口径，不留两头）。目标用 `大肥鱼@主身`（绑 `…\.batch\night\bridge\to-owner`，见 `cordis.patch.yml:380`），正文一句话 + 不带 mention，期望 `ok:true`、`deduped:false`、`relay.log` 有 `tool-deliver` 与 `注入身份` 各一行。**「大管家@主身」不可用**：本机 `resolveAddressNow('大管家@主身')` → `E_ADDR_INVALID/UNKNOWN_BOT`（`state.json` 9 个 Bot 里没有「大管家」，有主身 sessionId 的只有 `大肥鱼`、`项目总负责人`、`workbuddy联络人`、`管家跟班`）——admin 原话指的是这一条，按事实改成 `大肥鱼@主身`。
 
 ## 6 版本、打包、装法、回执
 
@@ -90,13 +91,14 @@
 | QA 判据 | 对应交付物 |
 | --- | --- |
 | ① 四码各一条可复现命令＋原文输出 | developer 交 `docs/ledger/relay-tool-0.6.2-evidence.md`：每码一条命令、贴 JSON／`relay.log` 原文 |
-| ② 成员表逐名对 `state.json`（含 `(未开分身)` 与 `@所有人` 人数） | 真机一次 `E_MENTION_REQUIRED` 输出全文 + 同时刻 `room.members` 名单 |
-| ③ `<Bot>@主身` 反向用例走通 | T4 单测原文 + 一条真机原件 |
+| ② 成员表逐名对 `state.json`（含 `(未开分身)` 与 `@所有人` 人数） | 真机一次 `E_MENTION_REQUIRED` 输出全文 + **装完那一刻**的 `state.json` 快照：取样时间（ISO 带时区）＋文件 `sha256`＋`room.members` 名单；事后 `state.json` 再变不改判，也不许拿旧快照倒推 |
+| ③ `<Bot>@主身` 反向用例走通 | T4 单测原文 + **一条真机原件**（真投一次、接受一次唤醒，口径见 §5.2，目标 `大肥鱼@主身`） |
 | ④ to-group 无 @：原文件不动／`.rejected.md` 生成／内容一致／目录无新增投递件 | T5 单测原文 + 真机目录 `ls` 前后对照 |
-| ⑤ 新增 ≥4 单测、`npm test` 全绿、真机走装好副本、回滚与 tgz sha 记在交付里 | `npm test` 末行 `TOTAL/TOTAL PASS` 原文、tgz sha256、回滚段落 |
+| ⑤ 新增 ≥4 单测、`npm test` 全绿、真机走装好副本、回滚与 tgz sha 记在交付里 | `npm test` 末行 `TOTAL/TOTAL PASS` 原文、tgz sha256、**装好副本** `node_modules/dsh-handoff-relay/index.js` 的 sha256（须与包内 `package/index.js` 同值——验包不算验装的那份）、回滚段落 |
 
 ## 9 风险
 
 - `E_MENTION_REQUIRED` 每次报错读一次约 570 KB `state.json`，只走错误路径；沿用「坏 JSON 显式失败」语义，不兜底猜。
 - 文案出现真实人名：属群内公开信息；`relay.log` 只记码与文件名，不记人名。
+- **本轮不扩判据的口径缺口**：`mention` 不参与路由，正文同时 `@A @B` 时子串判定会过——只能拦「没写」与「@错人」，拦不住「多写了一个」。记在这里，不扩进本轮判据。
 - 将来 ds-bot 自建同口径校验，两处会重：以 ds-bot 为准、relay 退回只堵文件通道（本节供后人查）。
