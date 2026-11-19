@@ -73,19 +73,24 @@ node --input-type=module -e "const R=/@[^\\s@]/; console.log(R.test('0.6.2 验�
 | M10 | 正文 `@QA测试 …` | 拒绝（右边界：不得命中 `@QA`） |
 | M11 | 目标解析成主身、文件落在 `to-group` | 拒绝，reason=`ROOM_UNRESOLVED`，文案给「改投 to-owner」 |
 | M12 | 拒绝后等两个扫描周期 | 不投递、不生成 `.rejected.md.rejected.md`、源件 mtime/size 不变 |
+| M13（×4） | 工具路径：mention=`所有`／`大家`／`all`／`张三`，正文同样写 `@所有`／`@大家`／`@all`／`@张三` | 全部 `E_MENTION_UNKNOWN`（`field=body`），文案回显正文点到的人、给本群名单与 `@所有人` 写法；**不得照投** |
+| M14 | 工具路径：mention=`所有人`，正文 `@所有人 …` | 通过，照常落盘 |
+| M15 | 工具路径：不给 mention，正文 `@所有 …` | `E_MENTION_UNKNOWN`（不是 `E_MENTION_REQUIRED`：区别在「@ 了但不是本群的人」） |
+| M16 | 工具路径：不给 mention，正文 `@QA …`（本群成员） | 仍 `E_MENTION_REQUIRED`（mention 参数约束独立成立） |
 
 M6–M12 用假 home 的 `state.json`（临时目录 + `os.homedir` 桩）跑真成员表，不依赖本机台账。
 既有 M5/M5b 的 watch 只给 `targetSessionId`，解析不出房间名 ⇒ 按新语义归 `ROOM_UNRESOLVED`（断言已同步）。
 
-实测：`npm test` → `TOTAL: 212/212 PASS` / `RESULT: PASS`（0.6.2 的 205 例 + 7 条新例）。
+实测：`npm test` → `TOTAL: 225/225 PASS` / `RESULT: PASS`（0.6.2 的 205 例 + M6–M12 七条 + M13×4／M14／M15／M16 七条）。
 
 ## 3.1 实现落点（0.6.3 实测行号）
 
-- `index.js:1711` `export function checkMentionForRoom(text, roomName, members)`：`@所有人` → `{ok:true, how:'all'}`；逐成员 `hasMentionInText` 精确命中 → `{ok:true, how:'name'}`；否则 `{ok:false, code:'NO_MENTION'}`。工具路径与文件通道共用，不再有第二套判据（`USABLE_AT_RE` 已删）。
-- `index.js:1427` `channelRoomName()`：只从 `targetIdentity` 解析 `<群名>:<Bot>` 得到房间名并缓存；解析不到返回空串。
-- `index.js:1446` `rejectNoMention(relName, state, reasonCode, roomName)`：`NO_MENTION` 与 `ROOM_UNRESOLVED` 两套文案（都写清改法），只写 `.rejected.md` + `rejected.json`，不碰源件。
-- `index.js:1505-1519` 闸体（在 `deliver()` 内、`resolveNow`/`agent` 判空之后、`buildMessage`/`followup` 之前）：现读 `state.json` 取成员表 → `checkMentionForRoom` → 不通过即 `rejectNoMention` 并 `return`，不再走 `agent.followup`。
-- 工具侧四码未动：`@所有人` 原本就能过（`hasMentionInText(body,'所有人')`），与文件通道行为一致。
+- `index.js:1768` `export function checkMentionForRoom(text, roomName, members)`：三态——`@所有人` → `{ok:true, how:'all'}`；逐成员 `hasMentionInText` 精确命中 → `{ok:true, how:'name'}`；正文**一个 @ 都没有** → `{ok:false, code:'NO_MENTION', names:[]}`；**有 @ 但都不落在本群成员上** → `{ok:false, code:'UNKNOWN_MENTION', names:[…]}`（`names` 复用 `mentionedNamesIn`，没有第二套解析）。工具路径与文件通道共用同一个函数。
+- `index.js:1819` `buildMentionUnknownMessage(names, resolved, listMembers)`：未知成员的文案，名单与人数仍走 `listMembers` 同一次现读。
+- `index.js:1468` `channelRoomName()`：只从 `targetIdentity` 解析 `<群名>:<Bot>` 得到房间名并缓存；解析不到返回空串。
+- `index.js:1487` `rejectNoMention(relName, state, reasonCode, roomName, names)`：三套文案（`NO_MENTION`／`UNKNOWN_MENTION`／`ROOM_UNRESOLVED`，都写清改法），只写 `.rejected.md` + `rejected.json`，不碰源件。
+- `index.js:1566` 文件通道闸体（在 `deliver()` 内、`resolveNow`/`agent` 判空之后、`buildMessage`/`followup` 之前）：现读 `state.json` 取成员表 → `checkMentionForRoom` → 不通过即按 `code` 落 `rejectNoMention` 并 `return`，不再走 `agent.followup`。
+- `index.js:2033` 工具路径群分支：`mention` 与正文一致性（`E_MENTION_NOT_IN_BODY`）单独判，成员资格改由 `checkMentionForRoom(bodyForMention, resolved.roomName, listMembers(room).members)` 判，失败按 `code` 报 `E_MENTION_UNKNOWN`／`E_MENTION_REQUIRED`；`mention` 缺省时即使正文 @ 到了成员仍报 `E_MENTION_REQUIRED`（参数约束独立）。成员表读不出来 → `E_DELIVER_FAILED/STATE_UNREADABLE`。
 
 ## 2.7 回执提示（Reply-To ＋ 固定提醒段）
 
@@ -121,7 +126,7 @@ Reply-To: <地址>            ← 解析不出时整行省略
 1. `node docs/ledger/collect-0.6.2-install-evidence.mjs "<to-group 目录>" --record`
 2. admin 丢件 → 等 `relay.log` 出新行
 3. `node … --diff` ⇒ 期望：① 源件仍在原地 ② 出现 `.rejected.md` ④ 无新增 `relay-*.md` 投递件
-4. `relay.log` ⇒ 期望有 `watch-reject … reason=NO_MENTION`（或 `ROOM_UNRESOLVED`），**不得有** `注入身份 from=UNKNOWN` 行
+4. `relay.log` ⇒ 期望有 `watch-reject … reason=NO_MENTION`（`@` 了不在本群的人时是 `reason=UNKNOWN_MENTION`；解析不出房间名时是 `ROOM_UNRESOLVED`），**不得有** `注入身份 from=UNKNOWN` 行
 5. `rejected.json` ⇒ 期望有该件 fingerprint，`delivered/<hash12>/` 下**无**该件
 
 **实验 B · 有 @ 件**（文件名 `062-verify-with-mention.md`，正文首行 `@DSH 插件组` 成员名）

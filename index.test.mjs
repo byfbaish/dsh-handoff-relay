@@ -4221,6 +4221,41 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.ok(M1.message.includes('@所有人'), `要给出 @所有人 写法：${M1.message}`);
   });
 
+  // 0.6.3-fix：工具路径与文件通道同源——@ 必须落在本群成员上，否则 E_MENTION_UNKNOWN
+  const unknownCases = [
+    ['所有', '@所有 全员通报一件。', '@所有'],
+    ['大家', '@大家 全员通报一件。', '@大家'],
+    ['all', '@all 全员通报一件。', '@all'],
+    ['张三', '@张三 请复核。', '@张三'],
+  ];
+  for (const [who, body, seen] of unknownCases) {
+    const r = await handler({ target: 'DSH 插件组:QA', subject: `未知成员 ${who}`, mention: who, body });
+    check(`工具 M13 未知成员 @${who} → E_MENTION_UNKNOWN（不得照投），文案给名单与 @所有人`, () => {
+      assert.equal(r.ok, false, `不得照投：${JSON.stringify(r)}`);
+      assert.equal(r.code, 'E_MENTION_UNKNOWN', `实际 ${r.code}`);
+      assert.equal(r.field, 'body', `field 应指正文，实际 ${r.field}`);
+      assert.ok(r.message.includes(seen), `应回显正文点到的人：${r.message}`);
+      assert.ok(r.message.includes('@所有人'), `要给出 @所有人 写法：${r.message}`);
+      assert.ok(r.message.includes('共 3 人'), `应列本群人数：${r.message}`);
+    });
+  }
+
+  const allOk = await handler({ target: 'DSH 插件组:QA', subject: '所有人正例', mention: '所有人', body: '@所有人 全员通报一件。' });
+  check('工具 M14 @所有人 → 通过（全群调用，不核名单），照常落盘', () => {
+    assert.equal(allOk.ok, true, `应通过：${JSON.stringify(allOk)}`);
+    assert.ok(fs.existsSync(allOk.delivered), '应落盘');
+  });
+
+  const emptyMentionUnknown = await handler({ target: 'DSH 插件组:QA', subject: '没给 mention 且 @ 不落在成员上', body: '@所有 全员通报一件。' });
+  check('工具 M15 mention 缺省 + 正文 @所有 → 报 E_MENTION_UNKNOWN（不是 E_MENTION_REQUIRED）', () => {
+    assert.equal(emptyMentionUnknown.code, 'E_MENTION_UNKNOWN', `实际 ${emptyMentionUnknown.code}`);
+  });
+
+  const memberNoMention = await handler({ target: 'DSH 插件组:QA', subject: '正文 @ 了成员但没给 mention', body: '@QA 请复核。' });
+  check('工具 M16 正文 @ 到本群成员但缺 mention 参数 → 仍 E_MENTION_REQUIRED（参数约束独立）', () => {
+    assert.equal(memberNoMention.code, 'E_MENTION_REQUIRED', `实际 ${memberNoMention.code}`);
+  });
+
   const M2 = await handler({ target: 'DSH 插件组:QA', subject: 'mention 对不上', mention: 'QA', body: '@QA测试 我不是这个人' });
   check('工具 M2 / M3b 右边界：@QA 不得命中 @QA测试 → E_MENTION_NOT_IN_BODY，且给两种改法', () => {
     assert.equal(M2.code, 'E_MENTION_NOT_IN_BODY', `实际 ${M2.code}`);

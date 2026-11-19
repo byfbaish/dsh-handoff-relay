@@ -1484,10 +1484,18 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   }
 
   /** 群投递无 @：原文留原地、写同名 `.rejected.md`、记台账（否则同快照每轮 rescan 反复判）。 */
-  function rejectNoMention(relName, state, reasonCode = 'NO_MENTION', roomName = '') {
+  function rejectNoMention(relName, state, reasonCode = 'NO_MENTION', roomName = '', names = []) {
     const full = path.join(watchDir, relName);
     const where = roomName ? `房间「${roomName}」` : '目标群';
-    const text = (reasonCode === 'ROOM_UNRESOLVED'
+    const listed = Array.isArray(names) && names.length > 0 ? names.join('、') : '（未识别出名字）';
+    const text = (reasonCode === 'UNKNOWN_MENTION'
+      ? [
+        `群投递被拒：正文里点了 @${listed}，但这些名字不在${where}的成员名单上。`,
+        '可用写法：改 @ 本群成员的名字，或写 "@所有人"（全群调用，慎用、会唤醒全群）。',
+        '说明：@所有／@大家／@all 都不算；名字须与名单逐字一致（区分字母大小写）。',
+        '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
+      ]
+      : reasonCode === 'ROOM_UNRESOLVED'
       ? [
         '群投递被拒：这条 watch 的目标是群，但没解析出房间名，无法核对成员名单。',
         '改法一：把 watch 的 targetIdentity 写成 "<群名>:<Bot>" 形式后重载。',
@@ -1556,7 +1564,11 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
       try { members = listRoomMembers(readStateFile(defaultStatePath()), room).members; }
       catch { rejectNoMention(relName, state, 'ROOM_UNRESOLVED', room); return; }
       const mentionVerdict = checkMentionForRoom(rawText, room, members);
-      if (!mentionVerdict.ok) { rejectNoMention(relName, state, 'NO_MENTION', room); return; }
+      if (!mentionVerdict.ok) {
+        // 两种拒绝都给（文件通道一律不投），但文案分开：没写 @ vs @ 了不在本群的人。
+        rejectNoMention(relName, state, mentionVerdict.code, room, mentionVerdict.names || []);
+        return;
+      }
     }
     // P54：To 由 relay 生成——标题优先取 resolved.title（resolveNow 已带回），
     // 缺失再 sessionTitleOf(ctx, agent)，都取不到写 (无标题)；id8 取 resolved.id 前 8 位；
@@ -1761,7 +1773,11 @@ export function checkMentionForRoom(text, roomName, members) {
     const botName = m && typeof m.botName === 'string' ? m.botName : '';
     if (botName && hasMentionInText(body, botName)) return { ok: true, how: 'name', name: botName };
   }
-  return { ok: false, code: 'NO_MENTION', roomName: roomName || '' };
+  // 三态（0.6.3-fix）：正文一个 @ 都没有 → NO_MENTION；有 @ 但都不落在本群成员上 → UNKNOWN_MENTION。
+  // 两者对调用方的动作不同：前者「补 @」，后者「改 @ 成谁」。名单复用 mentionedNamesIn，不另写解析。
+  const names = mentionedNamesIn(body);
+  if (names.length === 0) return { ok: false, code: 'NO_MENTION', roomName: roomName || '', names: [] };
+  return { ok: false, code: 'UNKNOWN_MENTION', roomName: roomName || '', names };
 }
 
 /** 正文里实际点到的人（用于 E_MENTION_NOT_IN_BODY 文案：列已点到的名字）。 */
@@ -1776,8 +1792,7 @@ function mentionedNamesIn(text) {
 }
 
 /** 群投递缺 mention 的文案：成员表、人数、@所有人 都来自同一次 listMembers 现读。 */
-function buildMentionRequiredMessage(resolved, listMembers) {
-  const head = '群地址必须带 mention：群内消息只唤被 @ 的人，不写 @ 等于没人接。';
+function buildMentionRequiredMessage(resolved, listMembers, head = '群地址必须带 mention：群内消息只唤被 @ 的人，不写 @ 等于没人接。') {
   const tail = (total) => `照抄：mention="QA"，并在 body 首行写 "@QA 请…"；要全员写 mention="@所有人"（慎用，该群 ${total} 人）`;
   try {
     const info = listMembers((resolved && resolved.roomName) || '');
@@ -1798,6 +1813,13 @@ function buildMentionRequiredMessage(resolved, listMembers) {
       tail(TOOL_MENTION_MAX_LIST),
     ].join('\n');
   }
+}
+
+/** 群投递的 @ 不落在本群成员上（@所有／@大家／@all／@张三）：点名列表 + 本群名单 + 照抄示例。 */
+function buildMentionUnknownMessage(names, resolved, listMembers) {
+  const listed = Array.isArray(names) && names.length > 0 ? names.join('、') : '（未识别出名字）';
+  const head = `正文点了 @${listed}，但不在本群名单上：群内消息只唤本群成员，或写 @所有人 唤全群。`;
+  return buildMentionRequiredMessage(resolved, listMembers, head);
 }
 
 function buildMentionNotInBodyMessage(mention, body) {
@@ -2004,13 +2026,29 @@ export function createRelayToolHandler(options) {
       return toolFail('E_NO_ROUTE', '', 'target', `解析到 ${resolved.title || IDENTITY_FALLBACK_TITLE} | ${id8Of(resolved.sessionId)} 但本机没有绑定它的 watch。当前可用目标：${avail.length > 0 ? avail.join('；') : '（无）'}；要投新目标请在 profile 的 dsh-handoff-relay 配置里加一条 watches（targetIdentity="${target}"）并重启`);
     }
 
-    // 0.6.2：群投递必须写 @。判定顺序（先语法、再不一致、最后缺失）已在 validate 里落 FULLWIDTH；
-    // 这里只对群地址校后两条；目标是「<Bot>@主身」时不校验（通报件行为与 0.6.1 一致）。
+    // 0.6.3-fix：群投递的 @ 判定与文件通道同源——只问「正文里的 @ 落在本群成员上吗」，
+    // 不再对 mention 参数做子串匹配（那是第二套判据，会让 @所有／@大家／@张三 从工具路径漏过去）。
+    // mention 参数只剩一条职责：与正文对齐（E_MENTION_NOT_IN_BODY），不承担成员资格判定。
+    // 目标是「<Bot>@主身」时不校验（通报件行为与 0.6.1 一致）。
     if (resolved.kind === 'group') {
       const bodyForMention = stripIdentityLines(body);
       if (mention !== '' && !hasMentionInText(bodyForMention, mention)) {
         return toolFail('E_MENTION_NOT_IN_BODY', '', 'mention', buildMentionNotInBodyMessage(mention, bodyForMention));
       }
+      let roomMembers = [];
+      try {
+        roomMembers = listMembers(resolved.roomName || '').members;
+      } catch (err) {
+        return toolFail('E_DELIVER_FAILED', 'STATE_UNREADABLE', 'target', `本群成员表读不出来（${describeIdentityError(err)}）：本机台账问题，重试无用，让管理员查 state.json`);
+      }
+      const verdict = checkMentionForRoom(bodyForMention, resolved.roomName || '', roomMembers);
+      if (!verdict.ok) {
+        if (verdict.code === 'UNKNOWN_MENTION') {
+          return toolFail('E_MENTION_UNKNOWN', '', 'body', buildMentionUnknownMessage(verdict.names || [], resolved, listMembers));
+        }
+        return toolFail('E_MENTION_REQUIRED', '', 'mention', buildMentionRequiredMessage(resolved, listMembers));
+      }
+      // 正文的 @ 合法但 mention 参数还是没给：参数约束独立成立（0.6.2 签名第 3 条之前的口径不变）。
       if (mention === '') {
         return toolFail('E_MENTION_REQUIRED', '', 'mention', buildMentionRequiredMessage(resolved, listMembers));
       }
@@ -2109,7 +2147,7 @@ export function registerRelayTool(ctx, options) {
   const handler = createRelayToolHandler({ ...opt, ctx });
   return tools.register({
     name: RELAY_TOOL_NAME,
-    description: '把一条消息投递给本机已绑定 watch 的目标 Bot／主身。参数即约束：target 只接受「<群名>:<Bot>」或「<Bot>@主身」（不 trim、不模糊匹配）；subject 单行 ≤120 字符并进幂等键；body 非空、UTF-8 ≤1 MiB；kind 缺省 REPORT。群地址必须给 mention（只填名字，如 "QA"／"所有人"）：正文里要出现「@+这个名字」，其后须是空格／标点／|／行尾。预期失败不抛异常，返回 { ok:false, code, reason, message }，按 code 决定下一步：E_ADDR_INVALID／E_SESSION_UNRECORDED 改地址或等台账、E_ARGS_INVALID 改入参、E_BODY_TOO_LARGE 改写法（摘要＋路径）、E_MENTION_REQUIRED 补 mention、E_MENTION_NOT_IN_BODY 让正文与 mention 一致、E_MENTION_FULLWIDTH 把 ＠ 改回 @、E_NO_ROUTE 加 watch 配置并重启、E_DELIVER_FAILED 查目录权限。',
+    description: '把一条消息投递给本机已绑定 watch 的目标 Bot／主身。参数即约束：target 只接受「<群名>:<Bot>」或「<Bot>@主身」（不 trim、不模糊匹配）；subject 单行 ≤120 字符并进幂等键；body 非空、UTF-8 ≤1 MiB；kind 缺省 REPORT。群地址必须给 mention（只填名字，如 "QA"／"所有人"）：正文里要出现「@+这个名字」，其后须是空格／标点／|／行尾。预期失败不抛异常，返回 { ok:false, code, reason, message }，按 code 决定下一步：E_ADDR_INVALID／E_SESSION_UNRECORDED 改地址或等台账、E_ARGS_INVALID 改入参、E_BODY_TOO_LARGE 改写法（摘要＋路径）、E_MENTION_REQUIRED 补 mention、E_MENTION_NOT_IN_BODY 让正文与 mention 一致、E_MENTION_UNKNOWN 把正文的 @ 改成该群成员或 @所有人、E_MENTION_FULLWIDTH 把 ＠ 改回 @、E_NO_ROUTE 加 watch 配置并重启、E_DELIVER_FAILED 查目录权限。',
     parameters: TOOL_PARAMETERS,
     output: {
       schema: TOOL_OUTPUT_SCHEMA,
