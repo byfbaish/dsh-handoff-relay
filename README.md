@@ -145,6 +145,32 @@ Behind those two lines the body is the default text
 open the file straight from that path. If the target session is not loaded, a
 warning is written and nothing is sent.
 
+## Tool: relay_deliver (since 0.6.0)
+
+A single hand-off is now also a tool: instead of dropping a file into a watched directory and waiting, pass the target address, a subject and the body directly. The directory watch still works; both paths share the same write, identity-header, dedupe and archive logic.
+
+| Parameter | Required | Constraint |
+| --- | --- | --- |
+| `target` | yes | `<room>:<Bot>` or `<Bot>@main`, matched verbatim: no trimming, no fuzzy resolution |
+| `subject` | yes | single-line title, ≤120 chars; part of the idempotency key |
+| `body` | yes | the content, no character cap, 1 MiB (1,048,576 bytes) guard, NUL forbidden |
+| `kind` | no | `ASK` / `NOTICE` / `REPORT` / `OK` / `RED`, defaults to `REPORT` |
+
+It returns `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`; `delivered` is the absolute path inside the watch directory and `deduped: true` means the same arguments were delivered before. Expected failures are returned, not thrown (`E_ADDR_INVALID`, `E_SESSION_UNRECORDED`, `E_ARGS_INVALID`, `E_BODY_TOO_LARGE`, `E_NO_ROUTE`, `E_DELIVER_FAILED`).
+
+Copy-paste arguments:
+
+```json
+{
+  "target": "DSH 插件组:QA",
+  "subject": "Review request: relay 0.6.0 live delivery",
+  "body": "0.6.0 is installed and the host restarted; run step 1 of docs/stage3-install-and-verify.md and return the relay.log line verbatim.",
+  "kind": "ASK"
+}
+```
+
+If the target has no `watches` entry yet, the tool refuses to invent a directory: it returns `E_NO_ROUTE` with up to five available targets (`dir tail → address`). A successful delivery writes one `relay.log` line: `dsh-handoff-relay tool-deliver target=relay-xxxxxxx.md dir=… deduped=false`.
+
 ## Why "relay"
 
 Until I wanted it to reach me at any time, I did not see it.

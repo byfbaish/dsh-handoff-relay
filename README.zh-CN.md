@@ -86,6 +86,38 @@ watch、找的是什么标题、命中几条（有歧义时列出候选）。**�
 `文件 <绝对路径> 已就绪（触发=stable|DONE），请继续。`，收件方可以按该路径直接读文件。
 如果目标会话尚未加载，则写一条警告日志，不发送任何消息。
 
+## 工具：relay_deliver（0.6.0 起）
+
+一条投递现在也是工具：不必先往目录里放文件再等 watch，调用时直接给「目标地址 + 标题 + 正文」。文件方式仍然保留，两者共用同一套落盘、身份头、去重与归档逻辑。
+
+| 参数 | 必填 | 约束 |
+| --- | --- | --- |
+| `target` | 是 | `<群名>:<Bot>` 或 `<Bot>@主身`，原样匹配、不 trim、不做模糊补全 |
+| `subject` | 是 | 单行标题，≤120 字符；同一目标下它参与幂等键 |
+| `body` | 是 | 要交的正文，无字符上限，护栏 1 MiB（1,048,576 字节），禁 NUL |
+| `kind` | 否 | `ASK`／`NOTICE`／`REPORT`／`OK`／`RED`，缺省 `REPORT` |
+
+返回 `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`：`delivered` 是落到 watch 目录的绝对路径，`deduped: true` 表示同参数重复调用、没有再次投递。预期失败不抛异常，直接回 `code`（`E_ADDR_INVALID`／`E_SESSION_UNRECORDED`／`E_ARGS_INVALID`／`E_BODY_TOO_LARGE`／`E_NO_ROUTE`／`E_DELIVER_FAILED`）。
+
+**可直接复制的调用参数**（交给任意 Bot，或直接在工具面板里粘贴）：
+
+```json
+{
+  "target": "DSH 插件组:QA",
+  "subject": "复核请求：relay 0.6.0 实机投递",
+  "body": "已装 0.6.0 并重启，请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。",
+  "kind": "ASK"
+}
+```
+
+**一句话版本**（发给你正在对话的 Bot）：
+
+```text
+用 relay_deliver 给「DSH 插件组:QA」发一条 ASK：subject 写「复核请求：relay 0.6.0 实机投递」，body 写「已装 0.6.0 并重启，请按 docs/stage3-install-and-verify.md 第 1 条执行一次 tool-deliver，回传 relay.log 行原文。」
+```
+
+目标没在 `watches` 里配置过时，工具不会自己造目录，而是回 `E_NO_ROUTE` 并列出最多 5 个可用目标（形如 `目录尾段 → 地址`）；把该目标加进 `watches` 后即可投递。成功投递会在 `relay.log` 写一行 `dsh-handoff-relay tool-deliver target=relay-xxxxxxx.md dir=… deduped=false`。
+
 ## 为什么叫 relay
 
 直到我想让它随时能找到我，才发现不是。
