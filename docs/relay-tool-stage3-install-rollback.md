@@ -41,18 +41,40 @@ sha256sum node_modules/dsh-handoff-relay/index.js   # 期望 ed7cef8c…（这�
 sha256sum ~/.dsh/profiles/desktop/cordis.patch.yml
 ```
 
-## 2 装包（主身放行后由主持人执行，developer 只在旁边看）
+## 2 装包（**CLI 路径已被 host 关闭**，见 §2.0；仅剩应用侧三条路）
 
-```bash
-cd C:/develop/workspace/dsh-handoff-relay
-sha256sum dsh-handoff-relay-0.6.0.tgz                      # 与 developer 报的值逐字比对
-dsh plugin --profile desktop add "file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.6.0.tgz"
+### 2.0 先看清：`dsh plugin --profile desktop` 在 0.2.2-rc.1 起被硬拒
+
+08:39 developer 按本文旧版 §2 执行，当场被拒（宿主未变一字节）：
+
+```
+error: profile "desktop" is managed exclusively by the Electron application
 ```
 
-**验收装包成功的三条**（任一不过就地停，不重启）：
+源码定性（我复核）：`C:\Users\<用户名>\AppData\Roaming\npm\node_modules\@deepseek-ai\dsh\lib\bin.js:36` 定义该文案，`:119` 在 `plugin` 子命令上先判 `if (!manageDesktopProfile) rejectElectronProfile(...)`——`manageDesktopProfile` 只由 Electron 应用以编程方式传 `true`（`runCli(options)`，`:209`），CLI 自己永远传不到。`dsh plugin --help` 的 usage 里也没有 force/override 一类口子。
 
-1. 命令 `exit 0`，输出含 `Packages: +N`；
-2. `node -e "…version"` → `0.6.0`；
+结论：**manual §2 的 `add` 命令在本机永远失败**，与操作者无关；P54／P113 当时能成，是因为那次 install 早于 11-19 00:11 的这次升级（`lib/bin.js` mtime 即 00:11）。
+
+### 2.1 三条可行路径（都要主身点头，Bot 不自行选）
+
+| # | 做法 | 谁执行 | 代价/风险 |
+| --- | --- | --- | --- |
+| A | 在 DSH 应用（Electron）的插件管理里安装本地 tgz `C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.6.0.tgz` | 主人本人 | 唯一符合「desktop 归应用托管」的路径；`package.json`/lock 由应用改写 |
+| B | 主身授权 Bot 用 `plugin_manager` 装 | 主持人（需 danger-full-access 批准） | 工具面向 registry/catalog spec，本地 `file:` tgz 未必吃，可能白批一次 |
+| C | 手改 `~/.dsh/profiles/desktop/package.json:20` specifier 为 0.6.0 tgz + 在 profile 目录 `pnpm install` | 主持人（需主身点头） | 绕过应用托管，下次应用启动可能被重写；备份四件已在，可 R1 回退 |
+
+推荐顺序：A > C > B（B 最可能空跑）。
+
+### 2.2 装后验收（三条，任一不过就地停，不重启；用 A/C 装完都适用）
+
+装前先记 tgz 的指纹（与 developer 报的值逐字比对）：
+
+```bash
+cd C:/develop/workspace/dsh-handoff-relay && sha256sum dsh-handoff-relay-0.6.0.tgz
+```
+
+1. 安装动作 `exit 0`（A 看应用提示、C 看 `pnpm install` 输出含 `+ dsh-handoff-relay`）；CLI 的 `add` 不要再试，必拒（§2.0）；
+2. `node -e "console.log(require(process.env.USERPROFILE + '/.dsh/profiles/desktop/node_modules/dsh-handoff-relay/package.json').version)"` → `0.6.0`；
 3. 工具面确实在包里（在 profile 目录内执行，避免写绝对路径）：
 
 ```bash
@@ -70,13 +92,15 @@ node -e "import('./node_modules/dsh-handoff-relay/index.js').then(m=>console.log
 ### R0 卸载（主身认可的「卸载命令原文」，装不上或要彻底退出时用）
 
 ```bash
-# 首选：官方卸载（本机 `dsh plugin --help` 无输出、未实测，执行时看 exit code）
+# 官方卸载（注意：与装包同一条守卫，desktop 上同样被拒，见 §2.0；报错即转下面的文件级做法）
 dsh plugin --profile desktop remove dsh-handoff-relay
 grep -n "dsh-handoff-relay" ~/.dsh/profiles/desktop/package.json      # 期望 0 命中
 ls ~/.dsh/profiles/desktop/node_modules/dsh-handoff-relay 2>/dev/null || echo "已移除"
 ```
 
-CLI 不可用时的等价文件级卸载（不手删 `node_modules`，交回 pnpm）：
+**更正（我此前写错过一次）**：`dsh plugin --help` 并不返回空——它正常打出 usage（`Usage: dsh plugin [options] [args...]`，只有 `--profile` 与 `-h`）。上一版写「无输出、未实测」是我这边捕获命令的写法问题（`.cmd` 经管道取证丢了输出），不是 CLI 行为；真正的坑是 usage 里没有任何 force/override 口子，且 `:119` 直接拒 desktop。
+
+文件级卸载（不手删 `node_modules`，交回 pnpm）：
 
 ```bash
 cd ~/.dsh/profiles/desktop
