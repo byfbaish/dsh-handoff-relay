@@ -1,78 +1,102 @@
-# relay 0.6.2 方案：把「派活必须 @ 谁」做成参数约束
+# relay 0.6.2 定稿：把「派活必须 @ 谁」做成参数约束
 
-主持人：项目总负责人｜2026-11-19 23:5x｜性质：**方案稿，未写一行代码、未打包、未装、未推送**；待群管理分身核过再动手。
-范围：只改 `C:\develop\workspace\dsh-handoff-relay`；**不碰 ds-bot 上游**（`groups.js` 一个字不改），成员清单一律只读 `~/.dsh/bot/state.json`。
+主持人：项目总负责人｜2026-11-19 23:59 定稿（群管理分身四点全批 + 产品经理三句口径并入，**不再出 v2**）｜状态：**待 developer 实现，未写码、未打包、未装、未推送**
+范围：只改 `C:\develop\workspace\dsh-handoff-relay`；**不碰 ds-bot 上游**（`groups.js` 一个字不改）。若主人批准 ds-bot 侧加同口径守卫，两处判据与文案必须同一份、以 ds-bot 为准。
 
 ## 1 现状锚点（0.6.1，HEAD `75f70c4`；行号以该提交为准）
 
 | 位置 | 内容 | 0.6.2 要动的地方 |
 | --- | --- | --- |
 | `index.js:1524` | `export const RELAY_TOOL_NAME = 'relay_deliver'` | 不动 |
-| `index.js:1526-1531` | `TOOL_SUBJECT_MAX_CHARS`／`TOOL_BODY_MAX_BYTES`／`TOOL_KINDS`／`TOOL_NO_ROUTE_LIMIT` | 新增 `TOOL_MENTION_MAX_LIST = 12` 一类常量 |
+| `index.js:1526-1531` | `TOOL_SUBJECT_MAX_CHARS`／`TOOL_BODY_MAX_BYTES`／`TOOL_KINDS`／`TOOL_NO_ROUTE_LIMIT` | 新增 `TOOL_MENTION_MAX_LIST = 12` |
 | `index.js:1534-1556` | `TOOL_PARAMETERS`（target／subject／body／kind，`required: ['target','subject','body']`） | 加 `mention` 可选属性，`required` 不变 |
-| `index.js:1567-1601` | `validateRelayToolArgs`（纯参数校验，不碰 fs） | 加 3 条纯判定；`mention` 并入返回值 |
+| `index.js:1567-1601` | `validateRelayToolArgs`（纯参数校验，不碰 fs） | 加 3 条纯判定，按 §2 优先级 |
 | `index.js:1618-1631` | `describeRelayRoutes`（`E_NO_ROUTE` 文案） | 不动；仿它新增成员清单函数 |
-| `index.js:1676-1700` | `relayToolExecute`：校验 → `resolveAddress` → `routeRelayTarget` → `E_NO_ROUTE` | 在**单返回出口**（`:1740→:1752`）之前给 `E_MENTION_REQUIRED` 拼成员清单 |
-| `index.js:1359-1405` | watch 投递 `deliver()`：去重 → `resolveNow` → 找 agent → 读桩件 `From:` → `buildMessage` | 在 `resolveNow` 成功之后、`buildMessage`（`:1397`）之前插文件通道闸 |
-| `index.js:1478-1481` | `listFiles()` 直接返回目录内所有文件 | 跳过 `.rejected.md` 后缀，否则拒绝件会被反复重投 |
-| `identity.js:105-127` | `createIndex`：`botsByName`、`roomsByName`（`room.members` 是 bot id 数组） | 加 `botsById`（反查 id→name），只加字段不改结构 |
+| `index.js:1676-1700` | `relayToolExecute`：校验 → `resolveAddress` → `routeRelayTarget` → `E_NO_ROUTE` | 单返回出口前给 `E_MENTION_REQUIRED` 拼成员清单 |
+| `index.js:1359-1405` | watch 投递 `deliver()`：去重 → `resolveNow` → 找 agent → 读桩件 `From:` → `buildMessage` | 在 `:1397` 之前插文件通道闸 |
+| `index.js:1478-1481` | `listFiles()` 返回目录内所有文件 | 跳过 `.rejected.md` 后缀 |
+| `identity.js:105-127` | `createIndex`：`botsByName`、`roomsByName`（`room.members` 是 bot id 数组） | 加 `botsById` 反查 |
 | `identity.js:19-33` | 错误码与 `REASONS` | 新增 `listRoomMembers` 导出（只读，不新增码） |
 
-## 2 四个错误码（文案一律「错在哪／为什么／照抄就能过」三件齐）
+## 2 三条判定与优先级（同一次现读取数，避两个人数打架）
 
-| 码 | 触发 | field | 文案骨架（示例，成员清单运行时生成） |
+**判定顺序固定：`E_MENTION_FULLWIDTH` → `E_MENTION_NOT_IN_BODY` → `E_MENTION_REQUIRED`**（产品经理 ③：mention 与正文都写了但指向不同人时，先报「不一致」，不让模型面对两种改法猜）。
+
+| 码 | 触发 | field | 文案要点 |
 | --- | --- | --- | --- |
-| `E_MENTION_REQUIRED` | target 是群地址（`<群名>:<Bot>`）且没给 `mention` | `mention` | `群地址必须带 mention：群内消息只唤被 @ 的人，不写 @ 等于没人接。该群可 @ 的人：大肥鱼、QA、developer（共 6 人，只列前 12）。照抄：mention="QA"，并在 body 首行写 "@QA 请…"；要全员写 mention="@所有人"（慎用，该群 6 人）` |
-| `E_MENTION_NOT_IN_BODY` | 给了 `mention`，但 body 里没有 `@<mention>` | `mention` | `mention 与正文不一致：@ 只在正文里生效，参数里的名字不代替正文。两种改法：①正文首行补一行 "@QA 请…"；②把 mention 改成正文里已经点了的那个人（当前正文点到的人：无）` |
-| `E_MENTION_FULLWIDTH` | `mention` 或 body 含全角 `＠` | `mention` 或 `body` | `全角 ＠ 群内不识别：它和半角 @ 是两个字符，解析器只认半角。把正文里的 ＠QA 改成 @QA（半角），mention 参数同样只填名字` |
-| （不新增） | target 是 `<Bot>@主身` | — | 不校验 mention；通报件行为不变（0.6.1 原样） |
+| `E_MENTION_FULLWIDTH` | `mention` 或正文含全角 `＠` | 实际出问题的字段 | 全角 `＠` 与半角 `@` 是两个字符，群内只认半角；把 `＠QA` 改成 `@QA`，mention 参数只填名字 |
+| `E_MENTION_NOT_IN_BODY` | 给了 `mention`，正文里没有合法的 `@<原名>` | `mention` | 两种改法：①正文首行补 `@QA 请…`；②把 mention 改成正文里已点的人（并列当前正文点到的人，无则写「无」） |
+| `E_MENTION_REQUIRED` | 群地址（`parseAddress(target).kind==='group'`）且没给 `mention` | `mention` | 见下 |
 
-群地址判定用既有纯函数 `identity.js:53 parseAddress`（只解析字符串、不读 fs），不用目录名猜。
+`E_MENTION_REQUIRED` 文案骨架：
+
+```
+群地址必须带 mention：群内消息只唤被 @ 的人，不写 @ 等于没人接。
+该群可 @ 的人（共 6 人，列前 12）：大肥鱼、QA、developer、产品经理 (未开分身)、…
+标 (未开分身) 的无法投递，别 @ 它。
+照抄：mention="QA"，并在 body 首行写 "@QA 请…"；要全员写 mention="@所有人"（慎用，该群 6 人）
+```
+
+- **成员表与人数同一次现读**：`可 @ 总数 = room.members 条数`；若 >12，列表尾写「等 {总数−12} 人」；`@所有人` 括号里写 `总数`——两者出自同一次 `state.json` 读取，不各算一遍。
+- **`(未开分身)` 仍列出**（群管理分身 ② 定的），并附「标此标记的无法投递，别 @ 它」一句。
+- **匹配口径（产品经理 ①）**：命中 `@` + 原名 **且其后一个字符必须是空格、标点、`|` 或行尾**，防止 `@QA` 误命中 `@QA测试`；不折叠大小写、不 trim 前后空格。
+- `<Bot>@主身` 目标**不校验**，通报件行为与 0.6.1 一致。
 
 ## 3 文件通道（to-group 目录投递）
 
-- 判定：「这是不是群投递」取或命题——watch 的 `targetIdentity` 解析为 `kind==='group'`，或目录尾段为 `to-group`。任一成立即校验（宁可多拦一次：主身件若挂在 to-group 目录下也会被要求 @，这是刻意的）。
-- 规则：正文（剥掉 `From:`／`To:` 头之后的正文）里**一个半角 `@` 都没有** → 不静默丢弃：
-  1. 文件留在原地，不移入 `delivered/`、不注入、不标 dedupe；
-  2. 同目录写 `<原名>.rejected.md`，内容＝同一段文案（含成员清单与两种改法）；
-  3. `relay.log` 写一行 `watch-reject target=<relName> dir=<dir> reason=NO_MENTION`。
-- **不做**的判定：不校验被 @ 的人是不是该群成员、不看 @ 是否有效——那套语义在 ds-bot 的 `groups.js`，我们只堵「一个 @ 都没有」这一种静默失效，避免两处权威打架。
-- 防重投：`listFiles()`（`:1478`）与 `consider` 入口跳过 `*.rejected.md`；拒绝件本身也带一行 `# 已拒收`，人工可读。
+- 判定取或：watch 的 `targetIdentity` 解析为 `kind==='group'`，**或**目录尾段为 `to-group`。任一成立即校验（刻意接受「挂错目录的主身件也被要求 @」）。
+- 触发：正文（剥掉 `From:`／`To:` 头之后）**没有合法的半角 `@`** → 不静默丢弃：
+  1. 文件留原地，不移入 `delivered/`、不注入、不标 dedupe；
+  2. 同目录写 `<原名>.rejected.md`，内容＝同一段文案；
+  3. `relay.log` 记 `watch-reject target=<relName> dir=<dir> reason=NO_MENTION`。
+- **文案必须写两种可能、各给一句改法**（群管理分身 ④）：
+  ```
+  群投递被拒：正文里没有可识别的 @。
+  可能一：地址解析成主身，文件却落在 to-group → 改投 to-owner 目录，或在正文首行 @ 目标人。
+  可能二：目标是群，但正文没写 @ → 在正文首行补 "@QA 请…"（半角 @）后重新放入本目录。
+  另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。
+  ```
+- **不做**的判断：不校验被 @ 的人是否本群成员、判断 @ 是否有效——那套语义在 ds-bot `groups.js`，避免两处权威打架。
+- 防重投：`listFiles()`（`:1478`）与 `consider` 入口跳过 `*.rejected.md`。
 
-## 4 单测（4 条正例＋2 条回归，落 `index.test.mjs`）
+## 4 单测（≥4 条新增＋回归，落 `index.test.mjs`）
 
 | # | 用例 | 断言 |
 | --- | --- | --- |
-| T1 | group target + 无 mention | `code=E_MENTION_REQUIRED`、`field='mention'`、文案含至少一个真实成员名与 `@` 半角示例、含「慎用」 |
-| T2 | mention=`QA`、body 无 `@QA` | `code=E_MENTION_NOT_IN_BODY`、文案含两种改法 |
-| T3 | body 含 `＠QA`（全角） | `code=E_MENTION_FULLWIDTH`、field 指向实际出问题的字段 |
-| T4 | `X@主身` + 无 mention | `ok:true` 路径不被 mention 校验拦截（用桩 io 走到底） |
-| T5 | 文件通道：群 watch 收无 `@` 文件 | 生成 `.rejected.md`、原文件仍在、`delivered/` 无新增、`relay.log` 有 `NO_MENTION` 行、再触发一次不重投 |
+| T1 | group target + 无 mention | `code=E_MENTION_REQUIRED`、`field='mention'`、文案含真实成员名、`@` 半角示例、`慎用`、人数 |
+| T2 | mention=`QA`、正文无 `@QA` | `code=E_MENTION_NOT_IN_BODY`、含两种改法 |
+| T3 | 正文含 `＠QA`（全角） | `code=E_MENTION_FULLWIDTH`、field 指向实际字段 |
+| T3b | 正文 `@QA测试`、mention=`QA` | **不得**误命中；按边界规则判 `E_MENTION_NOT_IN_BODY` |
+| T4 | `X@主身` + 无 mention | 不被 mention 校验拦截（桩 io 走到底） |
+| T5 | 群 watch 收无 `@` 文件 | 生成 `.rejected.md`、原文件仍在、`delivered/` 无新增、日志有 `NO_MENTION`、再触发不重投 |
 | T6 | 回归 | 0.6.1 的 199 例全绿；幂等键、去重、`inlined` 三项行为不变 |
 
 ## 5 真机验一条（只走错误路径，不新增唤醒噪音）
 
-在已装 0.6.2 的宿主上，对 `DSH 插件组:大肥鱼` 调一次 `relay_deliver`（`target` 该地址、`subject` 一行、`body` 一段、**不给 mention**）→ 期望返回 `E_MENTION_REQUIRED`，文案里能数出该群成员名，且 `relay.log` 无新增 `tool-deliver` 行（失败不落盘）。成功路径 0.6.1 已实机验过，本轮不再投一条打扰人。
+对 `DSH 插件组:大肥鱼` 调一次 `relay_deliver`（不给 mention）→ 期望 `E_MENTION_REQUIRED`、文案可逐名对账、`relay.log` 无新增 `tool-deliver` 行。成功路径 0.6.1 已验，本轮不投。
 
-## 6 版本、打包与装法
+## 6 版本、打包、装法、回执
 
 - `package.json` → `0.6.2`；产物 `dsh-handoff-relay-0.6.2.tgz`（sha256 由 developer 出，我核包内 `index.js` 与仓内同值）。
-- 装法只能是 **A 路**：主人在应用 → 插件管理里装本地 tgz（`dsh plugin --profile desktop add` 在 0.6.2 宿主上必被 `bin.js:119` 拒，已实测过一次）。
-- 与 `groups.js` 那次改动**共用同一个重启窗口**，窗口由群管理分身上报主人，Bot 不动宿主。
+- 装法只能 **A 路**：主人在应用 → 插件管理装本地 tgz（`dsh plugin --profile desktop add` 必被 `bin.js:119` 拒）。**装包由主人手动装**；与 `groups.js` 改动共用同一重启窗口，窗口群管理分身上报。
+- 回执件改用 `~/.dsh/bot/workspace/rotation/make-letter.mjs` 生成（群管理分身令），不再手写；头不许再出现 `From: UNKNOWN`。
 
 ## 7 回滚
 
-装前四件备份（三份配置＋整目录 `node_modules/dsh-handoff-relay`）；回滚＝把目录拷回 + 重启，**不跑任何 `dsh plugin`**；0.6.1 tgz（`50e06afe…`）留仓可重装。回滚判据：`index.js` sha256 回到装前值、`启动 N/N` 仍 N=M。
+装前四件备份（三份配置＋整目录 `node_modules/dsh-handoff-relay`）；回滚＝目录拷回 + 重启，**不跑任何 `dsh plugin`**；0.6.1 tgz（`50e06afe…`）留仓可重装。判据：`index.js` sha256 回装前值、`启动 N/N` 仍 N=M。
 
-## 8 需要群管理分身先拍的四点（不定我就不动手）
+## 8 验收对表（QA 判据 → 交付物，一条不过即打回）
 
-1. **成员清单长度**：建议最多 12 名 + 「等 N 人」，`@所有人` 写清实际人数（`room.members` 条数）。
-2. **只列能解析的成员还是全列**：`room.members` 里有 Bot 但没分身 session 的（解析会 `E_SESSION_UNRECORDED`），建议仍列出并标 `(未开分身)`——否则名单与实际可 @ 的人不一致。
-3. **mention 匹配严格度**：建议精确子串 `@` + 原名、不做大小写折叠、不 trim 前后空格（群内识别本来就逐字）。
-4. **文件通道的判定口径**：按「目录尾段 `to-group` 或 target 解析为群」取或，接受「挂错目录的主身件也会被要求 @」这个副作用。
+| QA 判据 | 对应交付物 |
+| --- | --- |
+| ① 四码各一条可复现命令＋原文输出 | developer 交 `docs/ledger/relay-tool-0.6.2-evidence.md`：每码一条命令、贴 JSON／`relay.log` 原文 |
+| ② 成员表逐名对 `state.json`（含 `(未开分身)` 与 `@所有人` 人数） | 真机一次 `E_MENTION_REQUIRED` 输出全文 + 同时刻 `room.members` 名单 |
+| ③ `<Bot>@主身` 反向用例走通 | T4 单测原文 + 一条真机原件 |
+| ④ to-group 无 @：原文件不动／`.rejected.md` 生成／内容一致／目录无新增投递件 | T5 单测原文 + 真机目录 `ls` 前后对照 |
+| ⑤ 新增 ≥4 单测、`npm test` 全绿、真机走装好副本、回滚与 tgz sha 记在交付里 | `npm test` 末行 `TOTAL/TOTAL PASS` 原文、tgz sha256、回滚段落 |
 
 ## 9 风险
 
-- `describeRoomMentions` 每次失败都读一次 `state.json`（约 570 KB）：只在报错路径读，正常投递零成本；但需沿用 `readStateFile` 的「半写/坏 JSON 显式失败」语义，不许兜底猜。
-- 文案里出现真实人名：属群内公开信息，不进日志以外的地方；`relay.log` 只记 `NO_MENTION` 与文件名，不记人名。
-- 若将来 ds-bot 自己也做 mention 校验，两处会重；届时以 ds-bot 为准、relay 退回只堵文件通道（已写进本节，供后人查）。
+- `E_MENTION_REQUIRED` 每次报错读一次约 570 KB `state.json`，只走错误路径；沿用「坏 JSON 显式失败」语义，不兜底猜。
+- 文案出现真实人名：属群内公开信息；`relay.log` 只记码与文件名，不记人名。
+- 将来 ds-bot 自建同口径校验，两处会重：以 ds-bot 为准、relay 退回只堵文件通道（本节供后人查）。
