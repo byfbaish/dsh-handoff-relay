@@ -32,6 +32,23 @@ node --input-type=module -e "const R=/@[^\\s@]/; console.log(R.test('0.6.2 验�
 4. **拒绝件与台账不变**：仍写 `<原名>.rejected.md` 四行、`rejected.json` 按 `fingerOf(watchDir, relName, mtimeMs, size)` 跳过。
 5. 拒绝文案加一行实证信息：`本件被判无 @：正文里出现的 @ 均未匹配到成员名（名单：…）。`
 
+## 2.6 闸挂点与覆盖范围（应 admin 的硬要求 ②）
+
+只有一处投递出口：`index.js:1506 agent.followup(message)`，它在 `deliver()`（`:1456`）内部。闸在 `:1481-1485`，位置在 `resolveNow`／`agent` 判空之后、`buildMessage` 与 `followup` 之前。
+
+三个入口全部汇流到 `deliver()`，没有第二条投递路径：
+
+| 入口 | 行号 | 传入 reason |
+|---|---|---|
+| 尾巴命中 DONE（事件） | `:1538` | `DONE` |
+| 尾巴命中 DONE（首扫） | `:1542` | `DONE` |
+| `stableMs` 稳定投递（`checkStable` 的 timer 回调） | `:1543` | `stable` |
+| 重扫补投 | `:1581` | `DONE` |
+
+即 `stableMs` 分支不绕闸：它调的是同一个 `deliver()`。0.6.2 真机漏投不是「闸没挂在这条分支」，而是 `:1484` 的判据通过（§1）。
+
+0.6.3 把判据换成 `checkMentionForRoom` 后，闸仍在同一行位置——所以覆盖范围不变，变的只是判据。
+
 ## 3 单测（在 `index.test.mjs` 现有 M1–M5b 后追加）
 
 | 编号 | 输入 | 期望 |
@@ -49,7 +66,24 @@ node --input-type=module -e "const R=/@[^\\s@]/; console.log(R.test('0.6.2 验�
 
 - 版本 `0.6.2` → `0.6.3`，只改 `index.js` / `index.test.mjs` / 版本号。
 - 不装包、不推送、不动宿主；装包等下一个重启窗口（与 `groups.js` 改动共用）。
-- 真机复核需要再丢一次测试件（**由 admin 丢，我不动那个目录**）：丢后 `--diff` 应看到 `.rejected.md`、原文留原地、无新增 `relay-*.md`、`relay.log` 无 `注入身份` 行。
+- 真机复核（admin 的硬要求 ①：同一实验做两次，各贴命令与日志行号；**两次都由此 admin 丢件，我不动那个目录**）：
+
+**实验 A · 无 @ 件**（文件名 `062-verify-no-mention.md`，正文含 `@`＋标点即可，正是本次缺陷形状）
+
+1. `node docs/ledger/collect-0.6.2-install-evidence.mjs "<to-group 目录>" --record`
+2. admin 丢件 → 等 `relay.log` 出新行
+3. `node … --diff` ⇒ 期望：① 源件仍在原地 ② 出现 `.rejected.md` ④ 无新增 `relay-*.md` 投递件
+4. `relay.log` ⇒ 期望有 `watch-reject … reason=NO_MENTION`（或 `ROOM_UNRESOLVED`），**不得有** `注入身份 from=UNKNOWN` 行
+5. `rejected.json` ⇒ 期望有该件 fingerprint，`delivered/<hash12>/` 下**无**该件
+
+**实验 B · 有 @ 件**（文件名 `062-verify-with-mention.md`，正文首行 `@DSH 插件组` 成员名）
+
+1. 同上 `--record`
+2. admin 丢件 → 等日志
+3. 期望：`relay.log` 有 `注入身份 from=UNKNOWN to=c9ff5961…` 一行（有 @ 的件照常投、同样会搬走源件、不写 `.rejected.md`）——这是**预期行为**，与 A 的区别就是有没有被闸拦
+4. 该次投递会在本群产生一条真实唤醒，由 admin 认领噪音
+
+两份 `--diff` 与 `relay.log` 行号原样贴回证据件 `docs/ledger/relay-tool-0.6.2-evidence.md` 的 §4（0.6.3 真机两轮）。
 
 ## 5 顺带记一笔（不属 0.6.3 范围）
 
