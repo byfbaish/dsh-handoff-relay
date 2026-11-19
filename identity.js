@@ -111,6 +111,10 @@ export function createIndex(state) {
     }
     pushTo(botsByName, bot.name, bot);
   }
+  const botsById = new Map();
+  for (const bot of Object.values(bots)) {
+    if (isObj(bot) && isName(bot.id) && !botsById.has(bot.id)) botsById.set(bot.id, bot);
+  }
   const roomsByName = new Map();
   for (const room of Object.values(rooms)) {
     if (!isObj(room) || !isName(room.id) || !isName(room.name) || !isObj(room.sessions) || !Array.isArray(room.members)) {
@@ -118,7 +122,7 @@ export function createIndex(state) {
     }
     pushTo(roomsByName, room.name, room);
   }
-  return Object.freeze({ version: state.version, botsByName, roomsByName });
+  return Object.freeze({ version: state.version, botsByName, botsById, roomsByName });
 }
 
 /**
@@ -160,6 +164,26 @@ export function resolveInIndex(index, rawAddress) {
     kind: 'group', address: formatAddress(parsed), botId: bot.id, botName: bot.name,
     sessionId, roomId: room.id, roomName: room.name, aliasOfMain: bot.sessionId === sessionId,
   });
+}
+
+/**
+ * 列出一个群当前可 @ 的成员（同一次 state 快照内取数，成员表与人数天然同源）。
+ * hasSegment=false 表示该 Bot 在本群没开分身（无法投递，但仍列出并标注）。
+ * @returns {{roomName:string, roomId:string, total:number,
+ *            members:Array<{botName:string, address:string, hasSegment:boolean}>}}
+ */
+export function listRoomMembers(state, roomName) {
+  const index = createIndex(state);
+  const rooms = index.roomsByName.get(roomName) ?? [];
+  if (rooms.length === 0) addrFail(REASONS.UNKNOWN_ROOM, `unknown room "${roomName}"`, { roomName });
+  if (rooms.length > 1) addrFail(REASONS.AMBIGUOUS, `room name "${roomName}" is not unique`, { roomName });
+  const room = rooms[0];
+  const members = room.members.map((botId) => {
+    const bot = index.botsById.get(botId);
+    const botName = bot ? bot.name : String(botId);
+    return Object.freeze({ botName, address: `${room.name}:${botName}`, hasSegment: isName(room.sessions[botId]) });
+  });
+  return Object.freeze({ roomName: room.name, roomId: room.id, total: members.length, members: Object.freeze(members) });
 }
 
 /** 读一次 state.json（只读，绝不写）。缺文件/半写/坏 JSON 一律抛 IdentityError，让调用方显式失败。 */

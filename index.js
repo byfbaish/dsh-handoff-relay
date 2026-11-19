@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 // P1-11：身份 → 会话解析（<群名>:<Bot> / <Bot>@主身），投递时现读 state.json，换段自动跟随。
-import { resolveAddressNow, describeIdentityError, REASONS as IDENTITY_REASONS } from './identity.js';
+import { resolveAddressNow, describeIdentityError, readStateFile, defaultStatePath, listRoomMembers, REASONS as IDENTITY_REASONS } from './identity.js';
 export const name = 'dsh-handoff-relay';
 export const inject = ['agents', 'tools'];
 const PLUGIN_NAME = 'dsh-handoff-relay';
@@ -32,6 +32,10 @@ const DEDUPE_FILENAME = 'dedupe.json';
 const DEDUPE_WINDOW_MS = 30000;
 const RELAY_LOG_FILENAME = 'relay.log';
 const MAX_FAILED_ENTRIES = 200;
+// 0.6.2 文件通道：正文没有 @ 的件留原地不投递，另写同名拒绝件 + 记台账（否则每轮 rescan 反复判）。
+const REJECTED_FILENAME = 'rejected.json';
+const MAX_REJECTED_ENTRIES = 200;
+const REJECTED_SUFFIX = '.rejected.md';
 const MAX_LOG_BYTES = 256 * 1024;
 const RENAME_RETRIES = 3;
 const RENAME_RETRY_DELAY_MS = 100;
@@ -368,6 +372,56 @@ function rememberFailed(ctx, stateDir, record) {
     fs.writeFileSync(reg.file, `${JSON.stringify(reg.entries, null, 2)}\n`, 'utf8');
   } catch (err) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] 写 failed.json 失败（不影响本次投递）：${String(err)}（file=${reg.file}）`);
+  }
+}
+
+// ---------------------------------------------------------------- 0.6.2：拒绝件台账
+// stateDir → { entries: [{finger,name,dirKey,at,reason}], fingers: Set, file }；每个 profile 根只读一次。
+const rejectedRegistry = new Map();
+
+function loadRejectedRegistry(ctx, stateDir) {
+  const cached = rejectedRegistry.get(stateDir);
+  if (cached) return cached;
+  const reg = { entries: [], fingers: new Set(), file: path.join(stateDir, REJECTED_FILENAME) };
+  let raw;
+  try {
+    raw = fs.readFileSync(reg.file, 'utf8');
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') log(ctx, 'warn', `[${PLUGIN_NAME}] 读取 rejected.json 失败，按空表处理：${String(err)}（file=${reg.file}）`);
+    rejectedRegistry.set(stateDir, reg);
+    return reg;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error('顶层不是数组');
+    const kept = parsed.filter((e) => e && typeof e.finger === 'string' && e.finger);
+    if (kept.length !== parsed.length) throw new Error('存在缺 finger 的条目');
+    reg.entries = kept;
+    reg.fingers = new Set(kept.map((e) => e.finger));
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] rejected.json 坏档，整表丢弃（本轮会重新记录）：${String(err)}（file=${reg.file}）`);
+  }
+  rejectedRegistry.set(stateDir, reg);
+  return reg;
+}
+
+/** 记一条拒绝件；同 finger 只记一次，超 200 条按 at 删最旧；落盘失败只 warn。 */
+function rememberRejected(ctx, stateDir, record) {
+  let reg;
+  try { reg = loadRejectedRegistry(ctx, stateDir); } catch { return; }
+  reg.fingers.add(record.finger);
+  if (reg.entries.some((e) => e.finger === record.finger)) return;
+  reg.entries.push(record);
+  if (reg.entries.length > MAX_REJECTED_ENTRIES) {
+    reg.entries.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    const dropped = reg.entries.splice(0, reg.entries.length - MAX_REJECTED_ENTRIES);
+    for (const d of dropped) reg.fingers.delete(d.finger);
+  }
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(reg.file, `${JSON.stringify(reg.entries, null, 2)}\n`, 'utf8');
+  } catch (err) {
+    log(ctx, 'warn', `[${PLUGIN_NAME}] 写 rejected.json 失败（不影响本次判定）：${String(err)}（file=${reg.file}）`);
   }
 }
 
@@ -1356,8 +1410,52 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     relayLog(ctx, stateDir, 'warn', msg);
   }
 
+  /** 该 watch 是否走「群投递必须 @」的闸：目录尾段 to-group，或身份绑定的目标解析为群。解析成功即缓存。 */
+  let channelGroup = null;
+  function channelRequiresMention() {
+    if (channelGroup === null) {
+      if (path.basename(watchDir).toLowerCase() === 'to-group') channelGroup = true;
+      else if (target.kind === 'identity') {
+        try { channelGroup = resolveAddressNow(target.value).kind === 'group'; } catch { channelGroup = null; }
+      } else channelGroup = false;
+    }
+    return channelGroup === true;
+  }
+
+  function isRejectedSnapshot(relName, st) {
+    const reg = loadRejectedRegistry(ctx, stateDir);
+    return reg.fingers.has(fingerOf(watchDir, relName, st.mtimeMs, st.size));
+  }
+
+  /** 群投递无 @：原文留原地、写同名 `.rejected.md`、记台账（否则同快照每轮 rescan 反复判）。 */
+  function rejectNoMention(relName, state) {
+    const full = path.join(watchDir, relName);
+    const text = [
+      '群投递被拒：正文里没有可识别的 @。',
+      '可能一：地址解析成主身，文件却落在 to-group → 改投 to-owner 目录，或在正文首行 @ 目标人。',
+      '可能二：目标是群，但正文没写 @ → 在正文首行补 "@QA 请…"（半角 @）后重新放入本目录。',
+      '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
+    ].join('\n') + '\n';
+    try {
+      fs.writeFileSync(`${full}${REJECTED_SUFFIX}`, text, 'utf8');
+    } catch (err) {
+      log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 写拒绝件失败：${String(err)}（dir=${watchDir}）`);
+    }
+    rememberRejected(ctx, stateDir, {
+      finger: fingerOf(watchDir, relName, state.mtimeMs, state.size),
+      name: relName,
+      dirKey: watchDir,
+      at: new Date().toISOString(),
+      reason: 'NO_MENTION',
+    });
+    const msg = `${PLUGIN_NAME} watch-reject target=${relName} dir=${watchDir} reason=NO_MENTION`;
+    log(ctx, 'warn', msg);
+    relayLog(ctx, stateDir, 'warn', msg);
+  }
+
   function deliver(relName, state, reason) {
     if (isFailedSnapshot(relName, state)) { skipFailed(relName); return; }
+    if (isRejectedSnapshot(relName, state)) return;   // 已拒绝过的同快照不再重判
     const verdict = dedupeVerdict(ctx, stateDir, watchDir, relName, state);
     if (verdict) {
       skipDuplicate(ctx, stateDir, watchDir, relName, verdict);
@@ -1378,6 +1476,12 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     if (!agent) {
       log(ctx, 'warn', `[${PLUGIN_NAME}] ${label} 会话 ${resolved.id} 投递时已不可用；文件 ${full} 未投递`);
       return;
+    }
+    // 0.6.2 文件通道闸：目标是群（或目录就叫 to-group）而正文没有可用的半角 @ ⇒ 不投递、原文留原地。
+    if (channelRequiresMention()) {
+      let rawText = '';
+      try { rawText = stripIdentityLines(fs.readFileSync(full, 'utf8')); } catch { rawText = ''; }
+      if (!USABLE_AT_RE.test(rawText)) { rejectNoMention(relName, state); return; }
     }
     // P54：To 由 relay 生成——标题优先取 resolved.title（resolveNow 已带回），
     // 缺失再 sessionTitleOf(ctx, agent)，都取不到写 (无标题)；id8 取 resolved.id 前 8 位；
@@ -1443,6 +1547,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
   function consider(relName, startup = false) {
     if (closed || !relName) return;
     if (relName === '.gitkeep') return;   // 占位文件永不投递、永不移动
+    if (relName.endsWith(REJECTED_SUFFIX)) return;   // 0.6.2：拒绝件自身不投递
     const full = path.join(watchDir, relName);
     let st;
     try { st = fs.statSync(full); } catch { return; }   // 删除事件 / 临时文件
@@ -1451,6 +1556,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const key = `${relName}|${sig}`;
     if (startupOld.has(key)) return;
     if (isFailedSnapshot(relName, { mtimeMs: st.mtimeMs, size: st.size })) { skipFailed(relName); return; }
+    if (isRejectedSnapshot(relName, { mtimeMs: st.mtimeMs, size: st.size })) return;   // 已拒绝过的同快照不再重判
     const verdict = dedupeVerdict(ctx, stateDir, watchDir, relName, { size: st.size, mtimeMs: st.mtimeMs });
     if (verdict) {
       skipDuplicate(ctx, stateDir, watchDir, relName, verdict);
@@ -1476,7 +1582,11 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     state.timer = setTimeout(() => checkStable(relName, state), cfg.stableMs);
   }
   function listFiles() {
-    try { return fs.readdirSync(watchDir, { withFileTypes: true }).filter((e) => e.isFile()).map((e) => e.name); }
+    try {
+      return fs.readdirSync(watchDir, { withFileTypes: true })
+        .filter((e) => e.isFile() && !e.name.endsWith(REJECTED_SUFFIX))
+        .map((e) => e.name);
+    }
     catch { return []; }
   }
   // P10：加载期扫过一遍；若当时解析不到（文件留在原地、未标记），首个事件到达时补一次全量重扫。
@@ -1527,7 +1637,81 @@ const TOOL_BODY_MAX_BYTES = 1024 * 1024;
 const TOOL_KINDS = Object.freeze(['ASK', 'NOTICE', 'REPORT', 'OK', 'RED']);
 const TOOL_DEFAULT_KIND = 'REPORT';
 const TOOL_NO_ROUTE_LIMIT = 5;
+// 0.6.2：成员表最多列 12 个，其余折成「等 N 人」；@所有人 括号里写该群实际人数（同一次现读）。
+const TOOL_MENTION_MAX_LIST = 12;
 const TOOL_STAGING_DIRNAME = 'tool-staging';
+
+// 0.6.2：mention 判定。半角 `@` + 原名，且其后一个字符必须是空白、标点、`|` 或行尾，
+// 防止 `@QA` 误命中 `@QA测试`（不折叠大小写、不 trim）。
+const MENTION_BOUNDARY_RE = /[\s,.;:!?、。，；：！？|)\]}>）】」』"]/;
+const FULLWIDTH_AT = '\uFF20';
+const USABLE_AT_RE = /@[^\s@]/;
+
+function normalizeMention(raw) {
+  const text = typeof raw === 'string' ? raw : '';
+  return text.startsWith('@') ? text.slice(1) : text;
+}
+
+/** 正文里是否点了 @name（右边界见 MENTION_BOUNDARY_RE）。 */
+export function hasMentionInText(text, name) {
+  if (!name) return false;
+  const body = String(text || '');
+  const needle = `@${name}`;
+  let from = 0;
+  for (;;) {
+    const at = body.indexOf(needle, from);
+    if (at === -1) return false;
+    const next = body.slice(at + needle.length, at + needle.length + 1);
+    if (next === '' || next === '\n' || next === '\r' || MENTION_BOUNDARY_RE.test(next)) return true;
+    from = at + 1;
+  }
+}
+
+/** 正文里实际点到的人（用于 E_MENTION_NOT_IN_BODY 文案：列已点到的名字）。 */
+function mentionedNamesIn(text) {
+  const names = [];
+  const re = /@([^\s@,.;:!?、。，；：！？|)\]}>）】」』"]+)/g;
+  let m;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    if (!names.includes(m[1])) names.push(m[1]);
+  }
+  return names;
+}
+
+/** 群投递缺 mention 的文案：成员表、人数、@所有人 都来自同一次 listMembers 现读。 */
+function buildMentionRequiredMessage(resolved, listMembers) {
+  const head = '群地址必须带 mention：群内消息只唤被 @ 的人，不写 @ 等于没人接。';
+  const tail = (total) => `照抄：mention="QA"，并在 body 首行写 "@QA 请…"；要全员写 mention="@所有人"（慎用，该群 ${total} 人）`;
+  try {
+    const info = listMembers((resolved && resolved.roomName) || '');
+    const shown = info.members.slice(0, TOOL_MENTION_MAX_LIST);
+    const names = shown.map((m) => (m.hasSegment ? m.botName : `${m.botName} (未开分身)`));
+    const more = info.total > TOOL_MENTION_MAX_LIST ? `，等 ${info.total - TOOL_MENTION_MAX_LIST} 人` : '';
+    const cap = info.total > TOOL_MENTION_MAX_LIST ? `，列前 ${TOOL_MENTION_MAX_LIST}` : '';
+    return [
+      head,
+      `该群可 @ 的人（共 ${info.total} 人${cap}）：${names.join('、')}${more}`,
+      '标 (未开分身) 的无法投递，别 @ 它。',
+      tail(info.total),
+    ].join('\n');
+  } catch (err) {
+    return [
+      head,
+      `成员表当前读不出来（${describeIdentityError(err)}）：先按「群名:Bot」确认目标，再补 mention。`,
+      tail(TOOL_MENTION_MAX_LIST),
+    ].join('\n');
+  }
+}
+
+function buildMentionNotInBodyMessage(mention, body) {
+  const seen = mentionedNamesIn(body);
+  const listed = seen.length > 0 ? seen.join('、') : '无';
+  return [
+    `mention="${mention}"，但正文里没有合法的 @${mention}（半角 @，其后须是空格、标点、| 或行尾）。两种改法：`,
+    `① 正文首行补一句 "@${mention} 请…"，mention 保持不变；`,
+    `② 把 mention 改成正文里已经点到的人（当前正文点到：${listed}）。`,
+  ].join('\n');
+}
 
 const TOOL_PARAMETERS = Object.freeze({
   type: 'object',
@@ -1544,7 +1728,11 @@ const TOOL_PARAMETERS = Object.freeze({
     },
     body: {
       type: 'string',
-      description: '正文，非空，UTF-8 ≤ 1 MiB（1,048,576 字节）。不要自带 From:／To: 行（落盘前会被剥掉）。',
+      description: '正文，非空，UTF-8 ≤ 1 MiB（1,048,576 字节）。不要自带 From:／To: 行（落盘前会被剥掉）。群投递时正文首行必须写「@名字」。',
+    },
+    mention: {
+      type: 'string',
+      description: '要 @ 的人名（只填名字，如 "QA" 或 "所有人"）。群地址必填：正文里必须出现「@+这个名字」。目标是「<Bot>@主身」时不用给。',
     },
     kind: {
       type: 'string',
@@ -1574,6 +1762,19 @@ export function validateRelayToolArgs(args) {
   if (!TOOL_KINDS.includes(kind)) {
     return { error: toolFail('E_ARGS_INVALID', '', 'kind', `kind 只能是 ${TOOL_KINDS.join('／')}：改成其中之一再调用`) };
   }
+  if (a.mention !== undefined && a.mention !== null && typeof a.mention !== 'string') {
+    return { error: toolFail('E_ARGS_INVALID', '', 'mention', 'mention 只能是字符串：填一个人名（如 "QA"），不要填数组或对象') };
+  }
+  const mention = normalizeMention(a.mention);
+  if (/[\r\n]/.test(mention)) {
+    return { error: toolFail('E_ARGS_INVALID', '', 'mention', 'mention 必须是单行：只填一个人名') };
+  }
+  if (mention.includes(FULLWIDTH_AT)) {
+    return { error: toolFail('E_MENTION_FULLWIDTH', '', 'mention', 'mention 里用了全角 ＠（U+FF20）：mention 只填名字（如 "QA"），@ 只在正文里用半角') };
+  }
+  if (body.includes(FULLWIDTH_AT)) {
+    return { error: toolFail('E_MENTION_FULLWIDTH', '', 'body', '正文里用了全角 ＠（U+FF20）：群内只认半角 @，把 ＠QA 改成 @QA') };
+  }
   if (target === '') {
     return { error: toolFail('E_ADDR_INVALID', 'FORMAT', 'target', '缺 target：地址只接受「群名:Bot」或「Bot@主身」，不带群名不解析') };
   }
@@ -1597,7 +1798,7 @@ export function validateRelayToolArgs(args) {
   if (bodyBytes > TOOL_BODY_MAX_BYTES) {
     return { error: toolFail('E_BODY_TOO_LARGE', '', 'body', `body 共 ${bodyBytes} 字节，超过 1 MiB 上限：把正文落到文件，body 只写一段短摘要＋路径`) };
   }
-  return { value: { target, subject, kind, body } };
+  return { value: { target, subject, kind, body, mention } };
 }
 
 /** 路由：先按 targetIdentity 现解析到的 session 相等，再按 targetSessionId 相等；多命中取靠前，全不中 null。 */
@@ -1672,11 +1873,16 @@ export function createRelayToolHandler(options) {
   const inlineMaxChars = Number.isFinite(opt.inlineMaxChars) && opt.inlineMaxChars > 0 ? opt.inlineMaxChars : DEFAULT_INLINE_MAX_CHARS;
   const resolveAddress = typeof opt.resolveAddress === 'function' ? opt.resolveAddress : resolveAddressNow;
   const io = opt.fsImpl || fs;
+  // 成员表默认现读 state.json；测试可注入 listMembers 传桩，避免依赖真台账。
+  const toolStatePath = typeof opt.statePath === 'string' && opt.statePath !== '' ? opt.statePath : defaultStatePath();
+  const listMembers = typeof opt.listMembers === 'function'
+    ? opt.listMembers
+    : (roomName) => listRoomMembers(readStateFile(toolStatePath), roomName);
 
   return async function relayToolExecute(args) {
     const checked = validateRelayToolArgs(args);
     if (checked.error) return checked.error;
-    const { target, subject, kind, body } = checked.value;
+    const { target, subject, kind, body, mention } = checked.value;
 
     let resolved;
     try {
@@ -1696,6 +1902,18 @@ export function createRelayToolHandler(options) {
     if (!route) {
       const avail = describeRelayRoutes(routes);
       return toolFail('E_NO_ROUTE', '', 'target', `解析到 ${resolved.title || IDENTITY_FALLBACK_TITLE} | ${id8Of(resolved.sessionId)} 但本机没有绑定它的 watch。当前可用目标：${avail.length > 0 ? avail.join('；') : '（无）'}；要投新目标请在 profile 的 dsh-handoff-relay 配置里加一条 watches（targetIdentity="${target}"）并重启`);
+    }
+
+    // 0.6.2：群投递必须写 @。判定顺序（先语法、再不一致、最后缺失）已在 validate 里落 FULLWIDTH；
+    // 这里只对群地址校后两条；目标是「<Bot>@主身」时不校验（通报件行为与 0.6.1 一致）。
+    if (resolved.kind === 'group') {
+      const bodyForMention = stripIdentityLines(body);
+      if (mention !== '' && !hasMentionInText(bodyForMention, mention)) {
+        return toolFail('E_MENTION_NOT_IN_BODY', '', 'mention', buildMentionNotInBodyMessage(mention, bodyForMention));
+      }
+      if (mention === '') {
+        return toolFail('E_MENTION_REQUIRED', '', 'mention', buildMentionRequiredMessage(resolved, listMembers));
+      }
     }
 
     const built = buildRelayToolFile({
@@ -1789,7 +2007,7 @@ export function registerRelayTool(ctx, options) {
   const handler = createRelayToolHandler({ ...opt, ctx });
   return tools.register({
     name: RELAY_TOOL_NAME,
-    description: '把一条消息投递给本机已绑定 watch 的目标 Bot／主身。参数即约束：target 只接受「<群名>:<Bot>」或「<Bot>@主身」（不 trim、不模糊匹配）；subject 单行 ≤120 字符并进幂等键；body 非空、UTF-8 ≤1 MiB；kind 缺省 REPORT。预期失败不抛异常，返回 { ok:false, code, reason, message }，按 code 决定下一步：E_ADDR_INVALID／E_SESSION_UNRECORDED 改地址或等台账、E_ARGS_INVALID 改入参、E_BODY_TOO_LARGE 改写法（摘要＋路径）、E_NO_ROUTE 加 watch 配置并重启、E_DELIVER_FAILED 查目录权限。',
+    description: '把一条消息投递给本机已绑定 watch 的目标 Bot／主身。参数即约束：target 只接受「<群名>:<Bot>」或「<Bot>@主身」（不 trim、不模糊匹配）；subject 单行 ≤120 字符并进幂等键；body 非空、UTF-8 ≤1 MiB；kind 缺省 REPORT。群地址必须给 mention（只填名字，如 "QA"／"所有人"）：正文里要出现「@+这个名字」，其后须是空格／标点／|／行尾。预期失败不抛异常，返回 { ok:false, code, reason, message }，按 code 决定下一步：E_ADDR_INVALID／E_SESSION_UNRECORDED 改地址或等台账、E_ARGS_INVALID 改入参、E_BODY_TOO_LARGE 改写法（摘要＋路径）、E_MENTION_REQUIRED 补 mention、E_MENTION_NOT_IN_BODY 让正文与 mention 一致、E_MENTION_FULLWIDTH 把 ＠ 改回 @、E_NO_ROUTE 加 watch 配置并重启、E_DELIVER_FAILED 查目录权限。',
     parameters: TOOL_PARAMETERS,
     output: {
       schema: TOOL_OUTPUT_SCHEMA,
