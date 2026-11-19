@@ -56,6 +56,23 @@ dsh plugin --profile desktop add file:C:/develop/workspace/dsh-handoff-relay/dsh
 
 期望：命令回 `dsh-handoff-relay@0.6.0`；`node_modules/dsh-handoff-relay/index.js` 变成 94,217 B；profile `package.json` 的依赖行改成 `file:...dsh-handoff-relay-0.6.0.tgz`；`pnpm-lock.yaml` 的 specifier/integrity 同步更新。
 
+### 3.1 实测：这条 CLI 命令在 desktop profile 上必然失败（2026-11-19 08:39 实测）
+
+```text
+$ dsh plugin --profile desktop add "file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.6.0.tgz"
+error: profile "desktop" is managed exclusively by the Electron application
+```
+
+`dsh plugin --help` 只有 `--profile` 与 `-h`，没有 force/override。**desktop 是 Electron 应用托管的 profile，命令行不能装插件。** 因此装包只能由以下三者之一完成，且都需要主人/应用这一侧的动作：
+
+| 路径 | 谁做 | 说明 |
+| --- | --- | --- |
+| A. 应用的插件管理里装本地 tgz | 主人（GUI） | 唯一符合「profile 归应用管」的路径；依赖声明与 lock 由应用改写 |
+| B. `plugin_manager` 工具装 | 授权后的 Bot | 面向 registry/catalog spec，本地 `file:` tgz 未必支持 |
+| C. 手改 `package.json:20` + `pnpm install` | 授权后的 Bot | 绕过应用托管，应用下次启动可能重写依赖，风险中等，不推荐 |
+
+在 A/B/C 任何一条真正执行前，本文的 §4–§6 都只是待执行命令；宿主侧一个字节都没变（装前装后 `cordis.patch.yml` 均为 `a32731f3…`、`node_modules/dsh-handoff-relay/index.js` 均为 `ed7cef8c…`）。
+
 装完立刻核对（不启动宿主也能跑）：
 
 ```bash
