@@ -1807,6 +1807,9 @@ export function apply(ctx, config = {}) {
     inlineMaxChars: Number.isFinite(config && config.inlineMaxChars) && config.inlineMaxChars > 0 ? config.inlineMaxChars : DEFAULT_INLINE_MAX_CHARS,
   };
   const disposers = [];
+  // 只数真正启动的 watch：disposers 里还含工具面（relay_deliver）的注销器，
+  // 用它当分子会把工具算成第 10 条 watch（现场 10/9 的成因）。
+  let startedWatches = 0;
   const startedModes = [];
   const dispose = () => { for (const d of disposers) { try { d(); } catch { /* ignore */ } } };
   // P44：探测路由必须在 watches 早退之前注册，否则空 watches 时设置卡仍拿不到目录核验。
@@ -1911,10 +1914,10 @@ export function apply(ctx, config = {}) {
     // 加载期每条 watch 一行解析结果（含 dir 与原样目标标识）：下次解析不到时能定位到是哪条 watch。
     relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] ${label} 加载解析 dir=${dir} 目标=${targetLabel} ${atLoad.status}`);
     const d = startWatch(ctx, cfg, dir, target, label, done.judge, done.mode, atLoad, delivered.root, stateDir, fromRole);
-    if (d) { disposers.push(d); startedModes.push(done.mode); }
+    if (d) { disposers.push(d); startedWatches += 1; startedModes.push(done.mode); }
   });
-  log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
-  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${disposers.length}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
+  log(ctx, 'info', `[${PLUGIN_NAME}] 已启动 ${startedWatches}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，done=${JSON.stringify(startedModes)}`);
+  relayLog(ctx, stateDir, 'info', `[${PLUGIN_NAME}] 启动 ${startedWatches}/${watches.length} 个 watch；stableMs=${cfg.stableMs}，delivered=${delivered.root}`);
   // P11 A / P14：设置 namespace 必须在 settings 服务就绪后挂载。
   // `ctx.inject(['settings'], cb)` 等价于开一个子 plugin fiber：settings 先到（回调立即执行）
   // 或后到（服务 provide 时再执行）都只触发一次；该 fiber 是 thenable（await 会等加载结束），

@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest } from './index.js';
+import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest, RELAY_TOOL_NAME, registerRelayTool } from './index.js';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
@@ -4186,6 +4186,42 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.equal(buildToolRoutes([{ dir: applyDir, targetIdentity: 'x' }]).length, 1);
   });
   disposeApply();
+}
+
+// ---------------------------------------------------------------- P56：启动行的分子只数 watch
+// 现场事故形态：装上 0.6.0 后启动行写「启动 10/9 个 watch」，而配置只有 9 条 - dir:。
+// 成因：工具面 relay_deliver 的注销器被塞进同一个 disposers 数组，而启动行原先用 disposers.length 当分子。
+// 判据：两条 watch 都启动 → 恰好 2/2；工具面已注册不影响分子。
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-p56-'));
+  const restoreProfile = p9WithProfile(root);
+  const d1 = tmp();
+  const d2 = tmp();
+  const box = capturingWatch();
+  let disp = null;
+  try {
+    disp = withFs(box.patch, () => apply(makeCtx([]), {
+      watches: [
+        { dir: d1, targetSessionId: 'P56-A' },
+        { dir: d2, targetSessionId: 'P56-B' },
+      ],
+      stableMs: 120,
+    }));
+    const logFile = path.join(p9StateDir(root), 'relay.log');
+    const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8') : '';
+    check('P56 启动行分子只数 watch：两条 watch → 启动 2/2（工具面不占分子）', () => {
+      const line = text.split('\n').find((l) => l.includes('启动') && l.includes('个 watch')) || '';
+      assert.ok(line, `relay.log 应有启动行，实际：${text.slice(-400)}`);
+      assert.ok(line.includes('启动 2/2 个 watch'), `期望「启动 2/2 个 watch」，实际：${line}`);
+    });
+    check('P56 工具面仍注册（分子修正不牵连注册路径）', () => {
+      assert.ok(typeof RELAY_TOOL_NAME === 'string' && RELAY_TOOL_NAME, 'RELAY_TOOL_NAME 应导出');
+      assert.ok(typeof registerRelayTool === 'function', 'registerRelayTool 应导出');
+    });
+  } finally {
+    if (disp) disp();
+    restoreProfile();
+  }
 }
 
 console.log('\n===== 自测汇总 =====');
