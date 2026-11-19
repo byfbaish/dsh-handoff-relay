@@ -90,7 +90,8 @@ let failed = 0;
 
 function check(label, fn) {
   try {
-    fn();
+    const r = fn();
+    if (r && typeof r.then === 'function') throw new Error('check 收到异步断言：先把 await 结果算好再传同步函数');
     results.push(`PASS  ${label}`);
     out(`PASS  ${label}`);
   } catch (err) {
@@ -4086,12 +4087,24 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.equal(d.error.code, 'E_ARGS_INVALID');
     assert.equal(d.error.field, 'kind');
   });
+  const beforeTooLarge = fs.readdirSync(toolDir).length;
+  const tooLarge = await handler({ target: 'DSH 插件组:QA', subject: '超限', body: 'a'.repeat(1024 * 1024 + 1) });
   check('工具 T2b body 超 1 MiB → E_BODY_TOO_LARGE，且不动目录', () => {
-    const before = fs.readdirSync(toolDir).length;
-    return handler({ target: 'DSH 插件组:QA', subject: '超限', body: 'a'.repeat(1024 * 1024 + 1) }).then((r) => {
-      assert.equal(r.code, 'E_BODY_TOO_LARGE', `期望 E_BODY_TOO_LARGE，实际 ${JSON.stringify(r)}`);
-      assert.equal(fs.readdirSync(toolDir).length, before, '超限不应落盘');
-    });
+    assert.equal(tooLarge.code, 'E_BODY_TOO_LARGE', `期望 E_BODY_TOO_LARGE，实际 ${JSON.stringify(tooLarge)}`);
+    assert.equal(fs.readdirSync(toolDir).length, beforeTooLarge, '超限不应落盘');
+  });
+
+  const beforeNul = fs.readdirSync(toolDir).length;
+  const nulCall = await handler({ target: 'DSH 插件组:QA', subject: '含NUL', body: '正文\u0000尾巴' });
+  check('工具 T2c body 含 NUL → E_ARGS_INVALID/field=body（走既有码）、不落盘、不新增码', () => {
+    const r = validateRelayToolArgs({ target: 'DSH 插件组:QA', subject: '含NUL', body: '正文\u0000尾巴' });
+    assert.ok(r.error, `应校验失败，实际 ${JSON.stringify(r)}`);
+    assert.equal(r.error.code, 'E_ARGS_INVALID', `NUL 应走既有 E_ARGS_INVALID，实际 ${r.error.code}`);
+    assert.equal(r.error.field, 'body');
+    assert.ok(r.error.message.includes('NUL'), `文案应指明 NUL：${r.error.message}`);
+    assert.equal(nulCall.code, 'E_ARGS_INVALID', `handler 也应回 E_ARGS_INVALID，实际 ${nulCall.code}`);
+    assert.equal(nulCall.field, 'body');
+    assert.equal(fs.readdirSync(toolDir).length, beforeNul, 'NUL 不应落盘');
   });
 
   const bad1 = await handler({ target: 'DSH 插件组:不存在', subject: 's', body: 'b' });
@@ -4118,12 +4131,26 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.deepEqual(list, ['dfw-tool-' + path.basename(toolDir).replace('dfw-tool-', '') + ' → DSH 插件组:QA'].map((x) => x.replace(/^dfw-tool-[^ ]+/, path.basename(toolDir))), '可用清单应是「目录尾段 → 地址」');
   });
 
-  check('工具 T5 幂等键用剥头后的 body：带不带 From: 行算出同一文件名', () => {
+  const stripDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dfw-tool-strip-'));
+  const stripHandler = createRelayToolHandler({
+    routes: [{ dir: stripDir, targetIdentity: 'DSH 插件组:QA', targetSessionId: '', targetTitle: '', fromRole: 'tool-test' }],
+    stateDir: toolState,
+    resolveAddress: resolveStub,
+  });
+  const s1 = await stripHandler({ target: 'DSH 插件组:QA', subject: '同题幂等', body: 'From: x\n正文' });
+  const s2 = await stripHandler({ target: 'DSH 插件组:QA', subject: '同题幂等', body: '正文' });
+  check('工具 T5 同一 body 带/不带 From: → 两次调用命中同一路径，第二次 deduped:true', () => {
     const a = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: 'From: x\n正文' });
     const b = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: '正文' });
     assert.equal(a.relName, b.relName, `剥头后应同名：${a.relName} vs ${b.relName}`);
     const c = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: '同题', kind: 'REPORT', body: '正文改一个字' });
     assert.notEqual(a.relName, c.relName, '正文变化应换文件名');
+    assert.equal(s1.ok, true, `首次应成功：${JSON.stringify(s1)}`);
+    assert.equal(s1.deduped, false, '首次不应 deduped');
+    assert.equal(s2.ok, true, `第二次应成功：${JSON.stringify(s2)}`);
+    assert.equal(s2.delivered, s1.delivered, `带不带 From: 应命中同一路径：${s1.delivered} vs ${s2.delivered}`);
+    assert.equal(s2.deduped, true, '第二次应 deduped:true');
+    assert.equal(fs.readdirSync(stripDir).filter((n) => n.endsWith('.md')).length, 1, '目录里应只有一个投递件');
   });
 
   const registered = [];
