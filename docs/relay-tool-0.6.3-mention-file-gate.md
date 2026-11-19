@@ -74,6 +74,29 @@ M6–M12 用假 home 的 `state.json`（临时目录 + `os.homedir` 桩）跑真
 - `index.js:1505-1519` 闸体（在 `deliver()` 内、`resolveNow`/`agent` 判空之后、`buildMessage`/`followup` 之前）：现读 `state.json` 取成员表 → `checkMentionForRoom` → 不通过即 `rejectNoMention` 并 `return`，不再走 `agent.followup`。
 - 工具侧四码未动：`@所有人` 原本就能过（`hasMentionInText(body,'所有人')`），与文件通道行为一致。
 
+## 2.7 回执提示（Reply-To ＋ 固定提醒段）
+
+需求由主人在 11-20 定，与文件闸同批：被 relay 叫醒的 Bot 要知道「回执走哪、别假定对方看得见群消息」。
+
+**放哪儿**：身份头仍是 `From:`／`To:` 两行不动；`Reply-To:` 与提醒文本一起放在**标记块内部**：
+
+```
+<!-- relay-notice begin -->
+Reply-To: <地址>            ← 解析不出时整行省略
+本件由 relay 投递。需要回执时请优先用 relay 投递到 <地址或「回执地址未知」>；不要假定对方能看到你在群里的发言。
+<!-- relay-notice end -->
+```
+
+放块内是主持边界①的直接后果：`stripRelayNotice()` 要能把 `Reply-To:` 一起剥掉；放进头里就剥不干净，「关掉提示」的落盘内容会和「开时剥完」差一行。
+
+**怎么算**：`resolveReplyTo(address)` 只做两件事——群地址 `<群名>:<Bot>` → `<Bot>@主身`（回执回到这个人自己的主身）；主身地址 `<Bot>@主身` → 来源群地址，但本插件拿不到「来源群」，所以返回空串 ⇒ 省略该行、提醒段写「回执地址未知」。不抛错、不猜、不造地址。
+
+**幂等**：`hash8` 公式一个字没改，仍只覆盖 `target + subject + stripIdentityLines(body).trim() + kind`；提示段与 `Reply-To` 都不进幂等键。`stripRelayNotice()` 与 `stripIdentityLines()` 同级，用于内联正文与文件内容比对，所以「开／关提示」得到同一路径、同一 `deduped` 判定。
+
+**开关**：配置键 `replyNotice`（布尔，默认 `true`，默认值常量 `DEFAULT_REPLY_NOTICE` 写死在代码里）；`cordis.patch.yml` 的 insert 层把它写出来只为让默认值可见，不改配置也是开。关掉时不留空行、不留空段——N1 断言 `stripRelayNotice(开) === 关`，逐字节相等。
+
+**实现落点**：`index.js` 顶部常量 `RELAY_NOTICE_BEGIN/END`、`DEFAULT_REPLY_NOTICE`、`REPLY_TO_UNKNOWN`、`RELAY_NOTICE_BLOCK_RE`；`stripRelayNotice()`、`resolveReplyTo()`、`buildRelayNotice()`；`buildIdentityHead()` 未加行；`buildMessage()` 与 `buildRelayToolFile()` 各拼一次；`apply()` 读 `config.replyNotice` 并下传工具面与 watch 面。
+
 ## 4 交付与边界
 
 - 版本 `0.6.2` → `0.6.3`，只改 `index.js` / `index.test.mjs` / 版本号。
@@ -96,6 +119,13 @@ M6–M12 用假 home 的 `state.json`（临时目录 + `os.homedir` 桩）跑真
 4. 该次投递会在本群产生一条真实唤醒，由 admin 认领噪音
 
 两份 `--diff` 与 `relay.log` 行号原样贴回证据件 `docs/ledger/relay-tool-0.6.2-evidence.md` 的 §4（0.6.3 真机两轮）。
+
+**实验 C · 回执提示与去重两格**（项目总负责人边界④，真机一格）
+
+1. 投一件带 `@` 的件到工具路径（`relay_deliver`，target 用现网有 watch 的群地址）→ 打开落盘件，确认 `Reply-To:` 行与两端标记齐全、提醒段在正文末尾
+2. 同一 `target`／`subject`／`body` 再投一次 → 返回 `deduped:true`、目录里仍只有一件
+3. 同一正文换一个 `target`（如主身地址）→ 落另一件、`deduped:false`，且该件无 `Reply-To` 行、提醒段写「回执地址未知」
+4. 机测等价已由 N4 覆盖（218/218，`index.test.mjs`）：同文同目标第二次 `deduped:true`、换目标互不判重、开／关提示同一文件名（N1b）
 
 ## 5 顺带记一笔（不属 0.6.3 范围）
 

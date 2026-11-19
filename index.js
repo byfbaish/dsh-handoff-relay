@@ -26,6 +26,12 @@ const DELIVERED_SUBDIR = 'delivered';
 const MAX_DELIVERED_FILES = 1000;
 const MAX_DELIVERED_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 // P9 止血：delivered 移动失败时重试；失败的 (文件,快照) 记进 failed.json，重载后不再重投。
+// 0.6.3：回执提示（主人 11-20 定）。固定边界标记包住整段，剥掉后的字节必须与「关掉」逐字节一致。
+const RELAY_NOTICE_BEGIN = '<!-- relay-notice begin -->';
+const RELAY_NOTICE_END = '<!-- relay-notice end -->';
+const DEFAULT_REPLY_NOTICE = true;
+const REPLY_TO_UNKNOWN = '回执地址未知';
+const RELAY_NOTICE_BLOCK_RE = /(?:\n|^)<!-- relay-notice begin -->\n[\s\S]*?<!-- relay-notice end -->\n/g;
 const RELAY_STATE_DIRNAME = 'dsh-handoff-relay';
 const FAILED_FILENAME = 'failed.json';
 const DEDUPE_FILENAME = 'dedupe.json';
@@ -71,6 +77,8 @@ function buildConfigSchema(z) {
     message: z.string().default(DEFAULT_MESSAGE),
     // P55：{body} 内联上限（字符）。0 或省略＝默认 4000。
     inlineMaxChars: z.number().default(DEFAULT_INLINE_MAX_CHARS),
+    // 0.6.3：投送时是否在正文末尾附回执提示（默认开）。关掉后落盘内容与「开时剥完」逐字节一致。
+    replyNotice: z.boolean().default(DEFAULT_REPLY_NOTICE),
   });
 }
 export const Config = buildConfigSchema(SCHEMA_LOAD && SCHEMA_LOAD.z);
@@ -887,6 +895,36 @@ function describeTargetNow(ctx, target) {
 
 // P54：注入消息的身份头由 relay 前置，不从配置模板取值（安全规则不能靠用户配置保证）。
 const IDENTITY_UNKNOWN = 'UNKNOWN';
+
+/** 剥掉回执提示段。幂等键、去重摘要、内联正文都先过它——提示不得改变「是不是同一件」。 */
+export function stripRelayNotice(text) {
+  return String(text == null ? '' : text).replace(RELAY_NOTICE_BLOCK_RE, '');
+}
+
+/**
+ * Reply-To 由目标类型决定，解析不出只降级、不造地址：
+ *   群地址 `<群名>:<Bot>` → 该 Bot 的 `<Bot名>@主身`（回执回到这个人自己的主身）
+ *   主身地址 `<Bot>@主身`  → 来源群地址（本插件拿不到「来源群」，故返回空串 ⇒ 省略该行）
+ */
+export function resolveReplyTo(address) {
+  try {
+    const parsed = parseAddress(String(address || ''));
+    if (parsed && parsed.kind === 'group') return `${parsed.botName}@主身`;
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 提示段（<200 字），带前导换行，供直接拼在正文末尾。
+ * `Reply-To:` 放在标记块内部第一行：它和提醒文本必须同生同灭，否则「关掉提示」时头里会残留一行。
+ */
+function buildRelayNotice(replyTo) {
+  const where = String(replyTo || '');
+  const replyLine = where ? `Reply-To: ${where}\n` : '';
+  return `\n${RELAY_NOTICE_BEGIN}\n${replyLine}本件由 relay 投递。需要回执时请优先用 relay 投递到 ${where || REPLY_TO_UNKNOWN}；不要假定对方能看到你在群里的发言。\n${RELAY_NOTICE_END}\n`;
+}
 const IDENTITY_FALLBACK_TITLE = '(无标题)';
 const IDENTITY_LINE_RE = /^(?:From|To)\s*[:：]\s*\S.*$/;
 // P54-fix3（D-TO8）：真实会话 id 形如 `session-8ea61110-…`，直接 slice(0, 8) 恒得字面前缀 `session-`。
@@ -983,14 +1021,14 @@ function inlineBodyOf(fullPath, state, cap) {
     return `（正文读取失败：${(err && err.code) || String(err)}；请读上方路径）`;
   }
   if (raw.includes('\u0000')) return `（正文疑似二进制 ${state.size} 字节，未内联；请读上方路径）`;
-  const body = stripIdentityLines(raw.replace(/<!--\s*DONE\s*-->\s*$/i, '')).trim();
+  const body = stripRelayNotice(stripIdentityLines(raw.replace(/<!--\s*DONE\s*-->\s*$/i, ''))).trim();
   if (body.length > cap) {
     return `（正文 ${state.size} 字节，超过内联上限 ${cap} 字符，未内联；请读上方路径）`;
   }
   return body;
 }
 
-function buildMessage(relName, fullPath, state, reason, template, identity, inlineMaxChars) {
+function buildMessage(relName, fullPath, state, reason, template, identity, inlineMaxChars, replyNotice) {
   const cap = Number.isFinite(inlineMaxChars) && inlineMaxChars > 0 ? inlineMaxChars : DEFAULT_INLINE_MAX_CHARS;
   const withBody = String(template).includes('{body}');
   let rendered = template.replaceAll('{file}', relName).replaceAll('{path}', fullPath)
@@ -999,10 +1037,13 @@ function buildMessage(relName, fullPath, state, reason, template, identity, inli
   if (withBody) rendered = rendered.replaceAll('{body}', inlineBodyOf(fullPath, state, cap));
   const text = rendered;
   const head = buildIdentityHead(identity);
+  // 0.6.3：模板与正文自带的提示段先剥掉，再按开关决定是否由 relay 追加唯一一段。
+  const withNotice = replyNotice === undefined ? DEFAULT_REPLY_NOTICE : replyNotice !== false;
+  const noticeTail = withNotice ? buildRelayNotice(identity && identity.replyTo) : '';
   return Object.freeze({
     id: randomUUID(),
     role: 'user',
-    content: Object.freeze([Object.freeze({ type: 'text', text: head + stripIdentityLines(text) })]),
+    content: Object.freeze([Object.freeze({ type: 'text', text: head + stripRelayNotice(stripIdentityLines(text)) + noticeTail })]),
     // v4：source.kind 必须是「生产者自有」标识，非空且不等于 'plugin'。
     source: Object.freeze({ kind: `plugin:${PLUGIN_NAME}` }),
   });
@@ -1529,8 +1570,12 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
     const fromLine = readStubFromLine(full);
     const stubFrom = fromLine ? fromLine.replace(/^From\s*[:：]\s*/, '') : '';
     const from = resolveFromText(stubFrom, fromRole);
-    const identity = { title, id8, kind, fromText: from.fromText };
-    const message = buildMessage(relName, full, state, reason, cfg.message, identity, cfg.inlineMaxChars);
+    // 0.6.3：Reply-To 只从 targetIdentity 派生（群地址 → 该 Bot 的 @主身）；其它绑定方式解析不出就省略。
+    const identity = {
+      title, id8, kind, fromText: from.fromText,
+      replyTo: resolveReplyTo(target && target.kind === 'identity' ? target.value : ''),
+    };
+    const message = buildMessage(relName, full, state, reason, cfg.message, identity, cfg.inlineMaxChars, cfg.replyNotice);
     // 审计字段 injectedHeader 与注入同源：两行头文本（不带尾换行）。
     const injectedHeader = buildIdentityHead(identity).replace(/\n$/, '');
     const fileDigest = typeof state.contentHash === 'string' && state.contentHash
@@ -1897,12 +1942,15 @@ export function buildRelayToolFile(input) {
     .slice(0, 8);
   const relName = `relay-${hash8}.md`;
   const identity = {
+    replyTo: String(it.replyTo || ''),
     fromText: it.fromText || IDENTITY_UNKNOWN,
     title: it.targetTitle || IDENTITY_FALLBACK_TITLE,
     id8: id8Of(it.targetSessionId),
     kind: it.sessionKind || '主身',
   };
-  const content = `${buildIdentityHead(identity)}# ${subject}\n\n${cleanBody}\n`;
+  // 0.6.3：提示段拼在正文末尾；hash8 只用 cleanBody，提示与 Reply-To 都不进幂等键。
+  const noticeOn = it.replyNotice === false ? false : DEFAULT_REPLY_NOTICE;
+  const content = `${buildIdentityHead(identity)}# ${subject}\n\n${cleanBody}\n${noticeOn ? buildRelayNotice(it.replyTo) : ''}`;
   return { relName, content, cleanBody, hash8 };
 }
 
@@ -1977,6 +2025,8 @@ export function createRelayToolHandler(options) {
       targetTitle: resolved.title,
       targetSessionId: resolved.sessionId,
       sessionKind: resolved.kind === 'group' ? '群分身' : '主身',
+      replyTo: resolveReplyTo(target),
+      replyNotice: opt.replyNotice,
     });
     const full = path.join(route.dir, built.relName);
 
@@ -2075,6 +2125,7 @@ export function apply(ctx, config = {}) {
     stableMs: Number.isFinite(config && config.stableMs) && config.stableMs > 0 ? config.stableMs : DEFAULT_STABLE_MS,
     message: config && typeof config.message === 'string' && config.message ? config.message : DEFAULT_MESSAGE,
     inlineMaxChars: Number.isFinite(config && config.inlineMaxChars) && config.inlineMaxChars > 0 ? config.inlineMaxChars : DEFAULT_INLINE_MAX_CHARS,
+    replyNotice: config && config.replyNotice === false ? false : DEFAULT_REPLY_NOTICE,
   };
   const disposers = [];
   // 只数真正启动的 watch：disposers 里还含工具面（relay_deliver）的注销器，
@@ -2086,7 +2137,7 @@ export function apply(ctx, config = {}) {
   registerProbeRoute(ctx);
   // 工具面先于 watches 早退注册：watches 为空时 relay_deliver 仍可用，报 E_NO_ROUTE 并列出可用目标。
   const toolRoutes = buildToolRoutes(config && Array.isArray(config.watches) ? config.watches : []);
-  disposers.push(registerRelayTool(ctx, { routes: toolRoutes, stateDir: relayStateDir(), inlineMaxChars: cfg.inlineMaxChars }));
+  disposers.push(registerRelayTool(ctx, { routes: toolRoutes, stateDir: relayStateDir(), inlineMaxChars: cfg.inlineMaxChars, replyNotice: cfg.replyNotice }));
   const watches = config && Array.isArray(config.watches) ? config.watches : [];
   if (watches.length === 0) {
     log(ctx, 'warn', `[${PLUGIN_NAME}] 未启动：watches 必须是长度 ≥1 的数组`);

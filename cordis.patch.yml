@@ -8,4 +8,7 @@
 - insert:
     - id: dsh-handoff-relay
       name: dsh-handoff-relay
-      config: {}
+      # replyNotice：投送时是否附回执提示（Reply-To + 固定提醒段），默认开。
+      # 这里写出来只是让默认值可见，不写代码也按默认开；关掉用 false。
+      config:
+        replyNotice: true

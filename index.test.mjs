@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest, RELAY_TOOL_NAME, registerRelayTool } from './index.js';
+import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest, RELAY_TOOL_NAME, registerRelayTool, buildRelayToolFile, stripRelayNotice, resolveReplyTo, createRelayToolHandler } from './index.js';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
@@ -324,7 +324,8 @@ const infoCtx = (calls, opts) => {
   check('自定义 message 模板替换 {file}/{reason}/{size}/{mtimeMs}', () => {
     assert.equal(calls.length, 1);
     // P54：注入文本最前面是 relay 前置的 From:/To: 两行身份头，正文仍是模板原样渲染结果。
-    assert.ok(calls[0].content[0].text.endsWith(`F=tpl.txt|R=DONE|S=${st.size}|M=${st.mtimeMs}`),
+    // 0.6.3：尾部固定提醒段不影响模板渲染，比对前先剥掉（剥不掉就是提醒段越界了）。
+    assert.ok(stripRelayNotice(calls[0].content[0].text).endsWith(`F=tpl.txt|R=DONE|S=${st.size}|M=${st.mtimeMs}`),
       calls[0].content[0].text);
   });
   disp();
@@ -1111,7 +1112,7 @@ function makeTitleCtx(calls, entries, opts = {}) {
     assert.equal(calls.length, 1, `期望 1，实际 ${calls.length}`);
     // P54：前置 From:/To: 两行身份头，正文文案不变（仍是默认模板 + 绝对路径）。
     // P55：默认模板内联正文（此处文件内容为 x），不再只给路径。
-    assert.ok(calls[0].content[0].text.endsWith(`文件 ${f} 已就绪（触发=DONE）。
+    assert.ok(stripRelayNotice(calls[0].content[0].text).endsWith(`文件 ${f} 已就绪（触发=DONE）。
 
 x`),
       calls[0].content[0].text);
@@ -4513,6 +4514,106 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   }
 
   os.homedir = nativeHomedir;
+}
+
+
+// ===== 0.6.3 回执提示（Reply-To + 可剥离提醒段）=====
+{
+  const noticeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notice-'));
+  const baseArgs = {
+    target: 'DSH 插件组:QA',
+    subject: '回执提示 N1',
+    kind: 'REPORT',
+    body: '@QA 请复核\n正文第二行',
+    fromText: 'developer · DSH 插件组',
+    targetTitle: 'QA · DSH 插件组',
+    targetSessionId: 'session-aaaa1111-2222',
+    sessionKind: '群分身',
+  };
+  const withNotice = buildRelayToolFile({ ...baseArgs, replyTo: 'QA@主身', replyNotice: true });
+  const without = buildRelayToolFile({ ...baseArgs, replyTo: 'QA@主身', replyNotice: false });
+
+  check('N1 群目标：头有 Reply-To、正文末有提醒段，且剥掉提示后与「关掉」逐字节一致', () => {
+    assert.ok(withNotice.content.includes('Reply-To: QA@主身'), `缺 Reply-To 行：${withNotice.content.slice(0, 200)}`);
+    assert.ok(withNotice.content.includes('relay-notice begin'), '缺提示段起始标记');
+    assert.ok(withNotice.content.includes('不要假定对方能看到你在群里的发言'), '提示文案缺关键句');
+    assert.equal(without.content.includes('Reply-To:'), false, '关掉时不应有 Reply-To 行');
+    assert.equal(without.content.includes('<!-- relay-notice begin -->'), false, '关掉时不应有提示段');
+    assert.equal(stripRelayNotice(withNotice.content), without.content, '开时剥完必须与关掉逐字节一致');
+  });
+
+  check('N1b 幂等键不含提示：开／关同一正文算出同一文件名', () => {
+    assert.equal(withNotice.relName, without.relName, `文件名应相同：${withNotice.relName} vs ${without.relName}`);
+  });
+
+  check('N2 主身目标：解析不出回执地址 ⇒ 省略 Reply-To 行、提示写「回执地址未知」，不抛错不造地址', () => {
+    assert.equal(resolveReplyTo('大肥鱼@主身'), '', '主身地址取不到来源群 ⇒ 空串');
+    assert.equal(resolveReplyTo('DSH 插件组:QA'), 'QA@主身', '群地址 ⇒ 该 Bot 的 @主身');
+    assert.equal(resolveReplyTo('乱七八糟'), '', '解析失败 ⇒ 空串，不猜');
+    const mainFile = buildRelayToolFile({ ...baseArgs, target: '大肥鱼@主身', replyTo: '', replyNotice: true });
+    assert.equal(mainFile.content.includes('Reply-To:'), false, '解析不出时不得写 Reply-To 行');
+    assert.ok(mainFile.content.includes('回执地址未知'), `提示段应写回执地址未知：${mainFile.content.slice(-220)}`);
+  });
+
+  check('N3 剥函数幂等：连剥两次结果不变，且不误伤正文里的普通 HTML 注释', () => {
+    const once = stripRelayNotice(withNotice.content);
+    assert.equal(stripRelayNotice(once), once, '二次剥离不应再变');
+    const plain = '# 标题\n\n<!-- 普通注释 -->\n正文\n';
+    assert.equal(stripRelayNotice(plain), plain, '非 relay 注释不得被剥');
+  });
+
+  // 真机等价：走工具执行体落盘，同一正文投两次 ⇒ 第二次 deduped:true；换目标 ⇒ 另一件
+  const toolState = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notice-state-'));
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notice-a-'));
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notice-b-'));
+  const resolvedStub = { ok: true, kind: 'group', id: 'session-aaaa1111-2222', title: 'QA · DSH 插件组', sessionId: 'session-aaaa1111-2222' };
+  const mainStub = { ok: true, kind: 'identity', id: 'session-bbbb2222-3333', title: '主管家', sessionId: 'session-bbbb2222-3333' };
+  const memberStub = () => ({ members: [{ botName: 'QA', address: 'DSH 插件组:QA', hasSegment: true }], total: 1, roomName: 'DSH 插件组' });
+  const resolveStub = (addr) => {
+    if (addr === 'DSH 插件组:QA') return resolvedStub;
+    if (addr === '大肥鱼@主身') return mainStub;
+    throw new Error(`unexpected address ${addr}`);
+  };
+  const routes = [
+    { dir: dirA, targetIdentity: 'DSH 插件组:QA', targetSessionId: '', targetTitle: '', fromRole: 'tool-test' },
+    { dir: dirB, targetIdentity: '大肥鱼@主身', targetSessionId: '', targetTitle: '', fromRole: 'tool-test' },
+  ];
+  const handler = createRelayToolHandler({ routes, stateDir: toolState, inlineMaxChars: 4000, resolveAddress: resolveStub, listMembers: memberStub });
+
+  const a1 = await handler({ target: 'DSH 插件组:QA', subject: '回执提示 N4', mention: 'QA', body: '@QA 同一正文' });
+  const a2 = await handler({ target: 'DSH 插件组:QA', subject: '回执提示 N4', mention: 'QA', body: '@QA 同一正文' });
+  const b1 = await handler({ target: '大肥鱼@主身', subject: '回执提示 N4', body: '@QA 同一正文' });
+  check('N4 落盘件含 Reply-To＋提醒段；同文同目标第二次 deduped:true；换目标互不判重', () => {
+    assert.equal(a1.ok, true, JSON.stringify(a1));
+    assert.equal(a1.deduped, false, '首次不应 deduped');
+    assert.equal(a2.deduped, true, '第二次同文同目标必须 deduped:true');
+    assert.equal(a1.delivered, a2.delivered, '同文同目标必须同路径');
+    const textA = fs.readFileSync(a1.delivered, 'utf8');
+    assert.ok(textA.includes('Reply-To: QA@主身'), `落盘件应有 Reply-To：${textA.slice(0, 200)}`);
+    assert.ok(textA.includes('relay-notice begin'), '落盘件应有提醒段');
+    assert.equal(b1.ok, true, JSON.stringify(b1));
+    assert.notEqual(path.basename(a1.delivered) === path.basename(b1.delivered), true, '换目标应得另一件');
+    const textB = fs.readFileSync(b1.delivered, 'utf8');
+    assert.equal(textB.includes('Reply-To:'), false, '主身目标不得写 Reply-To 行');
+    assert.ok(textB.includes('回执地址未知'), '主身目标提示段应写回执地址未知');
+  });
+
+  // 真文件通道：buildMessage 侧的提示与开关（用 apply 走一次真实 watch 投递）
+  const messageState = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-notice-msg-'));
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-nmsg-watch-'));
+  const calls = [];
+  const ctx = { agents: { get: () => ({ followup: (m) => calls.push(m) }) }, logger: { info() {}, warn() {}, error() {}, debug() {} } };
+  const watch = { dir: watchDir, targetIdentity: '大肥鱼@主身', exact: true };
+  const disp = apply(ctx, { watches: [watch], stableMs: 200, replyNotice: false });
+  fs.writeFileSync(path.join(watchDir, 'n5-no-notice.md'), '@QA 关掉提示的一件。\n');
+  await sleep(1000);
+  check('N5 配置 replyNotice:false ⇒ 注入消息里没有提醒段（正文照常内联）', () => {
+    assert.equal(calls.length >= 1, true, `应至少投递一次，实际 ${calls.length}`);
+    const text = String(calls[calls.length - 1].content[0].text);
+    assert.equal(text.includes('<!-- relay-notice begin -->'), false, `关掉时不得有提示段：${text.slice(0, 300)}`);
+    assert.ok(text.includes('关掉提示的一件'), '正文应照常内联');
+  });
+  disp();
 }
 
 console.log('\n===== 自测汇总 =====');
