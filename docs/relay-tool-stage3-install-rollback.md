@@ -12,9 +12,12 @@
 | 已安装版本 | `0.5.0` | `node -e "console.log(require('~/.dsh/profiles/desktop/node_modules/dsh-handoff-relay/package.json').version)"` |
 | 代码分支 | `feat/relay-tool-interface`，HEAD `2296933` | `git log --oneline -3` |
 | 单测 | `TOTAL: 195/195 PASS`、`EXIT=0` | QA 08:0x 独立复跑（stage 2 判 pass 依据） |
-| 待装包 | `dsh-handoff-relay-0.6.0.tgz`，尚未生成 | `ls -1 *.tgz` → 只有 `0.5.0` |
+| **现网代码内容** | 等同仓内 `528adf8`（80,013 B，sha256 `ed7cef8c…`；git 侧 80,010 B／`00fbac7f…`，差在行尾 CRLF） | `sha256sum ~/.dsh/profiles/desktop/node_modules/dsh-handoff-relay/index.js` |
+| **与 0.5.0 tgz 不同** | tgz 内 index.js 78,090 B／`f699cf1a…`，缺 P55 `{body}` 内联与 `IDENTITY_LINE_RE` 全角冒号 | `tar -xOzf dsh-handoff-relay-0.5.0.tgz package/index.js | sha256sum` |
+| 现网 watch 条数 | `9` | `grep -c '^      - dir:' ~/.dsh/profiles/desktop/cordis.patch.yml` → `9` |
+| 待装包 | `dsh-handoff-relay-0.6.0.tgz` 56,784 B，sha256 `f1b399f2…1825` | `ls -l *.tgz`、`sha256sum` |
 
-## 1 装包前必做：三件备份（一次性，5 秒）
+## 1 装包前必做：四件备份（一次性，几秒）
 
 `PROFILE=~/.dsh/profiles/desktop`，时间戳取 `date +%Y%m%d-%H%M%S`：
 
@@ -24,13 +27,17 @@ TS=$(date +%Y%m%d-%H%M%S)
 cp package.json     package.json.bak-relay060-$TS
 cp pnpm-lock.yaml   pnpm-lock.yaml.bak-relay060-$TS
 cp cordis.patch.yml cordis.patch.yml.bak-relay060-$TS
-ls -l *bak-relay060-$TS
+# 第四件、也是最关键的一件：现网代码整目录备份（回滚点在这里，不在 0.5.0 tgz）
+cp -r node_modules/dsh-handoff-relay node_modules/dsh-handoff-relay.bak-relay060-$TS
+ls -ld *bak-relay060-$TS  node_modules/dsh-handoff-relay.bak-relay060-$TS
+sha256sum node_modules/dsh-handoff-relay.bak-relay060-$TS/index.js   # 期望 ed7cef8c…
 ```
 
 同时记下装包前的两行事实（回滚后要逐字对上）：
 
 ```bash
-node -e "console.log(require('./node_modules/dsh-handoff-relay/package.json').version)"   # 期望 0.5.0
+node -e "console.log(require('./node_modules/dsh-handoff-relay/package.json').version)"   # 字面 0.5.0（见 §0：字面值不等于代码）
+sha256sum node_modules/dsh-handoff-relay/index.js   # 期望 ed7cef8c…（这才是回滚基准）
 sha256sum ~/.dsh/profiles/desktop/cordis.patch.yml
 ```
 
@@ -58,28 +65,52 @@ node -e "import('./node_modules/dsh-handoff-relay/index.js').then(m=>console.log
 
 生效需要**宿主重启**（插件源码在启动时载入）；重启由主身决定时点，Bot 不 kill、不重启宿主。
 
-## 3 回滚（三档，按副作用从小到大取）
+## 3 卸载与回滚（四档：R0 卸载 → R1 回代码 → R2 回配置 → R3 紧急停用）
 
-### R1 回 0.5.0（首选，最小动作，不需要还原备份文件）
+### R0 卸载（主身认可的「卸载命令原文」，装不上或要彻底退出时用）
 
 ```bash
-dsh plugin --profile desktop add "file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.5.0.tgz"
+# 首选：官方卸载（本机 `dsh plugin --help` 无输出、未实测，执行时看 exit code）
+dsh plugin --profile desktop remove dsh-handoff-relay
+grep -n "dsh-handoff-relay" ~/.dsh/profiles/desktop/package.json      # 期望 0 命中
+ls ~/.dsh/profiles/desktop/node_modules/dsh-handoff-relay 2>/dev/null || echo "已移除"
 ```
 
-→ 重启 → 复核：`version` = `0.5.0`；`relay.log` 有「启动 7/7 个 watch」；`relay_deliver` 消失（旧包没有工具面）。0.6.0 的 tgz 留在仓里不影响。
+CLI 不可用时的等价文件级卸载（不手删 `node_modules`，交回 pnpm）：
 
-### R2 回「装包前的 profile 状态」（R1 的 specifier 也对不上时才用）
+```bash
+cd ~/.dsh/profiles/desktop
+cp package.json.bak-relay060-<TS>   package.json
+cp pnpm-lock.yaml.bak-relay060-<TS> pnpm-lock.yaml
+pnpm install --dir . >/dev/null 2>&1 || dsh plugin --profile desktop add "file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.5.0.tgz"
+```
+
+卸载后**必须重启**才算不加载；只卸不重启＝旧进程里仍在跑，别把日志当证据。
+
+### R1 回装包前的现网代码（**首选**，真正的回滚点）
+
+```bash
+cd ~/.dsh/profiles/desktop
+rm -rf node_modules/dsh-handoff-relay
+cp -r node_modules/dsh-handoff-relay.bak-relay060-<TS> node_modules/dsh-handoff-relay
+sha256sum node_modules/dsh-handoff-relay/index.js     # 必须回到 ed7cef8c…
+```
+
+→ 重启 → 复核：`index.js` sha256 = `ed7cef8c…`、`version` 字面 `0.5.0`、`relay.log` 有「启动 9/9 个 watch」、`RELAY_TOOL_NAME` 不再导出。
+
+**为什么不用 0.5.0 tgz 回滚**（developer 08:2x 提出、我实测复核）：tgz 里那份 `index.js` 是 78,090 B／`f699cf1a…`，缺 P55 的 `{body}` 内联与全角冒号修复；装回 tgz 会把现网已有的两处修复一起退掉，投递消息退回「只给路径」。tgz 只能当「代码丢失时」的最后一档。
+
+### R2 回「装包前的 profile 状态」（specifier 与配置也要一起回时用）
 
 ```bash
 cd ~/.dsh/profiles/desktop
 cp package.json.bak-relay060-<TS>     package.json
 cp pnpm-lock.yaml.bak-relay060-<TS>   pnpm-lock.yaml
 cp cordis.patch.yml.bak-relay060-<TS> cordis.patch.yml
-# 然后重放装包前的那条 add 命令（等同于把旧 specifier 再装一次）
-dsh plugin --profile desktop add "file:C:/develop/workspace/dsh-handoff-relay/dsh-handoff-relay-0.5.0.tgz"
+pnpm install --dir .    # 按还原后的 lock 重装；**不要**再跑 0.5.0 的 add
 ```
 
-→ 重启 → 复核同上；`sha256sum cordis.patch.yml` 与 §1 记录逐字相同。
+→ 重启 → 复核：`sha256sum cordis.patch.yml` 与 §1 记录逐字相同，`index.js` 回到 `ed7cef8c…`。
 
 ### R3 紧急停用（只在工具面导致宿主起不来时用，代价＝投递全停）
 
@@ -104,6 +135,8 @@ grep -n -A2 "^- id: dsh-handoff-relay" cordis.patch.yml
 ```
 
 → 重启 → 宿主可用、7 条 watch 全停（不是降级，是完全不投递）；恢复即把 `disabled` 改回 `false` 再重启。
+
+**约束**：重启前不得把「已装」当「已生效」；R1 的 `cp -r` 覆盖前提是同一 profile、同一路径。
 
 **回滚演练口径**：R1 的 `add` 命令与 P1-13/P54 两次实测同形（`+N`/exit 0），因此不需要预演；R2/R3 是文件覆盖，只看 `sha256sum` 对上。
 
