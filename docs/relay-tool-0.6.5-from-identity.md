@@ -28,7 +28,23 @@
 
 - **主身**：遍历 `Object.values(state.bots)`，命中 `bot.sessionId === sessionId` ⇒ `kind='main'`，`fromText = `${bot.name} · 主身``，`replyTo = `${bot.name}@主身``。
 - **群分身**：遍历 `Object.values(state.rooms)`，在 `room.sessions`（`botId → segmentSessionId`）里找值等于 `sessionId` 的键 `botId`；再用 `state.bots[botId].name` 取名字 ⇒ `kind='group'`，`fromText = `${bot.name} · ${room.name}（群分身）``，`replyTo = `${room.name}:${bot.name}``。名字与 id8 同源（同一个 botId 既查名字又参与 `id8Of`），不靠标题里有没有 ` · ` 去猜。
-- **判不出来**（无 exec.agent／读盘失败／两张表都没有该 session／同名 bot 冲突）⇒ 一律退回 0.6.4 行为：`fromText='UNKNOWN'`、`replyTo=''`（文件里写「回执地址未知」），**不抛错、不写告警升级**，只在 `relay.log` 留一行 `tool-from fallback reason=…`。
+- **判不出来**（无 exec.agent／读盘失败／两张表都没有该 session／同名 bot 冲突）⇒ `fromText='UNKNOWN'`、`replyTo=''`；**解析不出回执地址就整行不写 `Reply-To`**（见 §2.5，`0.6.5` 改口径，不再写「回执地址未知」），**不抛错、不写告警升级**，只在 `relay.log` 留一行 `tool-from fallback reason=…`。
+
+## 2.5 单向投递：`Reply-To` 从「给地址」升级成「给动作」（主身 17:0x 追加，硬要求）
+
+宿主的 `send/followup/steer/inject` 都不带返回地址（`dsh-agent-preset-registry/lib/typert.host.js:284`），relay 投递走 `agent.followup(message)`（`index.js:1597`）——被投递方把回复写在结尾只留在自己会话，发件人永远收不到。**这不是记性问题，是结构上没有回程。** 所以三处一起改：
+
+1. **行文案**：`Reply-To: <地址>（回信请用 relay_deliver 投该地址；本轮结尾文本不会回到发件人）`
+2. **提醒段**：把「不要假定对方能看到你在群里的发言」换成 **「本件是单向投递，没有回程；回信必须另投一次。」**
+3. **解析不出回执地址时整行不写**——不写「回执地址未知」。「未知」会被读成「有回程、地址待补」，比没有更误导。这条**覆盖 0.6.3 定下的「省略并写未知」口径**。
+
+连带要改的存量（都属本版范围）：
+
+- `index.js:33` `REPLY_TO_UNKNOWN='回执地址未知'` 删除或不再用于文案；`index.js:923` `buildRelayNotice` 拼行逻辑按「给了才写」重写。
+- `index.js:110` 附近的 `docs/relay-tool-0.6.3-mention-file-gate.md:110`／`:116`／`:151` 三处旧口径同步改。
+- **既有单测要改断言**：`index.test.mjs:4584`（N2 标题与 `:4590`、`:4633` 的 `includes('回执地址未知')`）改为断言「无 `Reply-To` 行」＋文案含「单向投递」「没有回程」。这三处不改，`npm test` 一定红。
+
+验收口径补一条：任何负向复跑，**必须 `watch-reject` 日志 ＋ `.rejected.md` ＋ `rejected.json` 三件同现**才算「闸生效」，「目录安静」不算证据（`docs/ledger/dedup-vs-gate-20261120.md`，通用判据，正本在 `dev-workflow-guide.md` 归主身改）。
 
 ## 3 五条单测（都是纯函数 + 假 state，不碰本机台账）
 
@@ -36,8 +52,8 @@
 |---|---|---|
 | S1 | state 里某 bot 的 `sessionId` ＝ 传入 id | `kind='main'`，`fromText='<Bot> · 主身'`，`replyTo='<Bot>@主身'` |
 | S2 | 某 room 的 `sessions[botId]` ＝ 传入 id | `kind='group'`，`fromText='<Bot> · <群名>（群分身）'`，`replyTo='<群名>:<Bot>'` |
-| S3 | 不传 exec / `exec.agent` 缺失 | handler 返回 `ok:true`，落盘件头仍 `From: UNKNOWN`、`Reply-To` 段写「回执地址未知」，不抛错 |
-| S4 | exec 有 id 但两张表都查不到 | 同 S3（回退），并有一行 `tool-from fallback` 日志 |
+| S3 | 不传 exec / `exec.agent` 缺失 | handler 返回 `ok:true`，落盘件头仍 `From: UNKNOWN`，**整件不含 `Reply-To` 行**（断言 `!/^Reply-To:/m`），提醒段含「单向投递」「没有回程」，不抛错 |
+| S4 | exec 有 id 但两张表都查不到 | 同 S3（无 `Reply-To` 行、文案含「单向投递」「没有回程」），并有一行 `tool-from fallback` 日志 |
 | S5 | 群分身调用、正文与头同时校验 | `From:` 与 `Reply-To:` 同时正确；`hash8` 与 0.6.4 同参同值（**提示段与身份行都不进幂等键**，这条要显式断言） |
 
 回归：既有 225 例全绿（`npm test`），mention 四条码与 @ 闸、去重台账、watch 通道一律不动。
@@ -47,6 +63,7 @@
 - **文案修**（QA 提、主持已判该修）：`index.js:1496`／`:1504`／`:1512` 三处末句改成
   `另：本件已留原地，未投递；同内容会被去重拦（与文件名无关），改内容后重投即可。`
   （去重键是内容摘要不是文件名；`docs/relay-tool-0.6.2-mention-plan.md:57` 同步改。）
+- **0.6.3 文档旧口径**：`docs/relay-tool-0.6.3-mention-file-gate.md:110`／`:116`／`:151` 按 §2.5 改写（「省略并写未知」→「整行不写」）。
 - **README 两版**：已完成并提交 `e1f6d42`——文件通道的 `@` 只过闸、不决定收件人，收件人由 watch 的 `targetIdentity` 固定；要叫某人干活走 `relay_deliver` 或群里 @。硬依据 `relay.log:880` 那轮 `watches[7]` 的 `targetIdentity`。
 
 ## 5 交付与边界
