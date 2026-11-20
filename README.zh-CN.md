@@ -86,6 +86,12 @@ watch、找的是什么标题、命中几条（有歧义时列出候选）。**�
 `文件 <绝对路径> 已就绪（触发=stable|DONE），请继续。`，收件方可以按该路径直接读文件。
 如果目标会话尚未加载，则写一条警告日志，不发送任何消息。
 
+### 文件通道的 @ 只过闸，不决定收件人
+
+往被 watch 的目录里放文件时，正文里的 @ 只用来过 mention 闸（`@<本群成员>` 或 `@所有人`），**不改变收件人**——收件人由该条 watch 的 `targetIdentity` 写死。例如 `dsh-plugins-project\bridge\to-group` 绑的是 `DSH 插件组:大肥鱼`，所以往那里丢一件首行写 `@QA` 的文件，仍然注进 大肥鱼 的会话，QA 收不到。
+
+要点名让人干活：走工具 `relay_deliver`（`target` 里带收件人），或在群里 @ 对方。文件通道只能当闸用，不能当路由。
+
 ## 工具：relay_deliver（0.6.0 起）
 
 一条投递现在也是工具：不必先往目录里放文件再等 watch，调用时直接给「目标地址 + 标题 + 正文」。文件方式仍然保留，两者共用同一套落盘、身份头、去重与归档逻辑。
@@ -97,7 +103,7 @@ watch、找的是什么标题、命中几条（有歧义时列出候选）。**�
 | `body` | 是 | 要交的正文，无字符上限，护栏 1 MiB（1,048,576 字节），禁 NUL |
 | `kind` | 否 | `ASK`／`NOTICE`／`REPORT`／`OK`／`RED`，缺省 `REPORT` |
 
-返回 `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`：`delivered` 是落到 watch 目录的绝对路径，`deduped: true` 表示同参数重复调用、没有再次投递。预期失败不抛异常，直接回 `code`（`E_ADDR_INVALID`／`E_SESSION_UNRECORDED`／`E_ARGS_INVALID`／`E_BODY_TOO_LARGE`／`E_NO_ROUTE`／`E_DELIVER_FAILED`）。
+返回 `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`：`delivered` 是落到 watch 目录的绝对路径，`deduped: true` 表示同参数重复调用、没有再次投递。预期失败不抛异常，直接回 `code`（`E_ADDR_INVALID`／`E_SESSION_UNRECORDED`／`E_ARGS_INVALID`／`E_BODY_TOO_LARGE`／`E_NO_ROUTE`／`E_DELIVER_FAILED`／`E_MENTION_REQUIRED`／`E_MENTION_NOT_IN_BODY`／`E_MENTION_UNKNOWN`／`E_MENTION_FULLWIDTH`）。群地址缺 @ 或 @ 的人不在本群名单上时直接拒投，不会静默落盘。
 
 **可直接复制的调用参数**（交给任意 Bot，或直接在工具面板里粘贴）：
 

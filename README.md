@@ -145,6 +145,12 @@ Behind those two lines the body is the default text
 open the file straight from that path. If the target session is not loaded, a
 warning is written and nothing is sent.
 
+### The file channel's @ gates the delivery, it does not route it
+
+When you drop a file into a watched directory, an @ in the body only gets it past the mention gate (`@<a member of that room>` or `@所有人`); it does **not** change the recipient. The recipient is fixed by that watch's `targetIdentity`. For example `dsh-plugins-project\bridge\to-group` is bound to `DSH 插件组:大肥鱼`, so a file whose first line says `@QA` still lands in 大肥鱼's session and QA never sees it.
+
+To actually call someone to work: use the `relay_deliver` tool (the recipient is in `target`), or @ them in the group chat. The file channel is a gate, not a router.
+
 ## Tool: relay_deliver (since 0.6.0)
 
 A single hand-off is now also a tool: instead of dropping a file into a watched directory and waiting, pass the target address, a subject and the body directly. The directory watch still works; both paths share the same write, identity-header, dedupe and archive logic.
@@ -156,7 +162,7 @@ A single hand-off is now also a tool: instead of dropping a file into a watched 
 | `body` | yes | the content, no character cap, 1 MiB (1,048,576 bytes) guard, NUL forbidden |
 | `kind` | no | `ASK` / `NOTICE` / `REPORT` / `OK` / `RED`, defaults to `REPORT` |
 
-It returns `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`; `delivered` is the absolute path inside the watch directory and `deduped: true` means the same arguments were delivered before. Expected failures are returned, not thrown (`E_ADDR_INVALID`, `E_SESSION_UNRECORDED`, `E_ARGS_INVALID`, `E_BODY_TOO_LARGE`, `E_NO_ROUTE`, `E_DELIVER_FAILED`).
+It returns `{ ok, code, reason, field, message, delivered, target, targetTitle, deduped, inlined }`; `delivered` is the absolute path inside the watch directory and `deduped: true` means the same arguments were delivered before. Expected failures are returned, not thrown (`E_ADDR_INVALID`, `E_SESSION_UNRECORDED`, `E_ARGS_INVALID`, `E_BODY_TOO_LARGE`, `E_NO_ROUTE`, `E_DELIVER_FAILED`, `E_MENTION_REQUIRED`, `E_MENTION_NOT_IN_BODY`, `E_MENTION_UNKNOWN`, `E_MENTION_FULLWIDTH`). A group target whose body has no usable @, or whose @ is not a member of that room, is refused instead of silently written.
 
 Copy-paste arguments (the `target` below is an address that already has a `watches` entry on this machine; a target without one returns `E_NO_ROUTE` — add a `watches` entry first, the tool never invents a directory):
 
