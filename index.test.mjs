@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { apply, scheduleStartupRescans, parseWatchesFromYml, replaceWatchesInYml, writeWatchesToYml, Config, PROBE_ROUTE_PATH, probePath, handleProbeRequest, RELAY_TOOL_NAME, registerRelayTool, buildRelayToolFile, stripRelayNotice, resolveReplyTo, createRelayToolHandler } from './index.js';
+import { describeSourceBySession } from './identity.js';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
@@ -4571,7 +4572,7 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   check('N1 群目标：头有 Reply-To、正文末有提醒段，且剥掉提示后与「关掉」逐字节一致', () => {
     assert.ok(withNotice.content.includes('Reply-To: QA@主身'), `缺 Reply-To 行：${withNotice.content.slice(0, 200)}`);
     assert.ok(withNotice.content.includes('relay-notice begin'), '缺提示段起始标记');
-    assert.ok(withNotice.content.includes('不要假定对方能看到你在群里的发言'), '提示文案缺关键句');
+    assert.ok(withNotice.content.includes('单向投递') && withNotice.content.includes('没有回程'), `提示文案缺「单向投递/没有回程」：${withNotice.content.slice(-200)}`);
     assert.equal(without.content.includes('Reply-To:'), false, '关掉时不应有 Reply-To 行');
     assert.equal(without.content.includes('<!-- relay-notice begin -->'), false, '关掉时不应有提示段');
     assert.equal(stripRelayNotice(withNotice.content), without.content, '开时剥完必须与关掉逐字节一致');
@@ -4581,13 +4582,14 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.equal(withNotice.relName, without.relName, `文件名应相同：${withNotice.relName} vs ${without.relName}`);
   });
 
-  check('N2 主身目标：解析不出回执地址 ⇒ 省略 Reply-To 行、提示写「回执地址未知」，不抛错不造地址', () => {
+  check('N2 主身目标：解析不出回执地址 ⇒ 整行不写 Reply-To，也不写「回执地址未知」', () => {
     assert.equal(resolveReplyTo('大肥鱼@主身'), '', '主身地址取不到来源群 ⇒ 空串');
     assert.equal(resolveReplyTo('DSH 插件组:QA'), 'QA@主身', '群地址 ⇒ 该 Bot 的 @主身');
     assert.equal(resolveReplyTo('乱七八糟'), '', '解析失败 ⇒ 空串，不猜');
     const mainFile = buildRelayToolFile({ ...baseArgs, target: '大肥鱼@主身', replyTo: '', replyNotice: true });
     assert.equal(mainFile.content.includes('Reply-To:'), false, '解析不出时不得写 Reply-To 行');
-    assert.ok(mainFile.content.includes('回执地址未知'), `提示段应写回执地址未知：${mainFile.content.slice(-220)}`);
+    assert.equal(mainFile.content.includes('回执地址未知'), false, `不得写「回执地址未知」：${mainFile.content.slice(-220)}`);
+    assert.ok(mainFile.content.includes('单向投递') && mainFile.content.includes('没有回程'), `提示段应讲清单向投递：${mainFile.content.slice(-220)}`);
   });
 
   check('N3 剥函数幂等：连剥两次结果不变，且不误伤正文里的普通 HTML 注释', () => {
@@ -4630,7 +4632,8 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.notEqual(path.basename(a1.delivered) === path.basename(b1.delivered), true, '换目标应得另一件');
     const textB = fs.readFileSync(b1.delivered, 'utf8');
     assert.equal(textB.includes('Reply-To:'), false, '主身目标不得写 Reply-To 行');
-    assert.ok(textB.includes('回执地址未知'), '主身目标提示段应写回执地址未知');
+    assert.equal(textB.includes('回执地址未知'), false, '不得写「回执地址未知」');
+    assert.ok(textB.includes('单向投递'), '主身目标提示段应讲清单向投递');
   });
 
   // 真文件通道：buildMessage 侧的提示与开关（用 apply 走一次真实 watch 投递）
@@ -4649,6 +4652,100 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.ok(text.includes('关掉提示的一件'), '正文应照常内联');
   });
   disp();
+}
+
+// ===== 0.6.5 工具通道真实来源（From: 只从 exec.agent.id 派生）=====
+{
+  const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-src-'));
+  const srcStatePath = path.join(srcDir, 'state.json');
+  const srcState = {
+    version: 1,
+    bots: {
+      'session-aaaa0000-q1': { id: 'session-aaaa0000-q1', name: 'QA', sessionId: 'session-aaaa0000-main' },
+      'session-bbbb2222-3333': { id: 'session-bbbb2222-3333', name: '主管家', sessionId: 'session-bbbb2222-3333' },
+    },
+    rooms: {
+      'room-1': { id: 'room-1', name: 'DSH 插件组', members: ['session-aaaa0000-q1'], sessions: { 'session-aaaa0000-q1': 'session-aaaa1111-2222' } },
+    },
+  };
+  fs.writeFileSync(srcStatePath, JSON.stringify(srcState), 'utf8');
+
+  check('S1 主身来源：bots[].sessionId 命中 ⇒ From 写「<Bot> · 主身」、Reply-To 写「<Bot>@主身」', () => {
+    const got = describeSourceBySession(srcState, 'session-bbbb2222-3333');
+    assert.ok(got, '应命中主身');
+    assert.equal(got.kind, 'main');
+    assert.equal(got.fromText, '主管家 · 主身');
+    assert.equal(got.replyTo, '主管家@主身');
+  });
+
+  check('S2 群分身来源：rooms[].sessions[botId] 命中 ⇒ From 写「<Bot> · <群名>（群分身）」、Reply-To 写「<群名>:<Bot>」', () => {
+    const got = describeSourceBySession(srcState, 'session-aaaa1111-2222');
+    assert.ok(got, '应命中群分身');
+    assert.equal(got.kind, 'group');
+    assert.equal(got.roomName, 'DSH 插件组');
+    assert.equal(got.fromText, 'QA · DSH 插件组（群分身）');
+    assert.equal(got.replyTo, 'DSH 插件组:QA');
+  });
+
+  const sDirA = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-src-a-'));
+  const sDirB = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-src-b-'));
+  const sStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-src-log-'));
+  const sGroupStub = { ok: true, kind: 'group', id: 'session-aaaa1111-2222', title: 'QA · DSH 插件组', sessionId: 'session-aaaa1111-2222', roomName: 'DSH 插件组' };
+  const sMainStub = { ok: true, kind: 'identity', id: 'session-bbbb2222-3333', title: '主管家', sessionId: 'session-bbbb2222-3333' };
+  const sResolveStub = (addr) => {
+    if (addr === 'DSH 插件组:QA') return sGroupStub;
+    if (addr === '大肥鱼@主身') return sMainStub;
+    throw new Error(`unexpected address ${addr}`);
+  };
+  const sRoutes = [
+    { dir: sDirA, targetIdentity: 'DSH 插件组:QA', targetSessionId: '', targetTitle: '', fromRole: 'from-role-should-lose' },
+    { dir: sDirB, targetIdentity: '大肥鱼@主身', targetSessionId: '', targetTitle: '', fromRole: 'from-role-should-lose' },
+  ];
+  const sHandler = createRelayToolHandler({
+    routes: sRoutes, stateDir: sStateDir, inlineMaxChars: 4000,
+    resolveAddress: sResolveStub, statePath: srcStatePath,
+    listMembers: () => ({ members: [{ botName: 'QA', address: 'DSH 插件组:QA', hasSegment: true }], total: 1, roomName: 'DSH 插件组' }),
+  });
+  const sLog = () => {
+    try { return fs.readFileSync(path.join(sStateDir, 'relay.log'), 'utf8'); } catch { return ''; }
+  };
+
+  const noExec = await sHandler({ target: 'DSH 插件组:QA', subject: 'S3', mention: 'QA', body: '@QA 无 exec 的一件' });
+  const s3Text = noExec.ok ? fs.readFileSync(noExec.delivered, 'utf8') : '';
+  check('S3 无 exec.agent ⇒ 与 0.6.4 完全一致（From 退回配置 fromRole、Reply-To 按目标推算）、留 NO_AGENT 日志、不抛错', () => {
+    assert.equal(noExec.ok, true, JSON.stringify(noExec));
+    assert.ok(s3Text.includes('From: from-role-should-lose'), `应退回配置 fromRole：${s3Text.slice(0, 160)}`);
+    assert.ok(/^Reply-To: QA@主身（回信请用 relay_deliver/m.test(s3Text), `群目标的 Reply-To 仍按目标推算：${s3Text.slice(0, 260)}`);
+    assert.ok(s3Text.includes('单向投递') && s3Text.includes('没有回程'), '提示段应讲清单向投递');
+    assert.ok(sLog().includes('tool-from fallback reason=NO_AGENT'), `应留回退日志：${sLog().slice(-300)}`);
+  });
+
+  const missExec = { agent: { id: 'session-ffff9999-0000' } };
+  const miss = await sHandler({ target: '大肥鱼@主身', subject: 'S4', body: '@QA 查不到来源的一件' }, missExec);
+  const s4Text = miss.ok ? fs.readFileSync(miss.delivered, 'utf8') : '';
+  check('S4 exec 有 id 但两张表都查不到 ⇒ 回退 0.6.4 行为（From 走 fromRole、主身目标不写 Reply-To）、留 NOT_IN_STATE 日志、不抛错', () => {
+    assert.equal(miss.ok, true, JSON.stringify(miss));
+    assert.ok(s4Text.includes('From: from-role-should-lose'), `应退回配置 fromRole：${s4Text.slice(0, 160)}`);
+    assert.equal(/^Reply-To:/m.test(s4Text), false, '主身目标解析不出回执地址 ⇒ 整行不写');
+    assert.ok(sLog().includes('tool-from fallback reason=NOT_IN_STATE'), `应留回退日志：${sLog().slice(-300)}`);
+  });
+
+  const mainExec = { agent: { id: 'session-bbbb2222-3333' } };
+  const fromMain = await sHandler({ target: 'DSH 插件组:QA', subject: 'S5 主身来源', mention: 'QA', body: '@QA 我以主身身份投' }, mainExec);
+  const s5Main = fromMain.ok ? fs.readFileSync(fromMain.delivered, 'utf8') : '';
+  const fromSeg = await sHandler({ target: 'DSH 插件组:QA', subject: 'S5 群分身来源', mention: 'QA', body: '@QA 我以群分身身份投' }, { agent: { id: 'session-aaaa1111-2222' } });
+  const s5Seg = fromSeg.ok ? fs.readFileSync(fromSeg.delivered, 'utf8') : '';
+  check('S5 有 exec 时 From/Reply-To 同时正确；配置 fromRole 不得压过 exec；hash8 与 0.6.4 同参同值', () => {
+    assert.equal(fromMain.ok, true, JSON.stringify(fromMain));
+    assert.ok(s5Main.includes('From: 主管家 · 主身'), `主身来源写错：${s5Main.slice(0, 160)}`);
+    assert.ok(/^Reply-To: .*主管家@主身（回信请用 relay_deliver/m.test(s5Main), `主身 Reply-To 写错：${s5Main.slice(0, 260)}`);
+    assert.equal(s5Main.includes('from-role-should-lose'), false, '配置 fromRole 不得覆盖 exec 来源');
+    assert.equal(fromSeg.ok, true, JSON.stringify(fromSeg));
+    assert.ok(s5Seg.includes('From: QA · DSH 插件组（群分身）'), `群分身来源写错：${s5Seg.slice(0, 160)}`);
+    assert.ok(/^Reply-To: DSH 插件组:QA（回信请用 relay_deliver/m.test(s5Seg), `群分身 Reply-To 写错：${s5Seg.slice(0, 260)}`);
+    const expect = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: 'S5 群分身来源', kind: 'REPORT', body: '@QA 我以群分身身份投', replyTo: 'DSH 插件组:QA' });
+    assert.equal(path.basename(fromSeg.delivered), expect.relName, '身份与提示不得进幂等键');
+  });
 }
 
 console.log('\n===== 自测汇总 =====');

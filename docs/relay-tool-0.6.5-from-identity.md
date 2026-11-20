@@ -71,3 +71,16 @@
 - 版本 0.6.5；分支 `feat/relay-0.6.5-from-identity`；只提交分支与 `dsh-handoff-relay-0.6.5.tgz`，**不 push、不装包**；tgz 与三份 sha 报给项目总负责人。
 - 真机那条（投一件看 `relay.log` 的真实 `From:`）按派单由主持装好后自己跑；我出包即停。
 - 不做：群头拦截（主人已否）、`fromText` 类外部可覆盖入口（边界 ①）、动 mention 闸／去重／watch／回执提示。
+
+## 6 实现落点（2026-11-20 交付，0.6.5）
+
+按 §1 四处改动落完，另按主身追加要求把「单向投递」写进提示段。行号以本次提交为准：
+
+- `index.js:1993` `sessionIdOfExec(exec)`——取 `exec.agent.id`，`agent.session.id` 只作兜底。
+- `index.js:2008` `describeToolSource(exec, stateDir, statePath, ctx)`——现读 state、调 `describeSourceBySession`；取不到时留 `tool-from fallback reason=NO_AGENT|STATE_UNREADABLE|NOT_IN_STATE` 并返回 null（调用方退化）。`DSH_RELAY_DEBUG_SOURCE=1` 时额外打印 `exec`／`agent` 的键名（默认关）。
+- `identity.js:183` `describeSourceBySession(state, sessionId)`——主身查 `bots[].sessionId`，群分身查 `rooms[].sessions[botId]` 反查 botId 取 `bots[botId].name`；主身优先（同 id 时按主身算），查不到返回 null。
+- `index.js:2100` 落盘前用来源覆盖 `fromText`／`replyTo`：`fromText = source.fromText`（取不到才 `route.fromRole || UNKNOWN`）、`replyTo = source.replyTo`（取不到才按目标推算）。
+- `index.js:2200` `execute: (args, exec) => handler(args, exec)`。
+- `index.js:922` `buildRelayNotice`——`Reply-To: <地址>（回信请用 relay_deliver 投该地址；本轮结尾文本不会回到发件人）`，提醒段改「本件是单向投递，没有回程；回信必须另投一次。」；地址为空时整行不写；`REPLY_TO_UNKNOWN` 常量已删除，无死代码。
+- 文案修三处：`index.js:1499`／`:1507`／`:1515`（统一为「同内容会被去重拦（与文件名无关），改内容后重投即可。」），`docs/relay-tool-0.6.2-mention-plan.md` 示例同步。
+- 测试：`index.test.mjs` 新增 S1–S5（主身来源／群分身来源／无 exec／查不到该 session／From+Reply-To+幂等键），旧 N1/N2/N4 断言按「整行不写、不写未知」改写。`npm test` → **230/230 PASS**（0.6.4 的 225 + 5）。

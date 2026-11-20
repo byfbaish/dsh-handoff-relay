@@ -172,6 +172,43 @@ export function resolveInIndex(index, rawAddress) {
  * @returns {{roomName:string, roomId:string, total:number,
  *            members:Array<{botName:string, address:string, hasSegment:boolean}>}}
  */
+/**
+ * 0.6.5：由「会话 id」反查来源身份（工具通道的 `From:`）。
+ * 两张映射各自判定，都靠 botId 同一人：主身看 `bots[].sessionId`，群分身看 `rooms[].sessions[botId]`。
+ * 主身与群分身同 id（aliasOfMain）时按主身算——主身优先，避免把私聊当成群发言。
+ * 查不到返回 null（调用方退化，不抛错、不猜）。
+ * @returns {{kind:'main'|'group', botId:string, botName:string, roomName:string,
+ *            fromText:string, replyTo:string}|null}
+ */
+export function describeSourceBySession(state, sessionId) {
+  const sid = typeof sessionId === 'string' ? sessionId : '';
+  if (sid === '') return null;
+  const index = createIndex(state);
+  for (const bot of index.botsById.values()) {
+    if (bot.sessionId === sid) {
+      return Object.freeze({
+        kind: 'main', botId: bot.id, botName: bot.name, roomName: '',
+        fromText: `${bot.name} · 主身`, replyTo: `${bot.name}@主身`,
+      });
+    }
+  }
+  for (const rooms of index.roomsByName.values()) {
+    for (const room of rooms) {
+      const sessions = isObj(room.sessions) ? room.sessions : {};
+      for (const botId of Object.keys(sessions)) {
+        if (sessions[botId] !== sid) continue;
+        const bot = index.botsById.get(botId);
+        if (!bot) continue;
+        return Object.freeze({
+          kind: 'group', botId, botName: bot.name, roomName: room.name,
+          fromText: `${bot.name} · ${room.name}（群分身）`, replyTo: `${room.name}:${bot.name}`,
+        });
+      }
+    }
+  }
+  return null;
+}
+
 export function listRoomMembers(state, roomName) {
   const index = createIndex(state);
   const rooms = index.roomsByName.get(roomName) ?? [];

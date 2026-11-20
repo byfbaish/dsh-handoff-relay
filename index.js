@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 // P1-11：身份 → 会话解析（<群名>:<Bot> / <Bot>@主身），投递时现读 state.json，换段自动跟随。
-import { resolveAddressNow, parseAddress, describeIdentityError, readStateFile, defaultStatePath, listRoomMembers, REASONS as IDENTITY_REASONS } from './identity.js';
+import { resolveAddressNow, parseAddress, describeIdentityError, readStateFile, defaultStatePath, listRoomMembers, describeSourceBySession, REASONS as IDENTITY_REASONS } from './identity.js';
 export const name = 'dsh-handoff-relay';
 export const inject = ['agents', 'tools'];
 const PLUGIN_NAME = 'dsh-handoff-relay';
@@ -30,7 +30,6 @@ const MAX_DELIVERED_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const RELAY_NOTICE_BEGIN = '<!-- relay-notice begin -->';
 const RELAY_NOTICE_END = '<!-- relay-notice end -->';
 const DEFAULT_REPLY_NOTICE = true;
-const REPLY_TO_UNKNOWN = '回执地址未知';
 const RELAY_NOTICE_BLOCK_RE = /(?:\n|^)<!-- relay-notice begin -->\n[\s\S]*?<!-- relay-notice end -->\n/g;
 const RELAY_STATE_DIRNAME = 'dsh-handoff-relay';
 const FAILED_FILENAME = 'failed.json';
@@ -921,9 +920,13 @@ export function resolveReplyTo(address) {
  * `Reply-To:` 放在标记块内部第一行：它和提醒文本必须同生同灭，否则「关掉提示」时头里会残留一行。
  */
 function buildRelayNotice(replyTo) {
+  // 0.6.5：relay 是单向投递（宿主 send/followup/steer/inject 都不带返回地址），
+  // 所以这里给的是「动作」而不只是地址；解析不出地址时整行不写——写「未知」会被读成「有回程、地址待补」。
   const where = String(replyTo || '');
-  const replyLine = where ? `Reply-To: ${where}\n` : '';
-  return `\n${RELAY_NOTICE_BEGIN}\n${replyLine}本件由 relay 投递。需要回执时请优先用 relay 投递到 ${where || REPLY_TO_UNKNOWN}；不要假定对方能看到你在群里的发言。\n${RELAY_NOTICE_END}\n`;
+  const replyLine = where
+    ? `Reply-To: ${where}（回信请用 relay_deliver 投该地址；本轮结尾文本不会回到发件人）\n`
+    : '';
+  return `\n${RELAY_NOTICE_BEGIN}\n${replyLine}本件由 relay 投递。本件是单向投递，没有回程；回信必须另投一次。\n${RELAY_NOTICE_END}\n`;
 }
 const IDENTITY_FALLBACK_TITLE = '(无标题)';
 const IDENTITY_LINE_RE = /^(?:From|To)\s*[:：]\s*\S.*$/;
@@ -1493,7 +1496,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
         `群投递被拒：正文里点了 @${listed}，但这些名字不在${where}的成员名单上。`,
         '可用写法：改 @ 本群成员的名字，或写 "@所有人"（全群调用，慎用、会唤醒全群）。',
         '说明：@所有／@大家／@all 都不算；名字须与名单逐字一致（区分字母大小写）。',
-        '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
+        '另：本件已留原地，未投递；同内容会被去重拦（与文件名无关），改内容后重投即可。',
       ]
       : reasonCode === 'ROOM_UNRESOLVED'
       ? [
@@ -1501,7 +1504,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
         '改法一：把 watch 的 targetIdentity 写成 "<群名>:<Bot>" 形式后重载。',
         '改法二：正文首行写 "@所有人"（全群调用，不核名单）。',
         '也可能：地址解析成主身（<Bot>@主身），文件却落在 to-group → 改投 to-owner 目录。',
-        '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
+        '另：本件已留原地，未投递；同内容会被去重拦（与文件名无关），改内容后重投即可。',
       ]
       : [
         `群投递被拒：正文里没有可识别的 @（${where}）。`,
@@ -1509,7 +1512,7 @@ function startWatch(ctx, cfg, watchDir, target, label, judge, mode, atLoad, deli
         '可能一：地址解析成主身，文件却落在 to-group → 改投 to-owner 目录，或在正文首行 @ 目标人。',
         '可能二：目标是群，但正文没写 @ → 在正文首行补 "@QA 请…" 后重新放入本目录。',
         '说明：正文里的 @ 都未匹配到该房间成员名（或 @ 后紧跟标点，如「@，」），一律不算。',
-        '另：本件已留原地，未投递；改好后请用新文件名重投（同名会被去重拦）。',
+        '另：本件已留原地，未投递；同内容会被去重拦（与文件名无关），改内容后重投即可。',
       ]).join('\n') + '\n';
     try {
       fs.writeFileSync(`${full}${REJECTED_SUFFIX}`, text, 'utf8');
@@ -1984,6 +1987,45 @@ function identityToolMessage(code, reason) {
 }
 
 /**
+ * 从宿主 exec 取会话 id：运行时 `Agent` 只有 `readonly id`（`dsh-agent/src/types.ts:17-20`），
+ * 没有 `sessionId`；`session.id` 只作兜底。取不到返回空串。
+ */
+function sessionIdOfExec(exec) {
+  if (!exec || typeof exec !== 'object') return '';
+  const agent = exec.agent;
+  if (!agent || typeof agent !== 'object') return '';
+  if (typeof agent.id === 'string' && agent.id !== '') return agent.id;
+  const session = agent.session;
+  if (session && typeof session === 'object' && typeof session.id === 'string') return session.id;
+  return '';
+}
+
+/**
+ * 0.6.5：来源身份只从 `exec.agent.id` 派生（参数与配置一律不得覆盖；配置里的 fromRole 只作兜底）。
+ * 取不到 / 台账读不出 / 两张映射都查不到 ⇒ 回 null，调用方退化到 0.6.4 行为（From: UNKNOWN、不写 Reply-To）。
+ * 不抛错，只留一行 `tool-from fallback reason=…`。
+ */
+function describeToolSource(exec, stateDir, statePath, ctx) {
+  const logFallback = (reason) => relayLog(ctx || null, stateDir, 'info', `${PLUGIN_NAME} tool-from fallback reason=${reason}`);
+  const agent = exec && typeof exec === 'object' ? exec.agent : undefined;
+  if (process.env.DSH_RELAY_DEBUG_SOURCE === '1') {
+    relayLog(ctx || null, stateDir, 'info', `${PLUGIN_NAME} debug exec keys=${Object.keys(exec || {}).join(',')} agent keys=${agent && typeof agent === 'object' ? Object.keys(agent).join(',') : '(none)'} sessionId=${sessionIdOfExec(exec) || '(none)'}`);
+  }
+  const sessionId = sessionIdOfExec(exec);
+  if (sessionId === '') { logFallback('NO_AGENT'); return null; }
+  let state;
+  try {
+    state = readStateFile(statePath);
+  } catch {
+    logFallback('STATE_UNREADABLE');
+    return null;
+  }
+  const found = describeSourceBySession(state, sessionId);
+  if (!found) { logFallback('NOT_IN_STATE'); return null; }
+  return found;
+}
+
+/**
  * 工具执行体：参数校验 → 身份解析 → 路由 → 原子落盘 → 去重判定。
  * 预期失败不 throw，返回 { ok:false, code, reason, field, message }（每码一种下一步动作）。
  * @param {{routes:Array, stateDir:string, inlineMaxChars?:number, resolveAddress?:Function, fsImpl?:object}} options
@@ -2001,7 +2043,7 @@ export function createRelayToolHandler(options) {
     ? opt.listMembers
     : (roomName) => listRoomMembers(readStateFile(toolStatePath), roomName);
 
-  return async function relayToolExecute(args) {
+  return async function relayToolExecute(args, exec) {
     const checked = validateRelayToolArgs(args);
     if (checked.error) return checked.error;
     const { target, subject, kind, body, mention } = checked.value;
@@ -2054,16 +2096,18 @@ export function createRelayToolHandler(options) {
       }
     }
 
+    // 0.6.5：真来源优先；取不到才退化到配置 fromRole／按目标推算的 Reply-To（与 0.6.4 行为一致）。
+    const source = describeToolSource(exec, stateDir, toolStatePath, opt.ctx);
     const built = buildRelayToolFile({
       target,
       subject,
       kind,
       body,
-      fromText: route.fromRole || IDENTITY_UNKNOWN,
+      fromText: source ? source.fromText : (route.fromRole || IDENTITY_UNKNOWN),
       targetTitle: resolved.title,
       targetSessionId: resolved.sessionId,
       sessionKind: resolved.kind === 'group' ? '群分身' : '主身',
-      replyTo: resolveReplyTo(target),
+      replyTo: source ? source.replyTo : resolveReplyTo(target),
       replyNotice: opt.replyNotice,
     });
     const full = path.join(route.dir, built.relName);
@@ -2153,7 +2197,7 @@ export function registerRelayTool(ctx, options) {
       schema: TOOL_OUTPUT_SCHEMA,
       render: (_args, value) => [{ type: 'text', text: renderRelayToolValue(value) }],
     },
-    execute: (args) => handler(args),
+    execute: (args, exec) => handler(args, exec),
   });
 }
 

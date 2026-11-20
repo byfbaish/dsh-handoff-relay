@@ -106,14 +106,14 @@ M6–M12 用假 home 的 `state.json`（临时目录 + `os.homedir` 桩）跑真
 
 ```
 <!-- relay-notice begin -->
-Reply-To: <地址>            ← 解析不出时整行省略
-本件由 relay 投递。需要回执时请优先用 relay 投递到 <地址或「回执地址未知」>；不要假定对方能看到你在群里的发言。
+Reply-To: <地址>（回信请用 relay_deliver 投该地址；本轮结尾文本不会回到发件人）   ← 解析不出时整行省略
+本件由 relay 投递。本件是单向投递，没有回程；回信必须另投一次。
 <!-- relay-notice end -->
 ```
 
 放块内是主持边界①的直接后果：`stripRelayNotice()` 要能把 `Reply-To:` 一起剥掉；放进头里就剥不干净，「关掉提示」的落盘内容会和「开时剥完」差一行。
 
-**怎么算**：`resolveReplyTo(address)` 只做两件事——群地址 `<群名>:<Bot>` → `<Bot>@主身`（回执回到这个人自己的主身）；主身地址 `<Bot>@主身` → 来源群地址，但本插件拿不到「来源群」，所以返回空串 ⇒ 省略该行、提醒段写「回执地址未知」。不抛错、不猜、不造地址。
+**怎么算**：`resolveReplyTo(address)` 只做两件事——群地址 `<群名>:<Bot>` → `<Bot>@主身`（回执回到这个人自己的主身）；主身地址 `<Bot>@主身` → 来源群地址，但本插件拿不到「来源群」，所以返回空串 ⇒ **整行不写**（0.6.5 起由 `exec.agent.id` 反查来源，「回执地址未知」作废）。不抛错、不猜、不造地址。
 
 **幂等**：`hash8` 公式一个字没改，仍只覆盖 `target + subject + stripIdentityLines(body).trim() + kind`；提示段与 `Reply-To` 都不进幂等键。`stripRelayNotice()` 与 `stripIdentityLines()` 同级，用于内联正文与文件内容比对，所以「开／关提示」得到同一路径、同一 `deduped` 判定。
 
@@ -148,8 +148,8 @@ Reply-To: <地址>            ← 解析不出时整行省略
 
 1. 投一件带 `@` 的件到工具路径（`relay_deliver`，target 用现网有 watch 的群地址）→ 打开落盘件，确认 `Reply-To:` 行与两端标记齐全、提醒段在正文末尾
 2. 同一 `target`／`subject`／`body` 再投一次 → 返回 `deduped:true`、目录里仍只有一件
-3. 同一正文换一个 `target`（如主身地址）→ 落另一件、`deduped:false`，且该件无 `Reply-To` 行、提醒段写「回执地址未知」
-4. 机测等价已由 N4 覆盖（218/218，`index.test.mjs`）：同文同目标第二次 `deduped:true`、换目标互不判重、开／关提示同一文件名（N1b）
+3. 同一正文换一个 `target`（如主身地址）→ 落另一件、`deduped:false`，且该件无 `Reply-To` 行、提醒段讲「单向投递，没有回程」
+4. 机测等价已由 N4 覆盖（0.6.5 起 230/230，`index.test.mjs`）：同文同目标第二次 `deduped:true`、换目标互不判重、开／关提示同一文件名（N1b）
 
 ## 5 顺带记一笔（不属 0.6.3 范围）
 
