@@ -4748,6 +4748,134 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   });
 }
 
+// ===== 0.6.6 自指投递提示（A 同会话 / B 同 botId 另一会话 / T3 对照）=====
+{
+  const s66DirMain = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-self-main-'));
+  const s66DirSeg = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-self-seg-'));
+  const s66StateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-self-log-'));
+  const s66StateDir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-self-log3-'));
+  const s66StatePath = path.join(s66StateDir, 'state.json');
+  const s66MainSid = 'session-df11aa22-0001-0002-0003-000400050006';
+  const s66SegSid = 'session-ff33bb44-0001-0002-0003-000400050006';
+  const s66OtherSid = 'session-9999cccc-0001-0002-0003-000400050006';
+  const s66State = {
+    version: 1,
+    bots: {
+      'bot-dfy': { id: 'bot-dfy', name: '大肥鱼', sessionId: s66MainSid },
+      'bot-qa': { id: 'bot-qa', name: 'QA', sessionId: 'session-qa55dd66-0001-0002-0003-000400050006' },
+    },
+    rooms: {
+      'room-1': {
+        id: 'room-1', name: 'DSH 插件组', members: ['bot-dfy', 'bot-qa'],
+        sessions: { 'bot-dfy': s66SegSid },
+      },
+    },
+  };
+  fs.writeFileSync(s66StatePath, JSON.stringify(s66State), 'utf8');
+
+  const s66Members = () => ({
+    roomName: 'DSH 插件组',
+    roomId: 'room-1',
+    total: 2,
+    members: [
+      { botName: '大肥鱼', address: 'DSH 插件组:大肥鱼', hasSegment: true },
+      { botName: 'QA', address: 'DSH 插件组:QA', hasSegment: false },
+    ],
+  });
+  const s66Resolve = (addr) => {
+    if (addr === '大肥鱼@主身') {
+      return { ok: true, kind: 'main', botId: 'bot-dfy', botName: '大肥鱼', id: s66MainSid, sessionId: s66MainSid, title: '大肥鱼', aliasOfMain: false };
+    }
+    if (addr === 'DSH 插件组:大肥鱼') {
+      return { ok: true, kind: 'group', botId: 'bot-dfy', botName: '大肥鱼', id: s66SegSid, sessionId: s66SegSid, title: '大肥鱼 · DSH 插件组', roomName: 'DSH 插件组', aliasOfMain: false };
+    }
+    if (addr === 'DSH 插件组:QA') {
+      return { ok: true, kind: 'group', botId: 'bot-qa', botName: 'QA', id: 'session-qa55dd66-0001-0002-0003-000400050006', sessionId: 'session-qa55dd66-0001-0002-0003-000400050006', title: 'QA · DSH 插件组', roomName: 'DSH 插件组', aliasOfMain: false };
+    }
+    throw new Error(`unexpected address ${addr}`);
+  };
+  const s66Routes = [
+    { dir: s66DirMain, targetIdentity: '大肥鱼@主身', targetSessionId: '', targetTitle: '', fromRole: 's66' },
+    { dir: s66DirSeg, targetIdentity: 'DSH 插件组:大肥鱼', targetSessionId: '', targetTitle: '', fromRole: 's66' },
+  ];
+  const s66Handler = createRelayToolHandler({
+    routes: s66Routes, stateDir: s66StateDir, inlineMaxChars: 4000,
+    resolveAddress: s66Resolve, statePath: s66StatePath, listMembers: s66Members,
+  });
+  const s66Log = (dir) => {
+    try { return fs.readFileSync(path.join(dir, 'relay.log'), 'utf8'); } catch { return ''; }
+  };
+  const selfNoteA = '这条消息发给你自己（同一会话），已照常投递；它不会产生新的外部对话。';
+  const selfNoteB = '目标是同一 Bot 的另一个会话（主身/群分身是两套会话），这条不会出现在你当前窗口。';
+
+  const t1 = await s66Handler({ target: '大肥鱼@主身', subject: 'T1 自指同会话', body: '给自己留个便签' }, { agent: { id: s66MainSid } });
+  const t1Text = t1.ok ? fs.readFileSync(t1.delivered, 'utf8') : '';
+  const t1Lines = t1Text.split('\n');
+  check('T1 A 档同会话：note 逐字、件头第三行 Self-Addressed: same-session、提示段首行、日志 kind=A、不写 rejected', () => {
+    assert.equal(t1.ok, true, JSON.stringify(t1));
+    assert.equal(t1.note, selfNoteA, `note 不符：${JSON.stringify(t1.note)}`);
+    assert.equal(t1Lines[2], 'Self-Addressed: same-session', `件头第三行不符：${JSON.stringify(t1Lines[2])}`);
+    const notice = t1Text.slice(t1Text.indexOf('<!-- relay-notice begin -->'));
+    assert.ok(notice.split('\n')[1] === '提示：这条消息是发给你自己的（同一会话）。', `提示段首行不符：${JSON.stringify(notice.slice(0, 120))}`);
+    assert.ok(s66Log(s66StateDir).includes('WARN self-addressed kind=A from=df11aa22 to=df11aa22'), `日志缺 kind=A：${s66Log(s66StateDir).slice(-400)}`);
+    assert.equal(fs.existsSync(path.join(s66StateDir, 'rejected.json')), false, '自指提示不得写 rejected.json');
+  });
+
+  const t2 = await s66Handler({ target: 'DSH 插件组:大肥鱼', subject: 'T2 自指另一会话', mention: '大肥鱼', body: '@大肥鱼 给分身留话' }, { agent: { id: s66MainSid } });
+  const t2Text = t2.ok ? fs.readFileSync(t2.delivered, 'utf8') : '';
+  check('T2 B 档同 botId 另一会话：note 逐字、件头 same-bot-other-session、提示段首行、日志 kind=B、不写 rejected', () => {
+    assert.equal(t2.ok, true, JSON.stringify(t2));
+    assert.equal(t2.note, selfNoteB, `note 不符：${JSON.stringify(t2.note)}`);
+    assert.ok(t2Text.includes('Self-Addressed: same-bot-other-session'), `件头缺 B 标记：${t2Text.slice(0, 200)}`);
+    assert.ok(t2Text.includes('提示：这条消息发给同一 Bot 的另一个会话，不会到你的当前窗口。'), `提示段缺 B 文案：${t2Text.slice(-260)}`);
+    assert.ok(s66Log(s66StateDir).includes('WARN self-addressed kind=B from=df11aa22 to=ff33bb44'), `日志缺 kind=B：${s66Log(s66StateDir).slice(-500)}`);
+    assert.equal(fs.existsSync(path.join(s66StateDir, 'rejected.json')), false, '自指提示不得写 rejected.json');
+  });
+
+  const t1b = await s66Handler({ target: '大肥鱼@主身', subject: 'T1b 关提示段', body: '关掉提示段的自指件' }, { agent: { id: s66MainSid } });
+  check('T1b replyNotice:false 时 A 档仍有 note 与件头标记（关掉提示段不影响前两处）', () => {
+    assert.equal(t1b.ok, true, JSON.stringify(t1b));
+    assert.equal(t1b.note, selfNoteA, 'note 不应受 replyNotice 影响');
+    const text = fs.readFileSync(t1b.delivered, 'utf8');
+    assert.ok(text.includes('Self-Addressed: same-session'), '件头标记不应受 replyNotice 影响');
+  });
+
+  // T3 对照：正常跨群，判不出自指 ⇒ 行为与 0.6.5 一致，且定样本 hash8 字面值不变
+  const s66Handler3 = createRelayToolHandler({
+    routes: s66Routes, stateDir: s66StateDir3, inlineMaxChars: 4000,
+    resolveAddress: s66Resolve, statePath: s66StatePath, listMembers: s66Members,
+  });
+  const t3 = await s66Handler3({
+    target: 'DSH 插件组:大肥鱼', subject: 'T3 对照样本', kind: 'NOTICE',
+    mention: 'QA', body: '@QA 这是 0.6.5 定样本',
+  }, { agent: { id: s66OtherSid } });
+  const t3Text = t3.ok ? fs.readFileSync(t3.delivered, 'utf8') : '';
+  check('T3 对照：note 为空串、件头无 Self-Addressed、日志无 self-addressed、定样本仍是 relay-748730cd.md', () => {
+    assert.equal(t3.ok, true, JSON.stringify(t3));
+    assert.equal(t3.note, '', `T3 note 必须为空串：${JSON.stringify(t3.note)}`);
+    assert.equal(t3Text.includes('Self-Addressed:'), false, `T3 不得写 Self-Addressed：${t3Text.slice(0, 200)}`);
+    assert.equal(s66Log(s66StateDir3).includes('self-addressed'), false, `T3 不得留 self-addressed 日志：${s66Log(s66StateDir3).slice(-400)}`);
+    assert.equal(path.basename(t3.delivered), 'relay-748730cd.md', `定样本字面值不符：${t3.delivered}`);
+    const sample = buildRelayToolFile({ target: 'DSH 插件组:大肥鱼', subject: 'T3 对照样本', body: '@QA 这是 0.6.5 定样本', kind: 'NOTICE' });
+    assert.equal(sample.relName, 'relay-748730cd.md');
+    assert.equal(sample.hash8, '748730cd');
+  });
+
+  // 渲染面：note 必须出现在调用方看得到的文本里；T3 不追加
+  let s66Reg = null;
+  registerRelayTool({ tools: { register: (def) => { s66Reg = def; return () => {}; } }, logger: { info() {}, warn() {}, error() {}, debug() {} } }, {
+    routes: s66Routes, stateDir: s66StateDir3, resolveAddress: s66Resolve, statePath: s66StatePath, listMembers: s66Members,
+  });
+  check('T1c/渲染：返回文本在 delivered 行之后追加 note；T3（note 空）不追加任何行', () => {
+    const renderedA = s66Reg.output.render({}, t1)[0].text;
+    assert.ok(renderedA.includes(selfNoteA), `渲染缺 note：${renderedA}`);
+    assert.equal(renderedA.split('\n').length, 2, `A 档应是 delivered 行 + note 两行：${JSON.stringify(renderedA)}`);
+    const rendered3 = s66Reg.output.render({}, t3)[0].text;
+    assert.equal(rendered3.includes('发给你自己'), false, `T3 渲染不得带自指文案：${rendered3}`);
+    assert.equal(rendered3.split('\n').length, 1, `T3 渲染应只有一行：${JSON.stringify(rendered3)}`);
+  });
+}
+
 console.log('\n===== 自测汇总 =====');
 for (const r of results) console.log(r);
 console.log(`TOTAL: ${results.length - failed}/${results.length} PASS`);

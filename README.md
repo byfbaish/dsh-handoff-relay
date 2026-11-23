@@ -151,6 +151,8 @@ When you drop a file into a watched directory, an @ in the body only gets it pas
 
 To actually call someone to work: use the `relay_deliver` tool (the recipient is in `target`), or @ them in the group chat. The file channel is a gate, not a router.
 
+Known difference: the file channel (dropping a file into a `bridge\` directory) gives **no "sent to yourself" notice**. That channel can only read the directory-ownership label `fromRole`, which is not proof of identity (see `index.js:1026`) — the same role name does not mean the same session; only the tool channel, via `exec.agent.id`, has a trustworthy source. Doing this later would require a trusted source identifier beyond the file header. Also, the host-side `message_bot` (built into DS Bot) has no such notice and is out of reach for this plugin; relay only warns, it never blocks — leaving yourself a note is a legitimate use.
+
 ## Tool: relay_deliver (since 0.6.0)
 
 A single hand-off is now also a tool: instead of dropping a file into a watched directory and waiting, pass the target address, a subject and the body directly. The directory watch still works; both paths share the same write, identity-header, dedupe and archive logic.

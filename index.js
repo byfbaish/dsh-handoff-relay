@@ -915,18 +915,55 @@ export function resolveReplyTo(address) {
   }
 }
 
+// 0.6.6：自指投递提示（A 同会话 / B 同 botId 另一会话）。空串＝C 档不适用，行为与 0.6.5 逐字节一致。
+// 三处文案都是固定原文，不进 cleanBody／hash8（幂等键只看 target/subject/cleanBody/kind）。
+const SELF_ADDRESSED_NOTE = Object.freeze({
+  A: '这条消息发给你自己（同一会话），已照常投递；它不会产生新的外部对话。',
+  B: '目标是同一 Bot 的另一个会话（主身/群分身是两套会话），这条不会出现在你当前窗口。',
+});
+const SELF_ADDRESSED_HEAD = Object.freeze({
+  A: 'same-session',
+  B: 'same-bot-other-session',
+});
+const SELF_ADDRESSED_NOTICE = Object.freeze({
+  A: '提示：这条消息是发给你自己的（同一会话）。',
+  B: '提示：这条消息发给同一 Bot 的另一个会话，不会到你的当前窗口。',
+});
+
+/** 只认 A／B，其余（含空串、undefined）一律当「不适用」，保证 C 档不写任何提示。 */
+function selfAddressedKindOf(value) {
+  const kind = String(value || '');
+  return kind === 'A' || kind === 'B' ? kind : '';
+}
+
+/**
+ * 0.6.6 判定：先 A（同会话）后 B（同 botId 另一会话），判不出回空串（C 档）。
+ * sid 为空（无 exec）或来源查不到（source=null）都落到 C，不猜。
+ */
+export function resolveSelfAddressedKind(sid, source, resolved) {
+  const from = String(sid || '');
+  const target = resolved || {};
+  if (from === '') return '';
+  if (String(target.sessionId || '') === from) return 'A';
+  if (source && target.botId && source.botId && source.botId === target.botId) return 'B';
+  return '';
+}
+
 /**
  * 提示段（<200 字），带前导换行，供直接拼在正文末尾。
  * `Reply-To:` 放在标记块内部第一行：它和提醒文本必须同生同灭，否则「关掉提示」时头里会残留一行。
+ * 0.6.6：自指提示（A/B）插在 begin 标记之后、Reply-To 之前；仍在同一标记块内，stripRelayNotice 可整段剥离。
  */
-function buildRelayNotice(replyTo) {
+function buildRelayNotice(replyTo, selfKindParam) {
   // 0.6.5：relay 是单向投递（宿主 send/followup/steer/inject 都不带返回地址），
   // 所以这里给的是「动作」而不只是地址；解析不出地址时整行不写——写「未知」会被读成「有回程、地址待补」。
   const where = String(replyTo || '');
   const replyLine = where
     ? `Reply-To: ${where}（回信请用 relay_deliver 投该地址；本轮结尾文本不会回到发件人）\n`
     : '';
-  return `\n${RELAY_NOTICE_BEGIN}\n${replyLine}本件由 relay 投递。本件是单向投递，没有回程；回信必须另投一次。\n${RELAY_NOTICE_END}\n`;
+  const selfKind = selfAddressedKindOf(selfKindParam);
+  const selfLine = selfKind ? `${SELF_ADDRESSED_NOTICE[selfKind]}\n` : '';
+  return `\n${RELAY_NOTICE_BEGIN}\n${selfLine}${replyLine}本件由 relay 投递。本件是单向投递，没有回程；回信必须另投一次。\n${RELAY_NOTICE_END}\n`;
 }
 const IDENTITY_FALLBACK_TITLE = '(无标题)';
 const IDENTITY_LINE_RE = /^(?:From|To)\s*[:：]\s*\S.*$/;
@@ -998,7 +1035,8 @@ function resolveFromText(stubFrom, watchFrom) {
  * 身份头两行，字段分隔用 ` · ` 与 ASCII ` | `：
  *   From: <角色> · <群名后缀> | <session前8位>
  *   To: <目标会话标题> | <session前8位> | <主身/群分身>
- * identity = { title, id8, kind, fromText }；任何一项缺失都落到安全兜底值。
+ *   Self-Addressed: same-session|same-bot-other-session（仅 0.6.6 自指档 A/B，C 档不写，保持逐字节可比）
+ * identity = { title, id8, kind, fromText, selfAddressed }；任何一项缺失都落到安全兜底值。
  * 头文本只在这一处生成：注入与 `delivered` 审计字段 `injectedHeader` 同源。
  */
 function buildIdentityHead(identity) {
@@ -1007,7 +1045,9 @@ function buildIdentityHead(identity) {
   const title = String(id.title || '') || IDENTITY_FALLBACK_TITLE;
   const id8 = String(id.id8 || '');
   const kind = String(id.kind || '') || '主身';
-  return `From: ${fromText}\nTo: ${title} | ${id8} | ${kind}\n`;
+  const selfKind = selfAddressedKindOf(id.selfAddressed);
+  const selfLine = selfKind ? `Self-Addressed: ${SELF_ADDRESSED_HEAD[selfKind]}\n` : '';
+  return `From: ${fromText}\nTo: ${title} | ${id8} | ${kind}\n${selfLine}`;
 }
 
 /**
@@ -1972,10 +2012,12 @@ export function buildRelayToolFile(input) {
     title: it.targetTitle || IDENTITY_FALLBACK_TITLE,
     id8: id8Of(it.targetSessionId),
     kind: it.sessionKind || '主身',
+    selfAddressed: selfAddressedKindOf(it.selfAddressed),
   };
   // 0.6.3：提示段拼在正文末尾；hash8 只用 cleanBody，提示与 Reply-To 都不进幂等键。
+  // 0.6.6：自指提示 A/B 同样只落在头与提示段，不进 hash8。
   const noticeOn = it.replyNotice === false ? false : DEFAULT_REPLY_NOTICE;
-  const content = `${buildIdentityHead(identity)}# ${subject}\n\n${cleanBody}\n${noticeOn ? buildRelayNotice(it.replyTo) : ''}`;
+  const content = `${buildIdentityHead(identity)}# ${subject}\n\n${cleanBody}\n${noticeOn ? buildRelayNotice(it.replyTo, identity.selfAddressed) : ''}`;
   return { relName, content, cleanBody, hash8 };
 }
 
@@ -2098,6 +2140,9 @@ export function createRelayToolHandler(options) {
 
     // 0.6.5：真来源优先；取不到才退化到配置 fromRole／按目标推算的 Reply-To（与 0.6.4 行为一致）。
     const source = describeToolSource(exec, stateDir, toolStatePath, opt.ctx);
+    // 0.6.6：自指判定在 source 之后——A 同会话、B 同 botId 另一会话、其余不提示。
+    const execSid = sessionIdOfExec(exec);
+    const selfKind = resolveSelfAddressedKind(execSid, source, resolved);
     const built = buildRelayToolFile({
       target,
       subject,
@@ -2109,6 +2154,7 @@ export function createRelayToolHandler(options) {
       sessionKind: resolved.kind === 'group' ? '群分身' : '主身',
       replyTo: source ? source.replyTo : resolveReplyTo(target),
       replyNotice: opt.replyNotice,
+      selfAddressed: selfKind,
     });
     const full = path.join(route.dir, built.relName);
 
@@ -2141,6 +2187,10 @@ export function createRelayToolHandler(options) {
 
     const inlined = built.cleanBody.length <= inlineMaxChars;
     relayLog(opt.ctx || null, stateDir, 'info', `${PLUGIN_NAME} tool-deliver target=${built.relName} dir=${route.dir} deduped=${deduped}`);
+    // 0.6.6：自指提示只留台账一行，不进 rejected.json；文案与卡片判据逐字对应。
+    if (selfKind) {
+      relayLog(opt.ctx || null, stateDir, 'warn', `self-addressed kind=${selfKind} from=${id8Of(execSid)} to=${id8Of(resolved.sessionId)}`);
+    }
     return {
       ok: true,
       code: '',
@@ -2152,6 +2202,7 @@ export function createRelayToolHandler(options) {
       targetTitle: resolved.title || IDENTITY_FALLBACK_TITLE,
       deduped,
       inlined,
+      note: selfKind ? SELF_ADDRESSED_NOTE[selfKind] : '',
     };
   };
 }
@@ -2160,7 +2211,10 @@ function renderRelayToolValue(value) {
   const v = value && typeof value === 'object' ? value : {};
   if (v.ok === true) {
     const tail = v.inlined === false ? '（正文超过内联上限，目标读到路径后再读）' : '';
-    return `relay_deliver ${v.deduped === true ? 'deduped' : 'delivered'}: ${String(v.delivered || '')}${tail}`;
+    // 0.6.6：自指提示必须出现在调用方看得见的返回文本里；空串不追加，T3 输出与 0.6.5 一致。
+    const note = typeof v.note === 'string' ? v.note : '';
+    const noteLine = note !== '' ? `\n${note}` : '';
+    return `relay_deliver ${v.deduped === true ? 'deduped' : 'delivered'}: ${String(v.delivered || '')}${tail}${noteLine}`;
   }
   const code = String(v.code || 'E_DELIVER_FAILED');
   const reason = v.reason ? `/${String(v.reason)}` : '';
