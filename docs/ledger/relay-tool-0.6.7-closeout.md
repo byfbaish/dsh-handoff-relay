@@ -44,6 +44,19 @@ mention 闸、去重台账、`identity.js` 均未改动（`checkMentionForRoom` 
 4. 回归：`c9ff5961` 方向仍判 B、来源名正确；
 5. `NOT_IN_STATE` 成因待证（`04:31:22.945Z`、`04:33:00.787Z` 两条），以 `DSH_RELAY_DEBUG_SOURCE=1` 取真实 reason 后再定论，不许拿现网样本冒充。
 
+### 回填（2026-11-24 05:50，主身）
+
+| # | 结论 | 原文 |
+|---|---|---|
+| 1 | ✅ | 装机副本 `node_modules/dsh-handoff-relay/index.js` sha256 `0225b239fb07ae4979be02454b535370bb97845fdc0cd1ca74e782381b4bdc07`；与 tgz 内 `package/index.js`（`tar -xOf dsh-handoff-relay-0.6.7.tgz package/index.js \| sha256sum`）逐字节相同；`package.json` version `0.6.7` |
+| 2 | ✅ | `2026-11-23T15:24:55.731Z INFO [dsh-handoff-relay] 启动 10/10 个 watch；stableMs=5000`（装包重启后那一轮；配置侧 watch 实际条目 10 条） |
+| 3 | ✅ | 探针件（无 `From:` 行）→ `2026-11-23T21:43:36.816Z INFO 注入身份 from=UNKNOWN to=c6bbeb07\|大肥鱼\|主身`；投递件头逐字 `From: UNKNOWN` / `To: 大肥鱼 \| c6bbeb07 \| 主身`。取证见 `dsh-plugins-project/docs/relay-0.6.7-f1-live-evidence.md` |
+| 4 | ✅ | 同日 0.6.7 插件组→主身投递件头 `From: 大肥鱼 · DSH 插件组（群分身）` ＋ `Self-Addressed: same-bot-other-session`（同 bot 另一会话方向判 B、来源名正确，未串成他人名） |
+| 5 | ⏸ | 未取证。须以 `DSH_RELAY_DEBUG_SOURCE=1` 启动宿主并复现，属「需要一次带环境变量的重启」，不在发版闸内；建议转 0.6.8 收口，本版发布不在其前置 |
+
+口径补充（避免误读）：`fromRole` 是 watch 的可选目录归属标签，解析次序为「桩件正文首条 `From:` ＞ watch 的 `fromRole` ＞ `UNKNOWN`」（`index.js:1020`）。本机 10 条 watch 均未配 `fromRole`，故文件通道一律落到 `UNKNOWN`；§二「文件通道 fromRole 兜底没改」指的是该字段仍在、仍生效，不是本机行为。
+
+
 ## 六　gate 记录
 
 QA 判词 `rotation\qa-gate-067-20261123.md`：F1 过、F2 过、原第三条本机样本判据作废重写（不记不过）、`[live]` 未取样。F2 判据已改为「**不得命中**『watch 增删需重启』一句，检查范围限定于新增的两节」（安装/卸载章节里的「重启宿主」属正常步骤，不在判据内）。
