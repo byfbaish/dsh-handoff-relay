@@ -4712,9 +4712,10 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
 
   const noExec = await sHandler({ target: 'DSH 插件组:QA', subject: 'S3', mention: 'QA', body: '@QA 无 exec 的一件' });
   const s3Text = noExec.ok ? fs.readFileSync(noExec.delivered, 'utf8') : '';
-  check('S3 无 exec.agent ⇒ 与 0.6.4 完全一致（From 退回配置 fromRole、Reply-To 按目标推算）、留 NO_AGENT 日志、不抛错', () => {
+  check('S3 无 exec.agent ⇒ 0.6.7 起 From: UNKNOWN（不再回填 fromRole），Reply-To 仍按目标推算、留 NO_AGENT 日志、不抛错', () => {
     assert.equal(noExec.ok, true, JSON.stringify(noExec));
-    assert.ok(s3Text.includes('From: from-role-should-lose'), `应退回配置 fromRole：${s3Text.slice(0, 160)}`);
+    assert.ok(/^From: UNKNOWN$/m.test(s3Text), `来源查不到必须写 UNKNOWN：${s3Text.slice(0, 160)}`);
+    assert.equal(s3Text.includes('from-role-should-lose'), false, '不得回填 fromRole（错标他人）');
     assert.ok(/^Reply-To: QA@主身（回信请用 relay_deliver/m.test(s3Text), `群目标的 Reply-To 仍按目标推算：${s3Text.slice(0, 260)}`);
     assert.ok(s3Text.includes('单向投递') && s3Text.includes('没有回程'), '提示段应讲清单向投递');
     assert.ok(sLog().includes('tool-from fallback reason=NO_AGENT'), `应留回退日志：${sLog().slice(-300)}`);
@@ -4723,9 +4724,10 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
   const missExec = { agent: { id: 'session-ffff9999-0000' } };
   const miss = await sHandler({ target: '大肥鱼@主身', subject: 'S4', body: '@QA 查不到来源的一件' }, missExec);
   const s4Text = miss.ok ? fs.readFileSync(miss.delivered, 'utf8') : '';
-  check('S4 exec 有 id 但两张表都查不到 ⇒ 回退 0.6.4 行为（From 走 fromRole、主身目标不写 Reply-To）、留 NOT_IN_STATE 日志、不抛错', () => {
+  check('S4 exec 有 id 但两张表都查不到 ⇒ From: UNKNOWN、主身目标不写 Reply-To、留 NOT_IN_STATE 日志、不抛错', () => {
     assert.equal(miss.ok, true, JSON.stringify(miss));
-    assert.ok(s4Text.includes('From: from-role-should-lose'), `应退回配置 fromRole：${s4Text.slice(0, 160)}`);
+    assert.ok(/^From: UNKNOWN$/m.test(s4Text), `来源查不到必须写 UNKNOWN：${s4Text.slice(0, 160)}`);
+    assert.equal(s4Text.includes('from-role-should-lose'), false, '不得回填 fromRole（错标他人）');
     assert.equal(/^Reply-To:/m.test(s4Text), false, '主身目标解析不出回执地址 ⇒ 整行不写');
     assert.ok(sLog().includes('tool-from fallback reason=NOT_IN_STATE'), `应留回退日志：${sLog().slice(-300)}`);
   });
@@ -4745,6 +4747,54 @@ for (const d of [dirA, dirB, dirC, dirD1, dirD2, dirE, ...extraDirs]) {
     assert.ok(/^Reply-To: DSH 插件组:QA（回信请用 relay_deliver/m.test(s5Seg), `群分身 Reply-To 写错：${s5Seg.slice(0, 260)}`);
     const expect = buildRelayToolFile({ target: 'DSH 插件组:QA', subject: 'S5 群分身来源', kind: 'REPORT', body: '@QA 我以群分身身份投', replyTo: 'DSH 插件组:QA' });
     assert.equal(path.basename(fromSeg.delivered), expect.relName, '身份与提示不得进幂等键');
+  });
+}
+
+// ===== 0.6.7 F1：来源查不到一律 UNKNOWN；mapping-stale 只定位、不参与判定 =====
+{
+  const f1Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-f1-'));
+  const f1StateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-f1-log-'));
+  const f1StatePath = path.join(f1StateDir, 'state.json');
+  // 本机两条实测样本：注入压测 041b4aee（不在映射里）、插件组 c9ff5961（在映射里）
+  const f1MainSid = '909dc0a3-1111-4111-8111-000000000001';
+  const f1StaleSid = '041b4aee-2222-4222-8222-000000000002';
+  const f1SegSid = 'c9ff5961-3333-4333-8333-000000000003';
+  fs.writeFileSync(f1StatePath, JSON.stringify({
+    version: 1,
+    bots: { 'bot-dfy': { id: 'bot-dfy', name: '大肥鱼', sessionId: f1MainSid } },
+    rooms: { 'room-1': { id: 'room-1', name: 'DSH 插件组', members: ['bot-dfy'], sessions: { 'bot-dfy': f1SegSid } } },
+  }), 'utf8');
+  const f1Origin = '金牌编辑 · 注入压测（群分身）';
+  const f1Routes = [{ dir: f1Dir, targetIdentity: '大肥鱼@主身', targetSessionId: '', targetTitle: '', fromRole: f1Origin }];
+  const f1Handler = createRelayToolHandler({
+    routes: f1Routes, stateDir: f1StateDir, inlineMaxChars: 4000, statePath: f1StatePath,
+    resolveAddress: (addr) => {
+      if (addr === '大肥鱼@主身') return { ok: true, kind: 'identity', id: f1MainSid, botId: 'bot-dfy', title: '大肥鱼', sessionId: f1MainSid };
+      if (addr === 'DSH 插件组:大肥鱼') return { ok: true, kind: 'group', id: f1SegSid, botId: 'bot-dfy', title: '大肥鱼 · DSH 插件组', sessionId: f1SegSid, roomName: 'DSH 插件组' };
+      throw new Error(`unexpected address ${addr}`);
+    },
+    listMembers: () => ({ roomName: 'DSH 插件组', total: 1, members: [{ botName: '大肥鱼', address: 'DSH 插件组:大肥鱼', hasSegment: true }] }),
+  });
+  const f1Log = () => { try { return fs.readFileSync(path.join(f1StateDir, 'relay.log'), 'utf8'); } catch { return ''; } };
+
+  const stale = await f1Handler({ target: '大肥鱼@主身', subject: 'F1 旧会话来源', body: '@QA 旧会话投的一件' }, { agent: { id: f1StaleSid, title: '大肥鱼 · 注入压测（群分身）' } });
+  const staleText = stale.ok ? fs.readFileSync(stale.delivered, 'utf8') : '';
+  check('F1-a 旧会话 041b4aee 不在映射 ⇒ From: UNKNOWN（不按 botId 回填「金牌编辑…」）、无 Self-Addressed、留 mapping-stale 定位行', () => {
+    assert.equal(stale.ok, true, JSON.stringify(stale));
+    assert.ok(/^From: UNKNOWN$/m.test(staleText), `必须 UNKNOWN：${staleText.slice(0, 200)}`);
+    assert.equal(staleText.includes(f1Origin), false, '不得回填 route.fromRole 的 Bot 名');
+    assert.equal(/^Self-Addressed:/m.test(staleText), false, '查不到来源不得写自指标记');
+    assert.ok(f1Log().includes('tool-from fallback reason=NOT_IN_STATE'), `应留回退日志：${f1Log().slice(-400)}`);
+    assert.ok(f1Log().includes(`mapping-stale bot=大肥鱼 recorded=909dc0a3 live=041b4aee`), `应留定位行：${f1Log().slice(-400)}`);
+  });
+
+  const inMap = await f1Handler({ target: '大肥鱼@主身', subject: 'F1 命中来源', body: '@QA 在映射里的分身投的一件' }, { agent: { id: f1SegSid } });
+  const inMapText = inMap.ok ? fs.readFileSync(inMap.delivered, 'utf8') : '';
+  check('F1-b 在当前映射里的 c9ff5961 ⇒ B 档自指、From 写「大肥鱼 · DSH 插件组（群分身）」', () => {
+    assert.equal(inMap.ok, true, JSON.stringify(inMap));
+    assert.ok(inMapText.includes('From: 大肥鱼 · DSH 插件组（群分身）'), `来源名写错：${inMapText.slice(0, 200)}`);
+    assert.ok(inMapText.includes('Self-Addressed: same-bot-other-session'), `应判 B：${inMapText.slice(0, 240)}`);
+    assert.ok(f1Log().includes('self-addressed kind=B from=c9ff5961 to=909dc0a3'), `应留 kind=B：${f1Log().slice(-400)}`);
   });
 }
 

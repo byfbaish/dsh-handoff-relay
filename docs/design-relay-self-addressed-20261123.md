@@ -120,3 +120,23 @@ const selfKind = !sid ? '' : (resolved.sessionId === sid ? 'A'
 - 测试：`index.test.mjs` 新增 T1/T1b/T1c/T2/T3 五条，全量 `TOTAL: 235/235 PASS`。
 - 版本号：`0.6.5 → 0.6.6`。本机在跑 0.6.5，`0.5.0` 会倒退，故按主人裁定跳 0.5.0 出 0.6.6（补丁位）；与 0.6.5 的差仅为「自指提示」三落点＋台账一行＋返回 `note`，其余行为逐字节不变（T3 定样本 `relay-748730cd.md` 不变可证）。
 - `[live]` 未跑：需主身装包重启后由真宿主注入才可标；本轮单测与合成件只标 `[mock]`。
+
+## 11 追加修改（0.6.7，2026-11-23）：F1 来源不错标、F2 watch 生效口径
+
+F1（来源身份查不到时的处置）
+- `index.js:2174`：工具通道的 `fromText` 去掉 `route.fromRole` 兜底，改为「`source` 命中就写 `source.fromText`，否则一律 `IDENTITY_UNKNOWN`」。此前 `route.fromRole` 会把来源错标成配置里写的 Bot 名（实测 `From: 金牌编辑 · 注入压测（群分身）`），比 UNKNOWN 更危险。
+- `index.js:2050` `describeToolSource()`：只认 `bots[].sessionId` 与 `rooms[].sessions` 两张**当前**映射；查不到回 `null` → UNKNOWN。不按 botId、不按房间成员、不按旧会话 id 拼名字。
+- `index.js:2079` `describeMappingStale()`：仅当会话标题能对上某个 bot 名、且该 bot 台账会话与活体会话不同，追加一行 `mapping-stale bot=<名> recorded=<id8> live=<id8>` 供定位；**不参与任何判定**。对不上就不猜。
+- 文件通道（watch 目录）的 `fromRole` 兜底保持不变：那是目录归属标签，README 已声明「不是身份证明」，与本条修的不是同一路径。
+
+F2（文档口径）
+- `README.md` / `README.zh-CN.md` 在「启动期有限重扫 / Startup rescan」后各加一节：增删 watch 走热加载、不必重启宿主，但生效有滞后（实测可到数分钟）；不得以「改完立刻没反应」判失效，先看有没有新的 `启动 N/N 个 watch` 行。证据引 `relay.log 2026-11-23T04:17:10.568Z 启动 10/10` 与当日 `restart.log` 只有 `12:24:00` 一次重启。
+- 更正 §10 里「上线需重启」的旧说法：12:17 那次是进程内存活期间的整轮重载（热加载），不是重启生效。
+
+判据对照（0.6.7 卡面四条）
+| 卡面条目 | 落点 |
+| --- | --- |
+| 来源查不到一律 UNKNOWN | `index.js:2174`；测试 `index.test.mjs:4782`（F1-a） |
+| 禁按 botId／房间成员回填、旧会话不拼名 | `index.js:2050-2077`；F1-a 断言 `From: UNKNOWN` 且不含 `金牌编辑…` |
+| 同 bot 多会话只加 `mapping-stale` | `index.js:2079`；F1-a 断言该行、F1-b 断言命中映射时不产生错标 |
+| watch 增删热加载有滞后（F2 文档） | `README.md` / `README.zh-CN.md` 新增小节 |

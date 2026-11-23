@@ -387,6 +387,16 @@ the remaining attempts. If all three fail the plugin stops retrying — there is
 no standing timer and no polling loop. A watch that resolves at load time never
 rescans, and a normal delivery still writes nothing to `relay.log`.
 
+### Adding or removing a watch takes effect by hot reload, with a lag
+
+Editing `watches` does not require restarting the host: the plugin is re-applied
+in-process and re-reads the config. The re-apply is not instant — measured lags
+reach several minutes (evidence: `relay.log` `2026-11-23T04:17:10.568Z 启动 10/10`
+while `restart.log` for that day records a single host restart at `12:24:00`).
+So do not call a config change "not applied" just because nothing happened
+immediately: first check whether a new `启动 N/N 个 watch` line appeared, and
+give it the full lag before asserting a failure.
+
 ## Config
 
 | Field | Meaning |

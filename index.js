@@ -2043,9 +2043,9 @@ function sessionIdOfExec(exec) {
 }
 
 /**
- * 0.6.5：来源身份只从 `exec.agent.id` 派生（参数与配置一律不得覆盖；配置里的 fromRole 只作兜底）。
- * 取不到 / 台账读不出 / 两张映射都查不到 ⇒ 回 null，调用方退化到 0.6.4 行为（From: UNKNOWN、不写 Reply-To）。
- * 不抛错，只留一行 `tool-from fallback reason=…`。
+ * 0.6.7（F1）：来源会话在 `bots[].sessionId` / `rooms[].sessions` 两张**当前**映射里都查不到 ⇒ 回 null，
+ * 调用方一律写 `From: UNKNOWN`。禁止按 botId、房间成员或 route.fromRole 回填任何 Bot 名——错标他人比 UNKNOWN 危险。
+ * 同一 bot 存在旧会话记录时只多打一行 `mapping-stale` 供定位，绝不据此改判。
  */
 function describeToolSource(exec, stateDir, statePath, ctx) {
   const logFallback = (reason) => relayLog(ctx || null, stateDir, 'info', `${PLUGIN_NAME} tool-from fallback reason=${reason}`);
@@ -2063,8 +2063,31 @@ function describeToolSource(exec, stateDir, statePath, ctx) {
     return null;
   }
   const found = describeSourceBySession(state, sessionId);
-  if (!found) { logFallback('NOT_IN_STATE'); return null; }
+  if (!found) {
+    logFallback('NOT_IN_STATE');
+    const stale = describeMappingStale(state, sessionId, sessionTitleOf(ctx, agent));
+    if (stale !== '') relayLog(ctx || null, stateDir, 'info', `${PLUGIN_NAME} mapping-stale ${stale}`);
+    return null;
+  }
   return found;
+}
+
+/**
+ * 0.6.7（F1）：只在「同一 bot 的台账会话与活体会话不同」时给一行定位信息；不参与判定。
+ * 标题里能对上 bot 名才算候选——对不上就不猜（不按顺序、不按第一个 bot 兜底）。
+ */
+function describeMappingStale(state, liveSid, titleHint) {
+  const hint = String(titleHint == null ? '' : titleHint).trim();
+  if (hint === '') return '';
+  const bots = state && typeof state.bots === 'object' && state.bots ? state.bots : {};
+  for (const bot of Object.values(bots)) {
+    if (!bot || typeof bot !== 'object' || typeof bot.name !== 'string' || bot.name === '') continue;
+    if (!hint.includes(bot.name)) continue;
+    const recorded = typeof bot.sessionId === 'string' ? bot.sessionId : '';
+    if (recorded === '' || recorded === liveSid) continue;
+    return `bot=${bot.name} recorded=${id8Of(recorded)} live=${id8Of(liveSid)}`;
+  }
+  return '';
 }
 
 /**
@@ -2148,7 +2171,7 @@ export function createRelayToolHandler(options) {
       subject,
       kind,
       body,
-      fromText: source ? source.fromText : (route.fromRole || IDENTITY_UNKNOWN),
+      fromText: source ? source.fromText : IDENTITY_UNKNOWN,
       targetTitle: resolved.title,
       targetSessionId: resolved.sessionId,
       sessionKind: resolved.kind === 'group' ? '群分身' : '主身',
