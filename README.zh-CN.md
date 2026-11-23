@@ -2,6 +2,8 @@
 
 # dsh-handoff-relay
 
+当前版本 **0.6.7** —— 0.5.0 以来的完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 一个零依赖插件：监控一个或多个目录，当目录里的文件被判定为「已完成」时，
 向该目录对应的目标会话发送恰好一条通知。
 
@@ -18,7 +20,7 @@
 ```mermaid
 graph LR
   ID["dsh-identity-resolve 0.1.0<br/>身份解析 — 唯一真源"]
-  RL["dsh-handoff-relay 0.5.0<br/>目录监听 → 一条通知"]
+  RL["dsh-handoff-relay 0.6.7<br/>目录监听 → 一条通知"]
   HOST["DS-Bot（上游，第三方）<br/>Bot / 群 / 会话 / 插件注入点"]
   ID -->|"地址语义<br/>群名:Bot · Bot@主身<br/>E_ADDR_INVALID · E_SESSION_UNRECORDED"| RL
   HOST --- RL
@@ -211,10 +213,17 @@ dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay
 要固定某个版本就带下面的 tag，但以仓库 Releases 页为准：发版后取那里当前最新的 tag。
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.5.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.6.7
 ```
 
-0.4.0 不可用（设置卡缺入口），请安装 0.5.0 或更高版本。
+也可以用 npm 安装：
+
+```bash
+npm i dsh-handoff-relay@0.6.7
+```
+
+0.4.0 不可用（设置卡缺入口）。当前版本 0.6.7；0.5.0 以来的全部变更见
+[CHANGELOG.md](CHANGELOG.md)。
 
 ### 卸载与查看状态
 

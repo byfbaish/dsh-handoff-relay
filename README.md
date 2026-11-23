@@ -2,6 +2,9 @@
 
 # dsh-handoff-relay
 
+Current version **0.6.7** — see [CHANGELOG.md](CHANGELOG.md) for the full list of
+changes since 0.5.0.
+
 A dependency-free plugin that watches one or more directories and sends exactly
 one notification to each directory's target session when a file in it is
 considered finished.
@@ -22,7 +25,7 @@ This plugin is one of three projects that work together.
 ```mermaid
 graph LR
   ID["dsh-identity-resolve 0.1.0<br/>identity resolver — single source of truth"]
-  RL["dsh-handoff-relay 0.5.0<br/>dir watch → one notification"]
+  RL["dsh-handoff-relay 0.6.7<br/>dir watch → one notification"]
   HOST["DS-Bot (upstream, third party)<br/>bots / rooms / sessions / plugin hook"]
   ID -->|"address semantics<br/>&lt;Room&gt;:&lt;Bot&gt; · &lt;Bot&gt;@main<br/>E_ADDR_INVALID · E_SESSION_UNRECORDED"| RL
   HOST --- RL
@@ -269,10 +272,18 @@ append the tag shown below — the repository's Releases page stays authoritativ
 after a new release, use the latest tag listed there.
 
 ```bash
-dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.5.0
+dsh plugin --profile desktop add github:byfbaish/dsh-handoff-relay#v0.6.7
 ```
 
-0.4.0 is not usable (its settings card never appears). Install 0.5.0 or later.
+Or, from npm:
+
+```bash
+npm i dsh-handoff-relay@0.6.7
+```
+
+0.4.0 is not usable (its settings card never appears). Install 0.6.7 — or at
+least 0.5.0 if you need an older behaviour — see `CHANGELOG.md` for what changed
+between them.
 
 ### Uninstall and check status
 
